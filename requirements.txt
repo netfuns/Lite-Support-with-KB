@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+pyotp
+qrcode
+markdown
+pypdf
+pdfplumber
+python-docx
+openpyxl
+html2text
+fpdf2
+email-validator

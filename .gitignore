@@ -1,0 +1,10 @@
+# RankEZ Support — backend venv, caches, runtime data, env
+.venv/
+__pycache__/
+*.pyc
+_vendor_lib/
+backend/data/
+.env
+*.db
+*.sqlite
+.DS_Store
