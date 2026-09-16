@@ -53,9 +53,18 @@ function h(node, attrs = {}, ...children) {
     else if (k === "selected") el.selected = !!v;
     else el.setAttribute(k, v);
   }
-  for (const c of children) {
-    if (c == null) continue;
-    el.append(typeof c === "string" ? document.createTextNode(c) : c);
+  // flatten nested arrays (map() results are commonly passed as a single child)
+  const flat = [];
+  (function push(arr) {
+    for (const c of arr) {
+      if (Array.isArray(c)) push(c);
+      else flat.push(c);
+    }
+  })(children);
+  for (const c of flat) {
+    if (c == null || c === false) continue;
+    el.append(typeof c === "string" || typeof c === "number"
+      ? document.createTextNode(String(c)) : c);
   }
   return el;
 }
