@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 _venv/
 
+# Vendored offline dependency bundle (~100 MB, reinstall from requirements.txt)
+_vendor_lib/
+
 # Runtime data (SQLite + uploads)
 data/
 *.db

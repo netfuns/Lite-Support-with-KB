@@ -39,6 +39,67 @@ PERMISSIONS = [
 ]
 PERM_KEYS = [k for k, _ in PERMISSIONS]
 
+# ---------------------------------------------------------------------------
+# Role editor matrix: one row per left-hand menu entry, three levels each.
+#   none -> no permission at all for that area
+#   read -> the "view" permissions of that area
+#   edit -> the view permissions PLUS every write permission of that area
+# ---------------------------------------------------------------------------
+MENU_ITEMS = [
+    {"key": "dashboard", "label": "Dashboard", "read": [], "edit": []},
+    {"key": "tickets", "label": "Tickets",
+     "read": ["ticket.view_all", "ticket.view_own"],
+     "edit": ["ticket.create", "ticket.reply", "ticket.change_status", "ticket.edit",
+              "ticket.claim", "ticket.change_owner", "ticket.delete", "ticket.export"]},
+    {"key": "new_ticket", "label": "New Ticket",
+     "read": ["ticket.create"], "edit": ["ticket.create"]},
+    {"key": "kb", "label": "Knowledge Base",
+     "read": ["kb.view_public", "kb.view_registered", "kb.view_internal"],
+     "edit": ["kb.create", "kb.edit", "kb.delete", "kb.import",
+              "kb.manage_collections", "kb.export_pdf", "kb.share_email"]},
+    {"key": "customers", "label": "Customers",
+     "read": ["customer.view"],
+     "edit": ["customer.create", "customer.edit", "customer.delete", "customer.import_csv"]},
+    {"key": "users", "label": "Users",
+     "read": ["user.manage"], "edit": ["user.manage", "user.reset_totp"]},
+    {"key": "roles", "label": "Roles", "read": ["role.manage"], "edit": ["role.manage"]},
+    {"key": "groups", "label": "Groups", "read": ["group.manage"], "edit": ["group.manage"]},
+    {"key": "mail_settings", "label": "Mail Settings",
+     "read": ["settings.mail"], "edit": ["settings.mail"]},
+    {"key": "site_settings", "label": "Site Settings",
+     "read": ["settings.mail"], "edit": ["settings.mail"]},
+]
+
+
+def levels_for(perms):
+    """Derive {menu_key: none|read|edit} from a plain set of permission keys."""
+    perms = set(perms or [])
+    out = {}
+    for item in MENU_ITEMS:
+        if not item["read"] and not item["edit"]:
+            out[item["key"]] = "read"          # dashboard is always reachable
+            continue
+        if any(p in perms for p in item["edit"]):
+            out[item["key"]] = "edit"
+        elif any(p in perms for p in item["read"]):
+            out[item["key"]] = "read"
+        else:
+            out[item["key"]] = "none"
+    return out
+
+
+def perms_for_levels(levels):
+    """Expand {menu_key: none|read|edit} back into the flat permission list."""
+    levels = levels or {}
+    out = set()
+    for item in MENU_ITEMS:
+        lvl = levels.get(item["key"], "none")
+        if lvl in ("read", "edit"):
+            out.update(item["read"])
+        if lvl == "edit":
+            out.update(item["edit"])
+    return sorted(k for k in out if k in PERM_KEYS)
+
 
 def seed(conn):
     cur = conn.cursor()

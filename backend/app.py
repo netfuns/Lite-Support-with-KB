@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime
 
 import auth
 import rbac
@@ -28,8 +29,43 @@ init_db()
 app = FastAPI(title="RankEZ Support", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
 
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):  # noqa: BLE001
+    """Surface real errors as JSON so the UI shows a message instead of a bare 500."""
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": "%s: %s" % (type(exc).__name__, exc)})
+
+
+@app.middleware("http")
+async def _host_guard(request: Request, call_next):
+    """Settings > Bound domains: when a list is configured, only those hosts may
+    reach the site (empty list = every host, including raw IPs, is allowed)."""
+    allowed = site_allowed_hosts()
+    if allowed:
+        host = (request.headers.get("host") or "").split(":")[0].lower()
+        if host not in allowed:
+            return PlainTextResponse(
+                "403 - this host is not allowed to serve the site.\n"
+                "Configure it under Settings > Bound domains.",
+                status_code=403)
+    return await call_next(request)
+
+
 DEFAULT_MODULES = ["PAC", "PSM", "CPM", "VAULT", "CP", "REMOTEAPP", "CLM", "RAG"]
 DEPLOY_TYPES = ["ON-PREM", "SaaS"]
+LOGO_HINT = "建议上传 200 × 48 px 的 PNG / SVG（透明背景，横向），不超过 1 MB"
+
+DEFAULT_WELCOME = """# RankEZ 支持中心
+
+欢迎来到 **RankEZ 售后与知识库平台**。
+
+- 提交工单并跟踪处理进度
+- 检索产品文档与最佳实践
+- 内部知识沉淀与共享
+
+请点击右上角 **Sign in** 登录。
+"""
 
 
 def _seed_setting(conn, key, value):
@@ -47,7 +83,13 @@ def _seed():
     _seed_setting(conn, "modules", json.dumps(DEFAULT_MODULES, ensure_ascii=False))
     _seed_setting(conn, "internal_domains", "[]")
     _seed_setting(conn, "session_timeout", "480")
+    _seed_setting(conn, "session_max_lifetime", "1440")
     _seed_setting(conn, "theme", "light")
+    _seed_setting(conn, "company_name", "RankEZ")
+    _seed_setting(conn, "company_logo", "")
+    _seed_setting(conn, "welcome_md", DEFAULT_WELCOME)
+    _seed_setting(conn, "allowed_hosts", "[]")
+    _seed_setting(conn, "mail_provider", "smtp")
     # default collections
     for name, vis in (("公开知识", "public"), ("注册用户", "registered"), ("内部管理", "internal")):
         if not conn.execute("SELECT id FROM kb_collections WHERE name=?", (name,)).fetchone():
@@ -121,6 +163,14 @@ def _setting_json(key, default):
         return default
 
 
+def _setting_raw(key, default=""):
+    """Plain-text setting (company name, markdown, provider, ...)."""
+    c = conn_()
+    raw = get_setting(c, key, None)
+    c.close()
+    return raw if raw not in (None, "") else default
+
+
 def site_modules():
     m = _setting_json("modules", [])
     return [x for x in m if x] or DEFAULT_MODULES
@@ -130,11 +180,40 @@ def site_internal_domains():
     return [str(x).lower() for x in (_setting_json("internal_domains", []) or []) if x]
 
 
+def site_allowed_hosts():
+    """Hosts allowed to serve the site; empty list = allow everything."""
+    return [str(x).strip().lower() for x in (_setting_json("allowed_hosts", []) or []) if str(x).strip()]
+
+
+def site_company_name():
+    return _setting_raw("company_name", "RankEZ") or "RankEZ"
+
+
+def site_company_logo():
+    return _setting_raw("company_logo", "")
+
+
+def site_welcome_md():
+    return _setting_raw("welcome_md", "") or DEFAULT_WELCOME
+
+
+def site_mail_provider():
+    return "o365" if _setting_raw("mail_provider", "smtp").lower() == "o365" else "smtp"
+
+
 def site_session_timeout():
     try:
         return int(_setting_json("session_timeout", 480) or 0)
     except Exception:
         return 480
+
+
+def site_session_max_lifetime():
+    """Absolute cap on how long one login may live, in minutes (0 = unlimited)."""
+    try:
+        return int(_setting_json("session_max_lifetime", 1440) or 0)
+    except Exception:
+        return 1440
 
 
 def site_theme():
@@ -170,6 +249,15 @@ def _kb_can_edit(conn, u):
 
 
 # ------------------------------------------------------------------ auth ctx
+def _parse_dt(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
 def current_user(request: Request):
     token = request.headers.get("X-Token") or request.cookies.get("rz_token")
     if not token:
@@ -179,19 +267,29 @@ def current_user(request: Request):
     if not row or row["pending"]:
         c.close()
         return None
-    # session timeout (minutes; 0 = never)
-    timeout = site_session_timeout()
-    if timeout > 0 and row["created_at"]:
-        try:
-            import datetime as _dt
-            created = _dt.datetime.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S")
-            if (_dt.datetime.utcnow() - created).total_seconds() > timeout * 60:
-                c.execute("DELETE FROM tokens WHERE token=?", (token,))
-                c.commit()
-                c.close()
-                return None
-        except Exception:
-            pass
+    # Two independent limits, both in minutes, 0 = unlimited:
+    #   session_timeout       -> idle timeout, measured from the last request
+    #   session_max_lifetime  -> absolute cap, measured from login time
+    now = datetime.utcnow()
+    created = _parse_dt(row["created_at"])
+    last = _parse_dt(row["last_seen"] if "last_seen" in row.keys() else None) or created
+    idle_min = site_session_timeout()
+    max_min = site_session_max_lifetime()
+    expired = False
+    if idle_min > 0 and last and (now - last).total_seconds() > idle_min * 60:
+        expired = True
+    if max_min > 0 and created and (now - created).total_seconds() > max_min * 60:
+        expired = True
+    if expired:
+        c.execute("DELETE FROM tokens WHERE token=?", (token,))
+        c.commit()
+        c.close()
+        return None
+    # refresh the idle clock at most once every 30s (avoid a write per request)
+    if (not last) or (now - last).total_seconds() > 30:
+        c.execute("UPDATE tokens SET last_seen=? WHERE token=?",
+                  (now.strftime("%Y-%m-%d %H:%M:%S"), token))
+        c.commit()
     u = c.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
     c.close()
     if not u or u["status"] != "active":
@@ -282,6 +380,30 @@ def me(request: Request):
     return _me_payload(u)
 
 
+@app.get("/api/me/session")
+def me_session(request: Request):
+    """Heartbeat: refreshes the idle clock and reports the remaining seconds."""
+    require(request)
+    token = request.headers.get("X-Token") or request.cookies.get("rz_token")
+    c = conn_()
+    row = c.execute("SELECT * FROM tokens WHERE token=?", (token,)).fetchone()
+    c.close()
+    if not row:
+        raise HTTPException(401, "not_logged_in")
+    now = datetime.utcnow()
+    created = _parse_dt(row["created_at"])
+    last = _parse_dt(row["last_seen"] if "last_seen" in row.keys() else None) or created
+    idle_min = site_session_timeout()
+    max_min = site_session_max_lifetime()
+    idle_left = max_left = None
+    if idle_min > 0 and last:
+        idle_left = max(0, int(idle_min * 60 - (now - last).total_seconds()))
+    if max_min > 0 and created:
+        max_left = max(0, int(max_min * 60 - (now - created).total_seconds()))
+    return ok(idle_timeout=idle_min, idle_left=idle_left,
+              max_lifetime=max_min, max_left=max_left)
+
+
 @app.post("/api/me/password")
 async def my_password(request: Request):
     u = require(request)
@@ -370,8 +492,9 @@ def meta(request: Request):
               statuses=T.STATUSES, priorities=["critical", "high", "medium", "low"],
               my_permissions=sorted(myperms),
               modules=site_modules(), deploy_types=DEPLOY_TYPES,
-              session_timeout=site_session_timeout(), theme=site_theme(),
-              can_edit_kb=can_edit_kb)
+              session_timeout=site_session_timeout(),
+              session_max_lifetime=site_session_max_lifetime(),
+              theme=site_theme(), can_edit_kb=can_edit_kb)
 
 
 def my_perm_set(u):
@@ -408,7 +531,8 @@ async def customer_create(request: Request):
     if exists:
         cid = exists["id"]
         c.execute("UPDATE customers SET domains=?, version=?, service_start=?, service_end=?, contact_email=? WHERE id=?",
-                  (domains, b.get("version", ""), b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", "")), (cid,))
+                  (domains, b.get("version", ""), b.get("service_start", ""), b.get("service_end", ""),
+                   b.get("contact_email", ""), cid))
     else:
         cur = c.execute("INSERT INTO customers(name,domains,version,service_start,service_end,contact_email) VALUES(?,?,?,?,?,?)",
                         (name, domains, b.get("version", ""), b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", "")))
@@ -426,7 +550,7 @@ async def customer_update(cid: int, request: Request):
     c = conn_()
     c.execute("UPDATE customers SET name=?, domains=?, version=?, service_start=?, service_end=?, contact_email=? WHERE id=?",
               (b.get("name", ""), (b.get("domains") or "").lower(), b.get("version", ""),
-               b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", "")), (cid,))
+               b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", ""), cid))
     c.commit()
     c.close()
     return ok(ok=True)
@@ -487,7 +611,8 @@ async def customer_import(request: Request, file: UploadFile = File(...)):
         exists = c.execute("SELECT id FROM customers WHERE lower(name)=?", (name.lower(),)).fetchone()
         if exists:
             c.execute("UPDATE customers SET domains=COALESCE(NULLIF(?,''),domains), version=?, service_start=?, service_end=?, contact_email=? WHERE id=?",
-                      (domains, row.get("version", ""), row.get("service_start", ""), row.get("service_end", ""), row.get("contact_email", "")), (exists["id"],))
+                      (domains, row.get("version", ""), row.get("service_start", ""), row.get("service_end", ""),
+                       row.get("contact_email", ""), exists["id"]))
             updated += 1
             cid = exists["id"]
         else:
@@ -763,14 +888,8 @@ def _kb_access_ok(conn, u, article, group_ids):
         return False
     if article["visibility"] == "registered" and "kb.view_registered" not in perms:
         return False
-    if article["visibility"] == "registered":
-        ag = set(r["group_id"] for r in conn.execute(
-            "SELECT group_id FROM kb_article_groups WHERE article_id=?", (article["id"],)))
-        if ag:
-            return bool(ag & group_ids)
-    if article["visibility"] == "usergroup":
-        ag = set(r["group_id"] for r in conn.execute("SELECT group_id FROM kb_article_groups WHERE article_id=?", (article["id"],)))
-        return bool(ag & group_ids)
+    # Visibility is now a simple three-way choice (public / registered / internal);
+    # the old per-user-group binding is no longer used.
     return True
 
 
@@ -1217,9 +1336,17 @@ def admin_roles(request: Request):
             "SELECT p.key FROM permissions p JOIN role_permissions rp ON rp.perm_id=p.id WHERE rp.role_id=?", (r["id"],))]
         d = dict(r)
         d["permissions"] = perms
+        d["levels"] = rbac.levels_for(perms)
         out.append(d)
     c.close()
-    return ok(items=out)
+    return ok(items=out, menu=rbac.MENU_ITEMS)
+
+
+@app.get("/api/admin/perm_matrix")
+def perm_matrix(request: Request):
+    """Menu rows + the three levels, used to build the role editor."""
+    require_perm(request, "role.manage")
+    return ok(menu=rbac.MENU_ITEMS, levels=["none", "read", "edit"])
 
 
 @app.post("/api/admin/roles")
@@ -1230,12 +1357,20 @@ async def admin_role_create(request: Request):
     if not name:
         fail(400, "name_required")
     c = conn_()
-    cur = c.execute("INSERT OR INTO roles(name,description,builtin) VALUES(?,?,0)".replace("OR INTO", "OR IGNORE INTO"),
+    # never adopt an existing (possibly built-in) role by name - that would wipe its permissions
+    if c.execute("SELECT id FROM roles WHERE lower(name)=?", (name.lower(),)).fetchone():
+        c.close()
+        fail(400, "role_name_taken")
+    cur = c.execute("INSERT INTO roles(name,description,builtin) VALUES(?,?,0)",
                     (name, b.get("description", "")))
-    rid = c.execute("SELECT id FROM roles WHERE name=?", (name,)).fetchone()["id"]
+    rid = cur.lastrowid
     c.execute("DELETE FROM role_permissions WHERE role_id=?", (rid,))
+    # the role editor posts {levels:{menu_key: none|read|edit}}
+    perms = b.get("permissions")
+    if isinstance(b.get("levels"), dict):
+        perms = rbac.perms_for_levels(b["levels"])
     permmap = {r["key"]: r["id"] for r in c.execute("SELECT id,key FROM permissions")}
-    for k in (b.get("permissions") or []):
+    for k in (perms or []):
         if k in permmap:
             c.execute("INSERT OR IGNORE INTO role_permissions(role_id,perm_id) VALUES(?,?)", (rid, permmap[k]))
     c.commit()
@@ -1248,8 +1383,24 @@ async def admin_role_update(rid: int, request: Request):
     require_perm(request, "role.manage")
     b = await request.json()
     c = conn_()
+    role = c.execute("SELECT * FROM roles WHERE id=?", (rid,)).fetchone()
+    if not role:
+        c.close()
+        fail(404, "not_found")
+    if role["builtin"]:
+        c.close()
+        fail(400, "builtin_role_readonly")
+    if "name" in b:
+        name = (b.get("name") or "").strip()
+        if not name:
+            c.close()
+            fail(400, "name_required")
+        c.execute("UPDATE roles SET name=? WHERE id=?", (name, rid))
     if "description" in b:
         c.execute("UPDATE roles SET description=? WHERE id=?", (b.get("description", ""), rid))
+    # the role editor posts {levels:{menu_key: none|read|edit}}
+    if isinstance(b.get("levels"), dict):
+        b["permissions"] = rbac.perms_for_levels(b["levels"])
     if "permissions" in b:
         c.execute("DELETE FROM role_permissions WHERE role_id=?", (rid,))
         permmap = {r["key"]: r["id"] for r in c.execute("SELECT id,key FROM permissions")}
@@ -1314,8 +1465,12 @@ def admin_group_delete(gid: int, request: Request):
 def admin_site(request: Request):
     require_perm(request, "settings.mail")
     return ok(modules=site_modules(), internal_domains=site_internal_domains(),
-              session_timeout=site_session_timeout(), theme=site_theme(),
-              deploy_types=DEPLOY_TYPES)
+              session_timeout=site_session_timeout(),
+              session_max_lifetime=site_session_max_lifetime(),
+              theme=site_theme(), deploy_types=DEPLOY_TYPES,
+              company_name=site_company_name(), company_logo=site_company_logo(),
+              welcome_md=site_welcome_md(), allowed_hosts=site_allowed_hosts(),
+              logo_hint=LOGO_HINT, mail_provider=site_mail_provider())
 
 
 @app.post("/api/admin/site")
@@ -1334,8 +1489,22 @@ async def admin_site_save(request: Request):
             set_setting(c, "session_timeout", str(int(b.get("session_timeout") or 0)))
         except Exception:
             pass
+    if "session_max_lifetime" in b:
+        try:
+            set_setting(c, "session_max_lifetime", str(int(b.get("session_max_lifetime") or 0)))
+        except Exception:
+            pass
     if "theme" in b:
         set_setting(c, "theme", str(b.get("theme") or "light"))
+    if "company_name" in b:
+        set_setting(c, "company_name", str(b.get("company_name") or "").strip() or "RankEZ")
+    if "welcome_md" in b:
+        set_setting(c, "welcome_md", str(b.get("welcome_md") or ""))
+    if "allowed_hosts" in b:
+        hosts = [str(x).strip().lower().lstrip(".") for x in (b.get("allowed_hosts") or []) if str(x).strip()]
+        set_setting(c, "allowed_hosts", json.dumps(hosts, ensure_ascii=False))
+    if "mail_provider" in b:
+        set_setting(c, "mail_provider", "o365" if str(b.get("mail_provider") or "").lower() == "o365" else "smtp")
     c.commit()
     # re-evaluate internal group membership for every user
     for r in c.execute("SELECT id,email FROM users"):
@@ -1343,6 +1512,32 @@ async def admin_site_save(request: Request):
     c.commit()
     c.close()
     return ok(ok=True)
+
+
+@app.get("/api/brand")
+def brand():
+    """Public: company branding + welcome page content (used before login)."""
+    return ok(company_name=site_company_name(), company_logo=site_company_logo(),
+              welcome_md=site_welcome_md())
+
+
+@app.post("/api/admin/site/logo")
+async def admin_site_logo(request: Request, file: UploadFile = File(...)):
+    require_perm(request, "settings.mail")
+    raw = await file.read()
+    if len(raw) > 1024 * 1024:
+        fail(400, "file_too_large")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"):
+        fail(400, "unsupported_image_type")
+    name = "logo_" + str(int(time.time())) + ext
+    with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
+        f.write(raw)
+    c = conn_()
+    set_setting(c, "company_logo", "/files/" + name)
+    c.commit()
+    c.close()
+    return ok(ok=True, logo="/files/" + name)
 
 
 # =============================== ADMIN: SETTINGS / MAIL ===============================
@@ -1372,10 +1567,27 @@ async def admin_settings_save(request: Request):
         b.pop("imap_pass")
     if b.get("o365_client_secret") == "****":
         b.pop("o365_client_secret")
+    # The two mail engines are mutually exclusive: whichever one is saved becomes
+    # the active provider and the other side's credentials are wiped.
+    provider = str(b.get("mail_provider") or site_mail_provider()).lower()
+    provider = "o365" if provider == "o365" else "smtp"
+    SMTP_KEYS = ("smtp_host", "smtp_port", "smtp_security", "smtp_user", "smtp_pass", "smtp_from",
+                 "imap_host", "imap_port", "imap_security", "imap_user", "imap_pass", "imap_folder")
+    O365_KEYS = ("o365_tenant", "o365_client_id", "o365_client_secret", "o365_scope")
+    if provider == "o365":
+        for k in SMTP_KEYS:
+            b[k] = ""
+        b["o365_mode"] = "1"
+    else:
+        for k in O365_KEYS:
+            b[k] = ""
+        b["o365_mode"] = "0"
     c = conn_()
     mailer.set_mail_cfg(c, b)
+    set_setting(c, "mail_provider", provider)
+    c.commit()
     c.close()
-    return ok(ok=True)
+    return ok(ok=True, provider=provider)
 
 
 @app.post("/api/admin/mail/test")

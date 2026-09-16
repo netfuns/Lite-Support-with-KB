@@ -159,3 +159,41 @@ kbd { background:#f1f1f1; padding:2px 6px; border-radius:4px; font-size:12px; }
   color:var(--ink); font-size:14px; text-decoration:none; width:100%;
 }
 .dropdown a:hover, .dropdown button:hover { background:var(--bg); color:var(--blue); }
+
+/* ---- brand mark (company logo + name, from Settings > Company info) ---- */
+header.app-bar .logo { text-decoration:none; display:inline-flex; align-items:center; }
+.brand-mark { display:inline-flex; align-items:center; gap:9px; }
+.brand-logo { height:26px; width:auto; }
+.brand-name { font-weight:700; font-size:17px; color:var(--ink); letter-spacing:-.01em; }
+
+/* ---- public welcome / home page ---- */
+.home { max-width:1000px; }
+.home-hero { display:flex; flex-direction:column; align-items:center; text-align:center; gap:10px;
+  padding:38px 20px 24px; }
+.home-logo { max-height:64px; width:auto; }
+.home-title { margin:0; font-size:32px; letter-spacing:-.015em; }
+.home-cta { margin-top:8px; display:flex; gap:10px; }
+.home-doc { margin-top:4px; }
+.home-doc .card-body { padding:22px 26px; }
+
+/* ---- settings sub-navigation ---- */
+.tabs { display:flex; gap:6px; border-bottom:1px solid var(--line); margin-bottom:16px; flex-wrap:wrap; }
+.tab { padding:8px 14px; font-size:14px; color:var(--ink-2); text-decoration:none; border-radius:8px 8px 0 0; }
+.tab:hover { background:var(--bg); }
+.tab.active { background:var(--card); border:1px solid var(--line); border-bottom-color:var(--card);
+  color:var(--blue); font-weight:600; margin-bottom:-1px; }
+
+/* ---- forms: inputs fill their container ---- */
+.card-body > input, .card-body > select, .card-body > textarea,
+.card-body label:not(.btn) input:not([type=checkbox]):not([type=radio]):not([type=file]),
+.card-body label:not(.btn) select,
+.card-body label:not(.btn) textarea,
+label.field input:not([type=checkbox]):not([type=radio]):not([type=file]),
+label.field select, label.field textarea { width:100%; }
+.field { display:block; margin:9px 0; }
+.field > span { display:block; margin-bottom:4px; font-size:13px; }
+.grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.full { width:100%; }
+.logo-preview { max-height:56px; width:auto; background:var(--bg); padding:6px 10px;
+  border:1px dashed var(--line); border-radius:6px; }
+@media (max-width:640px) { .grid-2 { grid-template-columns:1fr; } }

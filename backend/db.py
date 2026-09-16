@@ -206,6 +206,10 @@ def migrate():
     ac = _columns(conn, "kb_articles")
     if "module" not in ac:
         conn.execute("ALTER TABLE kb_articles ADD COLUMN module TEXT DEFAULT ''")
+    tk = _columns(conn, "tokens")
+    if "last_seen" not in tk:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_seen TEXT")
+        conn.execute("UPDATE tokens SET last_seen=created_at")
     conn.commit()
     conn.close()
 

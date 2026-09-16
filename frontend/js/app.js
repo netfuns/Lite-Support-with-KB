@@ -7,7 +7,17 @@ const state = {
   meta: null,
   products: [],
   token: null,
+  brand: null,
 };
+
+/** Company branding shown before (and after) login - settings > company info. */
+async function loadBrand() {
+  try {
+    const b = await fetch("/api/brand").then(r => r.json());
+    state.brand = b || {};
+  } catch (e) { state.brand = state.brand || {}; }
+  return state.brand || {};
+}
 
 // ----------------------------------------------------------------- api
 async function api(path, opts = {}) {
@@ -21,6 +31,7 @@ async function api(path, opts = {}) {
   if (res.status === 401) {
     document.cookie = "rz_token=; Max-Age=0; path=/";
     state.user = null; state.token = null;
+    stopIdleWatchdog();
     if (window.location.hash !== "#/login") window.location.hash = "#/login";
     throw new Error("unauthorized");
   }
@@ -120,21 +131,37 @@ function mdToHtml(md) {
 }
 
 // ----------------------------------------------------------------- layout
+/** Company logo + name, taken from settings > company info. */
+function brandMark(size) {
+  const b = state.brand || {};
+  const name = b.company_name || "RankEZ";
+  const logo = b.company_logo
+    ? h("img", { src: b.company_logo, class: "brand-logo", alt: name,
+                 style: size ? "height:" + size + "px" : null })
+    : null;
+  return h("span", { class: "brand-mark" }, logo, h("span", { class: "brand-name" }, name));
+}
+
 function layout(title, content) {
   const root = document.getElementById("root");
   root.innerHTML = "";
+  document.title = ((state.brand && state.brand.company_name) || "RankEZ") + " \u00b7 " + t("app");
   root.append(h("div", {},
     h("header", { class: "app-bar" },
-      h("div", { class: "logo" }, "RankEZ " + t("app")),
-      h("div", { class: "search-wrap" },
-        h("input", { placeholder: t("search"), oninput: "data-q" + " = this.value" }),
-        h("span", { class: "icon-search", onclick: doSearch }, "🔎")),
+      h("a", { class: "logo", href: state.user ? "#/dashboard" : "#/home" }, brandMark(26)),
+      state.user
+        ? h("div", { class: "search-wrap" },
+            h("input", { placeholder: t("search") }),
+            h("span", { class: "icon-search", onclick: doSearch }, "🔎"))
+        : h("div", { class: "search-wrap" }),
       h("div", { class: "actions" },
         h("select", { class: "lang", onchange: e => { setLang(e.target.value); render(current().route); } },
           LANGS.map(l => h("option", { value: l.id, selected: state.lang === l.id ? "selected" : null }, l.label))),
         state.user
           ? h("span", { class: "user", onclick: toggleUserMenu }, "👤 " + (state.user.display_name || state.user.email))
-          : h("button", { class: "btn btn-blue", onclick: () => window.location.hash = "#/login" }, t("login")),
+          : h("div", { style: "display:flex;gap:8px;align-items:center" },
+              h("a", { class: "btn btn-ghost btn-sm", href: "#/home" }, t("home")),
+              h("a", { class: "btn btn-blue btn-sm", href: "#/login" }, t("login"))),
       ),
     ),
     h("div", { class: "layout" },
@@ -224,28 +251,114 @@ async function logout() {
   try { await api("/api/auth/logout", { method: "POST" }); } catch (e) {}
   document.cookie = "rz_token=; Max-Age=0; path=/";
   state.user = null; state.token = null;
+  stopIdleWatchdog();
   window.location.hash = "#/login";
 }
 
+// --------------------------------------------------- idle session watchdog
+// The server expires a token after `session_timeout` minutes of inactivity and
+// after `session_max_lifetime` minutes from login, whichever comes first. The
+// browser mirrors the idle rule so the user gets a warning instead of a silent
+// failure, and it pings the server while the user is actually working so that a
+// long form-filling session is not killed by the server-side idle clock.
+const idle = { timer: null, lastActive: 0, lastPing: 0, warnEl: null, counter: null, timeoutMin: 0 };
+
+function markActive() { idle.lastActive = Date.now(); hideIdleWarning(); }
+["click", "keydown", "mousemove", "wheel", "touchstart"].forEach(
+  ev => window.addEventListener(ev, markActive, { passive: true }));
+
+function hideIdleWarning() {
+  if (idle.warnEl) { idle.warnEl.remove(); idle.warnEl = null; idle.counter = null; }
+}
+
+function showIdleWarning() {
+  if (idle.warnEl) return;
+  const counter = h("b", {}, "");
+  const el = h("div", { class: "modal", id: "rz-idle-warn" },
+    h("div", { class: "panel" },
+      h("div", { class: "head" }, t("session_timeout")),
+      h("div", { class: "body" }, h("p", {}, counter)),
+      h("div", { class: "foot" },
+        h("button", { class: "btn btn-blue", onclick: () => {
+          markActive();
+          api("/api/me/session").catch(() => {});
+        } }, t("stay_signed_in")),
+        h("button", { class: "btn btn-ghost", onclick: () => signOutExpired() }, t("logout")))));
+  document.body.append(el);
+  idle.warnEl = el;
+  idle.counter = counter;
+}
+
+async function checkIdle() {
+  if (!state.user || !idle.timeoutMin) return;
+  const limitMs = idle.timeoutMin * 60000;
+  const leftMs = limitMs - (Date.now() - idle.lastActive);
+  if (leftMs <= 0) { signOutExpired(); return; }
+  if (leftMs <= 60000) {
+    showIdleWarning();
+    if (idle.counter) idle.counter.textContent = t("session_idle_warning", { n: Math.ceil(leftMs / 1000) });
+  } else {
+    hideIdleWarning();
+  }
+  const beat = Math.max(20000, limitMs / 4);
+  if (Date.now() - idle.lastPing > beat) {
+    idle.lastPing = Date.now();
+    try {
+      const r = await api("/api/me/session");
+      if (r && typeof r.idle_left === "number" && r.idle_left <= 0) signOutExpired();
+    } catch (e) { /* api() already handled 401 */ }
+  }
+}
+
+function signOutExpired() {
+  stopIdleWatchdog();
+  document.cookie = "rz_token=; Max-Age=0; path=/";
+  state.user = null; state.token = null; state.me_perms = new Set();
+  if (window.location.hash !== "#/login") window.location.hash = "#/login";
+  setTimeout(() => toast(t("session_expired"), false), 80);
+}
+
+function startIdleWatchdog() {
+  stopIdleWatchdog();
+  const min = Number((state.meta && state.meta.session_timeout) || 0);
+  idle.timeoutMin = min;
+  if (!min) return;               // 0 = never expire
+  idle.lastActive = Date.now();
+  idle.lastPing = Date.now();
+  idle.timer = setInterval(checkIdle, 5000);
+}
+
+function stopIdleWatchdog() {
+  if (idle.timer) { clearInterval(idle.timer); idle.timer = null; }
+  idle.timeoutMin = 0;
+  hideIdleWarning();
+}
+
+function navLink(href, label) {
+  const here = "#" + ((window.location.hash || "").replace(/^#/, "") || "/home");
+  const active = here === href || (href !== "#/home" && here.indexOf(href + "/") === 0);
+  return h("a", { href, class: active ? "active" : null }, label);
+}
+
 function sidebar() {
-  const links = [
-    ["#/dashboard", t("dashboard"), true],
-    ["#/tickets", t("tickets"), true],
-  ];
-  if (hasPerm("ticket.create")) links.push(["#/new-ticket", "+" + t("new_ticket"), false]);
-  links.push(["#/kb", t("kb"), true]);
-  if (hasPerm("customer.view")) links.push(["#/customers", t("customers"), false]);
   const items = [];
-  links.forEach(([href, label, active]) => items.push(h("a", { href, class: "active" + (active ? " active" : "") }, label)));
+  items.push(navLink("#/dashboard", t("dashboard")));
+  items.push(navLink("#/tickets", t("tickets")));
+  if (hasPerm("ticket.create")) items.push(navLink("#/new-ticket", "+" + t("new_ticket")));
+  items.push(navLink("#/kb", t("kb")));
+  if (hasPerm("customer.view")) items.push(navLink("#/customers", t("customers")));
   if (hasPerm("user.manage") || hasPerm("role.manage") || hasPerm("group.manage") || hasPerm("settings.mail")) {
     items.push(h("div", { class: "sep-label" }, t("admin")));
-    if (hasPerm("user.manage")) items.push(h("a", { href: "#/admin/users" }, t("users")));
-    if (hasPerm("role.manage")) items.push(h("a", { href: "#/admin/roles" }, t("roles")));
-    if (hasPerm("group.manage")) items.push(h("a", { href: "#/admin/groups" }, t("groups")));
+    if (hasPerm("user.manage")) items.push(navLink("#/admin/users", t("users")));
+    if (hasPerm("role.manage")) items.push(navLink("#/admin/roles", t("roles")));
+    if (hasPerm("group.manage")) items.push(navLink("#/admin/groups", t("groups")));
     if (hasPerm("settings.mail")) {
       items.push(h("div", { class: "sep-label" }, t("settings")));
-      items.push(h("a", { href: "#/admin/settings" }, t("mail_settings")));
-      items.push(h("a", { href: "#/admin/site" }, t("site_settings")));
+      items.push(navLink("#/admin/site", t("site_settings")));
+      items.push(navLink("#/admin/welcome", t("welcome_page")));
+      items.push(navLink("#/admin/company", t("company_info")));
+      items.push(navLink("#/admin/domains", t("bind_domains")));
+      items.push(navLink("#/admin/settings", t("mail_settings")));
     }
   }
   return h("nav", { class: "sidebar" }, items);
@@ -262,8 +375,14 @@ async function render() {
   const c = current();
   // handle sub-routes
   let route = c.raw.replace(/^\/?/, "").split("/")[0];
+  // these views dereference state.user, so an anonymous visitor must not reach them
+  if (!state.user && (route === "dashboard" || route === "me" || route === "admin")) {
+    if (window.location.hash !== "#/login") window.location.hash = "#/login";
+    return;
+  }
   let view;
-  if (route === "dashboard") view = dashboardView();
+  if (route === "" || route === "home" || route === "welcome") view = homeView();
+  else if (route === "dashboard") view = dashboardView();
   else if (route === "tickets") view = ticketsView();
   else if (route === "ticket") view = ticketDetail(c.raw.split("/")[1]);
   else if (route === "new-ticket") view = newTicketView();
@@ -281,9 +400,10 @@ async function render() {
     // raw is "/admin/users" -> split("/") = ["", "admin", "users"]
     const sub = c.raw.split("/")[2] || "users";
     const map = { users: adminUsers, roles: adminRoles, groups: adminGroups,
-                  settings: adminSettings, site: adminSite };
+                  settings: adminSettings, site: adminSite, welcome: adminWelcome,
+                  company: adminCompany, domains: adminDomains };
     view = (map[sub] || adminUsers)();
-  } else view = dashboardView();
+  } else view = state.user ? dashboardView() : homeView();
   view = await view;
   layout(view.title, view.body);
 }
@@ -291,12 +411,31 @@ async function render() {
 window.addEventListener("hashchange", () => render());
 
 // ----------------------------------------------------------------- views
+/** Public landing page: company logo + name, Sign in button, admin-editable Markdown. */
+async function homeView() {
+  if (!state.brand) await loadBrand();
+  const b = state.brand || {};
+  const name = b.company_name || "RankEZ";
+  const body = h("div", { class: "home" },
+    h("section", { class: "home-hero" },
+      b.company_logo ? h("img", { src: b.company_logo, class: "home-logo", alt: name }) : null,
+      h("h1", { class: "home-title" }, name),
+      h("p", { class: "muted" }, t("welcome_hero_sub")),
+      h("div", { class: "home-cta" },
+        state.user
+          ? h("a", { class: "btn btn-blue", href: "#/dashboard" }, t("go_dashboard"))
+          : h("a", { class: "btn btn-blue", href: "#/login" }, t("login")))),
+    h("section", { class: "card home-doc" },
+      h("div", { class: "card-body markdown", innerHTML: mdToHtml(b.welcome_md || "") })));
+  return { title: "", body };
+}
+
 function loginView() {
   const email = h("input", { name: "email", type: "email", placeholder: t("email"), required: true });
   const pw = h("input", { name: "password", type: "password", placeholder: t("password"), required: true });
   const totp = h("input", { name: "totp", class: "totp hidden", type: "text", placeholder: "TOTP" });
-  const body = h("div", { style: "max-width:360px;margin:60px auto" },
-    h("h1", { style: "text-align:center" }, "RankEZ"),
+  const body = h("div", { style: "max-width:380px;margin:60px auto" },
+    h("div", { style: "text-align:center;margin-bottom:16px" }, brandMark(34)),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("div", {}, email, pw, totp),
       h("button", { class: "btn btn-blue", style: "width:100%;margin-top:10px", onclick: async (e) => {
@@ -315,10 +454,13 @@ function loginView() {
         state.modules = state.meta.modules || [];
         state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
         applyTheme(state.meta.theme);
+        startIdleWatchdog();
         window.location.hash = "#/dashboard";
       } }, t("sign_in_btn")),
       h("p", { class: "muted", style: "text-align:center;margin-top:10px" },
-        h("a", { href: "#/register" }, t("register"))))),
+        h("a", { href: "#/register" }, t("register")),
+        " \u00b7 ",
+        h("a", { href: "#/home" }, t("home"))))),
   );
   return { title: "", body };
 }
@@ -483,7 +625,7 @@ async function ticketDetail(id) {
   const archChk = h("input", { type: "checkbox", checked: true });
   const desChk = h("input", { type: "checkbox", checked: true });
   const visSel = h("select", {},
-    ["registered", "usergroup", "internal"].map(v => h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
+    ["registered", "internal"].map(v => h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
 
   const statusBtn = h("button", { class: "btn btn-ghost", onclick: async () => {
     if (!closeSel.value) return;
@@ -598,8 +740,10 @@ async function newTicketView() {
             fd.set("description", desc.value);
             if (intChk.checked) fd.set("internal", "1");
             for (const f of fileInp.files) fd.append("files", f);
-            const r = await apiForm("/api/tickets", fd);
-            toast("OK: " + r.code); window.location.hash = "#/ticket/" + r.id;
+            try {
+              const r = await apiForm("/api/tickets", fd);
+              toast("OK: " + r.code); window.location.hash = "#/ticket/" + r.id;
+            } catch (e) { toast(e.message, false); }
           } }, t("submit")),
           h("button", { class: "btn btn-ghost", style: "margin-left:8px", onclick: () => window.location.hash = "#/tickets" }, t("cancel")))))));
   return { title: "", body };
@@ -666,7 +810,7 @@ async function kbView() {
 function openImportModal(preCol) {
   const colSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("collections"))]);
   const visSel = h("select", {},
-    ["public", "registered", "internal", "usergroup"].map(v => h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
+    ["public", "registered", "internal"].map(v => h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
   const fileInp = h("input", { type: "file", multiple: true });
   const body = h("div", {},
     h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("collections")), colSel),
@@ -705,17 +849,10 @@ async function kbEditorPage(id) {
 
   const visSel = h("select", { style: "width:100%" },
     ["public", "registered", "internal"].map(v => h("option", { value: v, selected: (art ? art.visibility : "registered") === v ? "selected" : null }, t(v))));
-  const grpSel = h("select", { style: "width:100%" }, [h("option", { value: "" }, "- " + t("groups") + " -")]);
   const modules = (state.modules && state.modules.length) ? state.modules : [];
   const modSel = h("select", { style: "width:100%" },
     h("option", { value: "" }, "- " + t("module") + " -"),
     modules.map(m => h("option", { value: m, selected: art && art.module === m ? "selected" : null }, m)));
-  loadGroupOptions(grpSel, art ? (art.group_ids || []) : []);
-
-  const grpRow = h("label", { style: "display:block" }, h("span", { class: "muted" }, t("usergroup")), grpSel);
-  const syncGrp = () => { grpRow.style.display = visSel.value === "registered" ? "block" : "none"; };
-  visSel.addEventListener("change", syncGrp);
-
   const body = h("div", {},
     h("div", { class: "flex-between mb-2" },
       h("h1", {}, id ? t("edit_article") : t("new_article_title")),
@@ -724,8 +861,7 @@ async function kbEditorPage(id) {
         h("button", { class: "btn btn-blue btn-sm", style: "margin-left:8px", onclick: async () => {
           if (!title.value.trim()) { toast(t("kb_title") + " *", false); return; }
           const payload = { title: title.value, body: bodyTa.value, visibility: visSel.value,
-                            module: modSel.value,
-                            group_ids: visSel.value === "registered" && grpSel.value ? [Number(grpSel.value)] : [] };
+                            module: modSel.value };
           try {
             if (id) await api("/api/kb/articles/" + id, { method: "PUT", body: JSON.stringify(payload) });
             else { const r = await api("/api/kb/articles", { method: "POST", body: JSON.stringify(payload) }); id = r.id; }
@@ -734,13 +870,11 @@ async function kbEditorPage(id) {
         } }, t("save")))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("kb_title")), title),
-      h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px" },
+      h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" },
         h("label", {}, h("span", { class: "muted" }, t("visibility")), visSel),
-        grpRow,
         h("label", {}, h("span", { class: "muted" }, t("module")), modSel)),
       h("label", { style: "display:block;margin:12px 0 6px" }, h("span", { class: "muted" }, t("kb_body")), bodyTa))));
   setTimeout(autoGrow, 0);
-  syncGrp();
   return { title: "", body };
 }
 
@@ -824,7 +958,11 @@ async function kbDetail(id) {
 
 function openCustomerEditor(cust, onDone) {
   const isNew = !cust;
-  const f = (key, type) => h("input", { value: cust ? (cust[key] || "") : "", type: type || "text", placeholder: t(key), style: "width:100%" });
+  // an <input type="date"> silently blanks any value that is not YYYY-MM-DD
+  const dv = v => (/^\d{4}-\d{2}-\d{2}/.test(v || "") ? String(v).slice(0, 10) : "");
+  const f = (key, type) => h("input", {
+    value: cust ? (type === "date" ? dv(cust[key]) : (cust[key] || "")) : "",
+    type: type || "text", placeholder: t(key), style: "width:100%" });
   const name = f("name"), domains = f("domains"), version = f("version");
   const start = f("service_start", "date"), end = f("service_end", "date"), contact = f("contact_email", "email");
   const body = h("div", { style: "min-width:460px" },
@@ -837,7 +975,12 @@ function openCustomerEditor(cust, onDone) {
     h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("contact_email")), contact),
     h("div", { class: "flex-between mt-2" },
       h("button", { class: "btn btn-blue", onclick: async () => {
-        if (!name.value || !domains.value) { toast(t("name") + " / " + t("domains") + " *", false); return; }
+        // Only the name is universally required. Email domains are mandatory when
+        // creating (the API enforces that too), but an existing customer may
+        // legitimately have none -- requiring it here made every edit of such a
+        // record silently refuse to save.
+        if (!name.value.trim()) { toast(t("name") + " *", false); return; }
+        if (isNew && !domains.value.trim()) { toast(t("name") + " / " + t("domains") + " *", false); return; }
         const payload = { name: name.value, domains: domains.value, version: version.value,
                           service_start: start.value, service_end: end.value, contact_email: contact.value };
         try {
@@ -1197,40 +1340,104 @@ async function adminUsers() {
   return { title: "", body };
 }
 
+/** Role page: every role is listed, click a name to edit it.
+ *  Built-in roles are read-only; only custom roles get a delete button. */
 async function adminRoles() {
-  if (!hasPerm("role.manage")) return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
-  const meta = await api("/api/meta");
-  const roles = await api("/api/admin/roles");
-  const cards = (roles.items || []).map(r => {
-    const perms = meta.permissions.filter(p => r.permissions.includes(p.key));
-    const grp = h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:4px" },
-      perms.map(p => h("label", { class: "muted", style: "font-size:13px" },
-        h("input", { type: "checkbox", checked: "checked", onchange: e => {
-          if (e.target.checked) r.permissions.push(p.key); else r.permissions = r.permissions.filter(k => k !== p.key);
-        } }, p.key + " (" + (p.grp || p.group) + ")"))));
-    const saveBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-      await api("/api/admin/roles/" + r.id, { method: "PUT", body: JSON.stringify({ permissions: r.permissions }) });
-      toast("OK"); setTimeout(render, 300);
-    } }, t("save"));
-    const delBtn = !r.builtin ? h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626;margin-left:6px", onclick: async () => {
-      await api("/api/admin/roles/" + r.id, { method: "DELETE" }); toast("OK"); setTimeout(render, 300);
-    } }, t("delete")) : null;
-    return h("div", { class: "card mb-2" },
-      h("div", { class: "card-body" },
-        h("div", { class: "flex-between" },
-          h("h3", {}, r.name + (r.builtin ? " (" + t("builtin") + ")" : "")),
-          h("div", {}, saveBtn, delBtn)),
-        grp));
-  });
+  if (!hasPerm("role.manage")) return noAccess();
+  let roles = { items: [] }, matrix = { menu: [] };
+  try {
+    const [r1, r2] = await Promise.all([api("/api/admin/roles"), api("/api/admin/perm_matrix")]);
+    roles = r1; matrix = r2;
+  } catch (e) { toast(e.message, false); }
+  const menu = matrix.menu || [];
+  const tbody = h("tbody", {});
+
+  for (const r of (roles.items || [])) {
+    tbody.append(h("tr", {},
+      h("td", {}, h("a", { href: "javascript:void(0)", onclick: () => openRoleEditor(r, menu) }, r.name)),
+      h("td", {}, r.description || "-"),
+      h("td", {}, r.builtin ? h("span", { class: "tag internal" }, t("builtin"))
+                            : h("span", { class: "muted" }, t("custom_role"))),
+      h("td", {}, String((r.permissions || []).length)),
+      h("td", {}, r.builtin
+        ? h("span", { class: "muted" }, "\u2014")
+        : h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
+            if (!confirm(t("confirm_delete") + " " + r.name)) return;
+            try {
+              await api("/api/admin/roles/" + r.id, { method: "DELETE" });
+              toast(t("saved")); render();
+            } catch (e) { toast(e.message, false); }
+          } }, t("delete")))));
+  }
+  if (!(roles.items || []).length) {
+    tbody.append(h("tr", {}, h("td", { colspan: 5, class: "muted" }, t("no_results"))));
+  }
+
   const body = h("div", {},
-    h("div", { class: "flex-between" }, h("h1", {}, t("roles")),
-      hasPerm("role.manage") ? h("button", { class: "btn btn-blue btn-sm", onclick: async () => {
-        const name = prompt("Role name"); if (!name) return;
-        await api("/api/admin/roles", { method: "POST", body: JSON.stringify({ name, permissions: [] }) });
-        toast("OK"); render();
-      } }, "+" + t("add_role")) : null),
-    cards);
+    h("div", { class: "toolbar" },
+      h("div", { class: "toolbar-left" }, h("h1", { style: "margin:0" }, t("roles"))),
+      h("div", { class: "toolbar-right" },
+        h("button", { class: "btn btn-blue btn-sm", onclick: () => openRoleEditor(null, menu) },
+          "+" + t("new_role")))),
+    h("p", { class: "muted" }, t("builtin_role_hint")),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("table", {},
+        h("thead", {}, h("tr", {},
+          [t("name"), t("description"), t("status"), t("permission"), t("actions")].map(x => h("th", {}, x)))),
+        tbody))));
   return { title: "", body };
+}
+
+/** Create / edit a role. Access is granted per left-hand menu entry: none | read | edit. */
+function openRoleEditor(role, menu) {
+  const isNew = !role;
+  const builtin = !!(role && role.builtin);
+  const ro = builtin ? true : null;
+  const name = h("input", { value: role ? role.name : "", placeholder: t("role_name"),
+    style: "width:100%", disabled: ro });
+  const desc = h("input", { value: role ? (role.description || "") : "", placeholder: t("description"),
+    style: "width:100%" });
+  const levels = Object.assign({}, (role && role.levels) || {});
+  const selects = {};
+  const rows = (menu || []).map(item => {
+    if (!item.read.length && !item.edit.length) {
+      return h("tr", {}, h("td", {}, t("menu_" + item.key)),
+        h("td", { class: "muted" }, t("dashboard_always")));
+    }
+    const sel = h("select", { style: "width:170px", disabled: ro },
+      [["none", t("level_none")], ["read", t("level_read")], ["edit", t("level_edit")]]
+        .map(([v, label]) => h("option", {
+          value: v, selected: (levels[item.key] || "none") === v ? "selected" : null }, label)));
+    selects[item.key] = sel;
+    return h("tr", {}, h("td", {}, t("menu_" + item.key)), h("td", {}, sel));
+  });
+
+  const body = h("div", { style: "min-width:540px;max-height:70vh;overflow:auto" },
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("role_name")), name),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("description")), desc),
+    h("h3", { style: "margin-top:12px" }, t("level")),
+    h("p", { class: "muted" }, t("menu_perm_hint")),
+    h("table", {},
+      h("thead", {}, h("tr", {}, [t("menu_entry"), t("level")].map(x => h("th", {}, x)))),
+      h("tbody", {}, rows)),
+    builtin ? h("p", { class: "muted", style: "margin-top:10px" }, t("builtin_role_hint")) : null,
+    h("div", { class: "flex-between mt-2" },
+      builtin ? h("span", {}) :
+        h("button", { class: "btn btn-blue", onclick: async () => {
+          if (!name.value.trim()) { toast(t("role_name") + " *", false); return; }
+          const lv = {};
+          for (const k of Object.keys(selects)) lv[k] = selects[k].value;
+          const payload = { name: name.value.trim(), description: desc.value, levels: lv };
+          try {
+            if (isNew) await api("/api/admin/roles", { method: "POST", body: JSON.stringify(payload) });
+            else await api("/api/admin/roles/" + role.id, { method: "PUT", body: JSON.stringify(payload) });
+            toast(t("saved")); closeModal(); render();
+          } catch (e) {
+            toast(e.message === "role_name_taken" ? t("role_name_taken") : e.message, false);
+          }
+        } }, t("save")),
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+  showModal(isNew ? t("new_role") : t("edit_role"), body);
 }
 
 async function adminGroups() {
@@ -1298,16 +1505,23 @@ async function adminSite() {
   renderDoms();
 
   const timeoutInp = h("input", { type: "number", min: 0, value: String(s.session_timeout || 0), style: "width:120px" });
+  const maxLifeInp = h("input", { type: "number", min: 0,
+    value: String(s.session_max_lifetime == null ? 1440 : s.session_max_lifetime), style: "width:120px" });
   const themeSel = h("select", {},
     [["light", t("theme_light")], ["dark", t("theme_dark")], ["system", t("theme_system")]]
       .map(([v, label]) => h("option", { value: v, selected: (s.theme || "light") === v ? "selected" : null }, label)));
 
   const body = h("div", { style: "max-width:860px" },
+    settingsTabs("site"),
     h("h1", {}, t("site_settings")),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
       h("h3", {}, t("session_timeout")),
       h("p", { class: "muted" }, t("session_timeout_hint")),
       h("div", { style: "display:flex;gap:8px;align-items:center" }, timeoutInp,
+        h("span", { class: "muted" }, t("minutes"))),
+      h("h3", { style: "margin-top:14px" }, t("session_max_lifetime")),
+      h("p", { class: "muted" }, t("session_max_lifetime_hint")),
+      h("div", { style: "display:flex;gap:8px;align-items:center" }, maxLifeInp,
         h("span", { class: "muted" }, t("minutes"))),
       h("h3", { style: "margin-top:14px" }, t("page_theme")),
       h("div", { style: "display:flex;gap:8px;align-items:center" }, themeSel))),
@@ -1336,13 +1550,153 @@ async function adminSite() {
         try {
           await api("/api/admin/site", { method: "POST", body: JSON.stringify({
             modules, internal_domains: domains,
-            session_timeout: Number(timeoutInp.value || 0), theme: themeSel.value }) });
+            session_timeout: Number(timeoutInp.value || 0),
+            session_max_lifetime: Number(maxLifeInp.value || 0),
+            theme: themeSel.value }) });
           applyTheme(themeSel.value);
           toast(t("saved"));
           const m = await api("/api/meta");
-          state.modules = m.modules; state.deployTypes = m.deploy_types; render();
+          state.meta = m;
+          state.modules = m.modules; state.deployTypes = m.deploy_types;
+          startIdleWatchdog();
+          render();
         } catch (e) { toast(e.message, false); }
       } }, t("save"))));
+  return { title: "", body };
+}
+
+/** Shared sub-navigation for the Settings section. */
+function settingsTabs(active) {
+  const tabs = [
+    ["site", "site_settings"],
+    ["welcome", "welcome_page"],
+    ["company", "company_info"],
+    ["domains", "bind_domains"],
+    ["settings", "mail_settings"],
+  ];
+  return h("div", { class: "tabs" },
+    tabs.map(([key, label]) => h("a", {
+      href: "#/admin/" + key, class: "tab" + (active === key ? " active" : null) }, t(label))));
+}
+
+async function loadSiteSettings() {
+  try { return await api("/api/admin/site"); }
+  catch (e) { toast(e.message, false); return null; }
+}
+
+/** Settings > Welcome page: Markdown shown on the public landing page. */
+async function adminWelcome() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  const s = await loadSiteSettings();
+  if (!s) return noAccess();
+  const ta = h("textarea", { rows: 16,
+    style: "width:100%;box-sizing:border-box;font-family:ui-monospace,Menlo,Consolas,monospace;line-height:1.6" });
+  ta.value = s.welcome_md || "";
+  const previewBody = h("div", { class: "card-body markdown" });
+  const preview = h("div", { class: "card" }, previewBody);
+  const paint = () => { previewBody.innerHTML = mdToHtml(ta.value); };
+  ta.addEventListener("input", paint);
+  setTimeout(paint, 0);
+
+  const body = h("div", { style: "max-width:1000px" },
+    settingsTabs("welcome"),
+    h("div", { class: "toolbar" },
+      h("div", { class: "toolbar-left" }, h("h1", { style: "margin:0" }, t("welcome_page"))),
+      h("div", { class: "toolbar-right" },
+        h("button", { class: "btn btn-blue btn-sm", onclick: async () => {
+          try {
+            await api("/api/admin/site", { method: "POST", body: JSON.stringify({ welcome_md: ta.value }) });
+            await loadBrand();
+            toast(t("saved"));
+          } catch (e) { toast(e.message, false); }
+        } }, t("save")))),
+    h("p", { class: "muted" }, t("welcome_page_hint")),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" }, ta)),
+    h("h3", {}, t("welcome_preview")),
+    preview);
+  return { title: "", body };
+}
+
+/** Settings > Company info: display name + logo upload. */
+async function adminCompany() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  const s = await loadSiteSettings();
+  if (!s) return noAccess();
+  const nameInp = h("input", { value: s.company_name || "", placeholder: t("company_name"), style: "width:100%" });
+  const logoImg = h("img", { src: s.company_logo || "", class: "logo-preview", alt: "" });
+  const fileInp = h("input", { type: "file", accept: "image/*", style: "display:none", onchange: async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append("file", f);
+    try {
+      const r = await apiForm("/api/admin/site/logo", fd);
+      logoImg.src = (r.logo || "") + "?v=" + Date.now();
+      await loadBrand();
+      toast(t("saved"));
+    } catch (err) { toast(err.message, false); }
+    e.target.value = "";
+  } });
+
+  const body = h("div", { style: "max-width:760px" },
+    settingsTabs("company"),
+    h("h1", {}, t("company_info")),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("company_name")),
+      nameInp,
+      h("button", { class: "btn btn-blue btn-sm", style: "margin-top:10px", onclick: async () => {
+        try {
+          await api("/api/admin/site", { method: "POST", body: JSON.stringify({ company_name: nameInp.value }) });
+          await loadBrand();
+          toast(t("saved"));
+        } catch (e) { toast(e.message, false); }
+      } }, t("save")),
+      h("h3", { style: "margin-top:18px" }, t("company_logo")),
+      s.company_logo ? h("div", { style: "margin-bottom:10px" },
+        h("div", { class: "muted" }, t("logo_current")), logoImg) : null,
+      h("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" },
+        h("label", { class: "btn btn-ghost btn-sm" }, t("upload_logo"), fileInp),
+        h("span", { class: "muted", style: "font-size:13px" }, t("logo_hint"))))));
+  return { title: "", body };
+}
+
+/** Settings > Bound domains: allow-list of hosts; empty = allow everything. */
+async function adminDomains() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  const s = await loadSiteSettings();
+  if (!s) return noAccess();
+  const hosts = (s.allowed_hosts || []).slice();
+  const list = h("div", {});
+  const inp = h("input", { placeholder: t("domain_placeholder"), style: "flex:1" });
+  const paint = () => {
+    list.innerHTML = "";
+    if (!hosts.length) list.append(h("div", { class: "muted" }, "\u2014"));
+    hosts.forEach((x, i) => list.append(h("div", {
+      class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
+      h("span", {}, x),
+      h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626",
+        onclick: () => { hosts.splice(i, 1); paint(); } }, t("delete")))));
+  };
+  paint();
+
+  const body = h("div", { style: "max-width:760px" },
+    settingsTabs("domains"),
+    h("h1", {}, t("bind_domains")),
+    h("p", { class: "muted" }, t("bind_domains_hint")),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      list,
+      h("div", { style: "display:flex;gap:8px;margin-top:12px" }, inp,
+        h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          const v = inp.value.trim().toLowerCase()
+            .replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/^\.+/, "").split(":")[0];
+          if (!v) return;
+          if (!hosts.includes(v)) hosts.push(v);
+          inp.value = ""; paint();
+        } }, "+" + t("add"))),
+      h("button", { class: "btn btn-blue", style: "margin-top:12px", onclick: async () => {
+        try {
+          await api("/api/admin/site", { method: "POST", body: JSON.stringify({ allowed_hosts: hosts }) });
+          toast(t("saved"));
+        } catch (e) { toast(e.message, false); }
+      } }, t("save")))));
   return { title: "", body };
 }
 
@@ -1353,68 +1707,91 @@ function applyTheme(theme) {
 }
 
 async function adminSettings() {
-  if (!hasPerm("settings.mail")) return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
+  if (!hasPerm("settings.mail")) return noAccess();
   let cfg;
-  try { cfg = (await api("/api/admin/settings")).config; } catch (e) { return { title: "", body: h("div", {}, t("no_results")) }; }
-  const f = (key, type) => h("input", { value: cfg[key] || "", type, name: key });
-  const o365Chk = h("input", { type: "checkbox", checked: cfg.o365_mode === "1" });
-  const o365Fields = h("div", { class: "muted" },
-    h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("o365_tenant")), f("o365_tenant")),
-    h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("o365_client_id")), f("o365_client_id")),
-    h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("o365_client_secret")), f("o365_client_secret")),
-    h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("o365_scope")), f("o365_scope")));
+  try { cfg = (await api("/api/admin/settings")).config; } catch (e) { return noAccess(); }
+
+  // The two mail engines are mutually exclusive: whichever one is saved becomes
+  // the active provider and the server wipes the other side's credentials.
+  const curProv = cfg.o365_mode === "1" ? "o365" : "smtp";
+  const provSel = h("select", { class: "full" },
+    [["smtp", t("provider_smtp")], ["o365", t("provider_o365")]]
+      .map(([v, label]) => h("option", { value: v, selected: curProv === v ? "selected" : null }, label)));
+  const f = (key, type) => h("input", { value: cfg[key] || "", type: type || "text", name: key, class: "full" });
+  const lab = (label, el) => h("label", { class: "field" }, h("span", { class: "muted" }, label), el);
+  const secSel = h("select", { name: "smtp_security", class: "full" },
+    ["ssl", "starttls"].map(v => h("option", {
+      value: v, selected: (cfg.smtp_security || "ssl") === v ? "selected" : null }, t(v))));
+  const smtpPanel = h("div", {},
+    h("h3", {}, "SMTP"),
+    lab(t("smtp_host"), f("smtp_host")),
+    h("div", { class: "grid-2" },
+      lab(t("smtp_port"), f("smtp_port", "number")),
+      lab(t("smtp_security"), secSel)),
+    lab(t("smtp_user"), f("smtp_user")),
+    lab(t("smtp_pass"), f("smtp_pass", "password")),
+    lab(t("smtp_from"), f("smtp_from")),
+    h("h3", { style: "margin-top:16px" }, "IMAP"),
+    lab(t("imap_host"), f("imap_host")),
+    h("div", { class: "grid-2" },
+      lab(t("imap_port"), f("imap_port", "number")),
+      lab(t("imap_folder"), f("imap_folder"))),
+    lab(t("imap_user"), f("imap_user")),
+    lab(t("imap_pass"), f("imap_pass", "password")),
+    lab(t("base_url"), f("base_url")));
+  const o365Panel = h("div", {},
+    h("h3", {}, t("provider_o365")),
+    lab(t("o365_tenant"), f("o365_tenant")),
+    lab(t("o365_client_id"), f("o365_client_id")),
+    lab(t("o365_client_secret"), f("o365_client_secret", "password")),
+    lab(t("o365_scope"), f("o365_scope")));
+  const syncProv = () => {
+    smtpPanel.style.display = provSel.value === "smtp" ? "block" : "none";
+    o365Panel.style.display = provSel.value === "o365" ? "block" : "none";
+  };
+  provSel.addEventListener("change", syncProv);
   const pollBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-    const r = await api("/api/admin/mail/poll", { method: "POST" });
-    toast("Polled: " + r.handled + " messages");
+    try {
+      const r = await api("/api/admin/mail/poll", { method: "POST" });
+      toast("Polled: " + r.handled + " messages");
+    } catch (e) { toast(e.message, false); }
   } }, t("poll_now"));
   const testBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
     const to = prompt("To address"); if (!to) return;
-    const r = await api("/api/admin/mail/test", { method: "POST", body: JSON.stringify({ to }) });
-    toast("Sent: " + (r.sent ? "yes" : "no"));
+    try {
+      const r = await api("/api/admin/mail/test", { method: "POST", body: JSON.stringify({ to }) });
+      toast("Sent: " + (r.sent ? "yes" : "no"));
+    } catch (e) { toast(e.message, false); }
   } }, t("test"));
-  const body = h("div", { style: "max-width:760px" },
-    h("div", { class: "flex-between mb-2" }, h("h1", {}, t("mail_settings")),
-      h("a", { class: "btn btn-ghost btn-sm", href: "#/admin/site" }, t("site_settings"))),
+  const body = h("div", { style: "max-width:860px" },
+    settingsTabs("settings"),
+    h("h1", {}, t("mail_settings")),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("mail_provider")),
+      provSel,
+      h("p", { class: "muted", style: "margin-top:8px" }, t("provider_exclusive_hint")))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, "SMTP host"), f("smtp_host")),
-      h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px" },
-        h("label", {}, h("span", { class: "muted" }, "Port"), f("smtp_port", "number")),
-        h("label", {}, h("span", { class: "muted" }, "Security"),
-          h("select", { value: cfg.smtp_security || "ssl" },
-            h("option", { value: "ssl", selected: (cfg.smtp_security || "ssl") === "ssl" ? "selected" : null }, t("ssl")),
-            h("option", { value: "starttls", selected: (cfg.smtp_security || "ssl") === "starttls" ? "selected" : null }, t("starttls")))),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("smtp_user")), f("smtp_user")),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("smtp_pass")), f("smtp_pass", "password")),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("smtp_from")), f("smtp_from")),
-      h("h3", { style: "margin-top:14px" }, "IMAP"),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, "IMAP host"), f("imap_host")),
-      h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px" },
-        h("label", {}, h("span", { class: "muted" }, "Port"), f("imap_port", "number")),
-        h("label", {}, h("span", { class: "muted" }, "Folder"), f("imap_folder"))),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("imap_user")), f("imap_user")),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("imap_pass")), f("imap_pass", "password")),
-      h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, "Base URL"), f("base_url")),
-      h("label", { class: "muted", style: "display:block;margin:8px 0" }, o365Chk, " " + t("o365_mode")),
-      o365Fields,
-      h("div", { style: "display:flex;gap:8px;margin-top:10px" },
+      smtpPanel, o365Panel,
+      h("div", { style: "display:flex;gap:8px;margin-top:14px" },
         h("button", { class: "btn btn-blue", onclick: async () => {
-          const b = { smtp_host: cfg.smtp_host || "" };
-          for (const inp of document.querySelectorAll(".card input[name]")) b[inp.name] = inp.value;
-          b.o365_mode = o365Chk.checked ? "1" : "0";
-          for (const inp of o365Fields.querySelectorAll("[name]")) b[inp.name] = inp.value;
-          const sel = document.querySelector(".card select");
-          if (sel) b.smtp_security = sel.value;
-          await api("/api/admin/settings", { method: "POST", body: JSON.stringify(b) });
-          toast("Saved");
+          const b = { mail_provider: provSel.value };
+          const scope = provSel.value === "smtp" ? smtpPanel : o365Panel;
+          for (const el of scope.querySelectorAll("input[name], select[name]")) b[el.name] = el.value;
+          try {
+            await api("/api/admin/settings", { method: "POST", body: JSON.stringify(b) });
+            toast(t("saved"));
+            render();
+          } catch (e) { toast(e.message, false); }
         } }, t("save")),
-        testBtn, pollBtn)))));
+        testBtn, pollBtn))));
+  setTimeout(syncProv, 0);
   return { title: "", body };
 }
-
 // ----------------------------------------------------------------- boot
 state.lang = localStorage.getItem("rz_lang") || "en";
 document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh" ? "zh-CN" : "zh-TW");
 (async function boot() {
+  await loadBrand();
   const tk = document.cookie.split(";").map(x => x.trim()).find(x => x.startsWith("rz_token="));
   if (tk) {
     state.token = tk.split("=")[1];
@@ -1426,6 +1803,7 @@ document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh
       state.modules = state.meta.modules || [];
       state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
       applyTheme(state.meta.theme);
+      startIdleWatchdog();
     } catch (e) { state.user = null; state.token = null; }
   }
   render();
