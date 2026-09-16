@@ -219,7 +219,7 @@ function current() {
   return { route: path.slice(1) || "dashboard", raw };
 }
 
-function render() {
+async function render() {
   const c = current();
   // handle sub-routes
   let route = c.raw.replace(/^\/?/, "").split("/")[0];
@@ -240,10 +240,11 @@ function render() {
     view = ({ users: adminUsers, roles: adminRoles, groups: adminGroups, settings: adminSettings })[sub] ?
       ({ users: adminUsers, roles: adminRoles, groups: adminGroups, settings: adminSettings })[sub]() : adminUsers();
   } else view = dashboardView();
+  view = await view;
   layout(view.title, view.body);
 }
 
-window.addEventListener("hashchange", render);
+window.addEventListener("hashchange", () => render());
 
 // ----------------------------------------------------------------- views
 function loginView() {
@@ -256,11 +257,10 @@ function loginView() {
       h("div", {}, email, pw, totp),
       h("button", { class: "btn btn-blue", style: "width:100%;margin-top:10px", onclick: async (e) => {
         e.preventDefault();
-        const fd = new URLSearchParams();
-        fd.set("email", email.value); fd.set("password", pw.value);
-        if (totp.value) fd.set("totp", totp.value);
-        const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: fd });
-        const data = await r.json();
+        const payload = { email: email.value, password: pw.value };
+        if (totp.value) payload.totp = totp.value;
+        const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        const data = await r.json().catch(() => ({ error: "HTTP " + r.status }));
         if (data.need_totp) { totp.classList.remove("hidden"); totp.focus(); toast(t("totp_prompt") || "Enter your 2FA code"); return; }
         if (data.error) { toast(data.error, false); return; }
         state.token = data.token;
@@ -324,7 +324,7 @@ async function dashboardView() {
         hasPerm("ticket.create")
           ? h("button", { class: "btn btn-blue btn-sm", onclick: () => window.location.hash = "#/new-ticket" }, "+" + t("new_ticket"))
           : null)),
-  );
+  ));
   return { title: "", body };
 }
 
@@ -384,7 +384,7 @@ async function ticketsView() {
         h("thead", {}, h("tr", {},
           [t("code"), t("title"), t("customer"), t("version"), t("module"), t("priority"), t("status"), t("owner"), t("created"), t("source")]
             .map(c => h("th", {}, c)))),
-        tbody)));
+        tbody))));
   [statusSel, prioSel, ownerInp, custInp, verInp, prodInp, dFrom, dTo].forEach(el => {
     el.addEventListener("change", doLoad);
     if (el.tagName === "INPUT" && el.type !== "date") el.addEventListener("input", doLoad);
@@ -495,7 +495,7 @@ async function ticketDetail(id) {
           h("div", {}, msgInp, fileInp),
           h("div", { class: "flex-between", style: "margin-top:8px" },
             h("span", { class: "muted" }, t("reply") + " · " + t("internal")),
-            replyBtn)) : null)));
+            replyBtn)) : null))));
   return { title: "", body };
 }
 
@@ -551,7 +551,7 @@ async function newTicketView() {
             const r = await apiForm("/api/tickets", fd);
             toast("OK: " + r.code); window.location.hash = "#/ticket/" + r.id;
           } }, t("submit")),
-          h("button", { class: "btn btn-ghost", style: "margin-left:8px", onclick: () => window.location.hash = "#/tickets" }, t("cancel")))));
+          h("button", { class: "btn btn-ghost", style: "margin-left:8px", onclick: () => window.location.hash = "#/tickets" }, t("cancel")))))));
   return { title: "", body };
 }
 
@@ -599,7 +599,7 @@ async function kbView() {
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
         h("thead", {}, h("tr", {}, [t("title"), t("collections"), t("status"), "Source", "Data", t("created")].map(c => h("th", {}, c)))),
-        tbody)));
+        tbody))));
   return { title: "", body };
 }
 
@@ -644,7 +644,7 @@ function openKbEditor(id, preCol) {
         else await api("/api/kb/articles", { method: "POST", body: JSON.stringify(b) });
         toast("OK"); window.location.hash = "#/kb";
       } }, t("save")),
-      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel")));
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
   showModal("Edit article", bodyWrap);
 }
 
@@ -678,7 +678,7 @@ async function kbCollections() {
     form,
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {}, h("thead", {}, h("tr", {}, [t("code"), t("name"), t("status")].map(x => h("th", {}, x)))),
-        h("tbody", {}, rows)))));
+        h("tbody", {}, rows))))) };
 }
 
 async function kbDetail(id) {
@@ -752,7 +752,7 @@ async function customersView() {
       const r = await apiForm("/api/customers/import", fd);
       toast("Imported " + r.created + " new / " + r.updated + " updated");
       e.target.value = ""; doLoad();
-    })));
+    } }));
   const body = h("div", {},
     h("div", { class: "flex-between" }, h("h1", {}, t("customers")),
       hasPerm("customer.import_csv") ? importBtn : null),
@@ -760,7 +760,7 @@ async function customersView() {
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
         h("thead", {}, h("tr", {}, [t("name"), t("domains"), t("version"), t("service_start"), t("service_end"), t("contact_email"), t("actions")].map(c => h("th", {}, c)))),
-        tbody)));
+        tbody))));
   doLoad();
   return { title: "", body };
 }
@@ -869,7 +869,7 @@ async function adminRoles() {
       perms.map(p => h("label", { class: "muted", style: "font-size:13px" },
         h("input", { type: "checkbox", checked: "checked", onchange: e => {
           if (e.target.checked) r.permissions.push(p.key); else r.permissions = r.permissions.filter(k => k !== p.key);
-        } }, p.key + " (" + (p.grp || p.group) + ")")));
+        } }, p.key + " (" + (p.grp || p.group) + ")"))));
     const saveBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
       await api("/api/admin/roles/" + r.id, { method: "PUT", body: JSON.stringify({ permissions: r.permissions }) });
       toast("OK"); setTimeout(render, 300);
@@ -916,7 +916,7 @@ async function adminGroups() {
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
         h("thead", {}, h("tr", {}, [t("code"), t("name"), t("status"), t("members"), t("actions")].map(c => h("th", {}, c)))),
-        h("tbody", {}, rows))));
+        h("tbody", {}, rows)))));
   return { title: "", body };
 }
 
@@ -974,7 +974,7 @@ async function adminSettings() {
           await api("/api/admin/settings", { method: "POST", body: JSON.stringify(b) });
           toast("Saved");
         } }, t("save")),
-        testBtn, pollBtn))));
+        testBtn, pollBtn)))));
   return { title: "", body };
 }
 

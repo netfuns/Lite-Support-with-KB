@@ -264,9 +264,8 @@ def meta(request: Request):
     c = conn_()
     perms = [{"key": r["key"], "grp": r["grp"]} for r in c.execute("SELECT * FROM permissions ORDER BY grp,key")]
     products = [r["name"] for r in c.execute("SELECT * FROM products ORDER BY id")]
-    c.close()
     u = current_user(request)
-    myperms = rbac.user_permissions(c, u["id"]) if u else set("kb.view_public")
+    myperms = rbac.user_permissions(c, u["id"]) if u else {"kb.view_public"}
     c.close()
     return ok(permissions=perms, products=products,
               statuses=T.STATUSES, priorities=["critical", "high", "medium", "low"],
