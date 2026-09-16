@@ -12,8 +12,25 @@
   --radius: 10px;
   --shadow: 0 1px 2px rgb(0 0 0 / .04), 0 6px 16px rgb(0 0 0 / .04);
 }
+/* explicit theme override (Settings > Site) */
+[data-theme="dark"] {
+  --ink: #eff1f6;
+  --ink-2: #d1d5db;
+  --ink-3: #9ca3af;
+  --line: #2d333b;
+  --bg: #0f1320;
+  --card: #161b28;
+}
+[data-theme="light"] {
+  --ink: #111827;
+  --ink-2: #374151;
+  --ink-3: #6b7280;
+  --line: #e5e7eb;
+  --bg: #f7f8fa;
+  --card: #ffffff;
+}
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]) {
     --ink: #eff1f6;
     --ink-2: #d1d5db;
     --ink-3: #9ca3af;
@@ -113,3 +130,32 @@ kbd { background:#f1f1f1; padding:2px 6px; border-radius:4px; font-size:12px; }
 .markdown code { background:#f1f1f1; padding:1px 4px; border-radius:3px; font-size:12px; }
 .markdown table { border-collapse:collapse; width:100%; }
 .markdown th, .markdown td { border:1px solid var(--line); padding:4px; }
+
+/* ---- toolbar (list pages) ---- */
+.toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+.toolbar-left { display:flex; align-items:center; gap:8px; }
+.toolbar-right { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+
+/* ---- fuzzy suggestion dropdown ---- */
+.suggest-wrap { position:relative; display:inline-block; }
+.suggest {
+  position:absolute; z-index:80; left:0; top:calc(100% + 4px); min-width:100%;
+  background:var(--card); border:1px solid var(--line); border-radius:8px;
+  box-shadow:0 8px 24px rgb(0 0 0 / .10); max-height:280px; overflow:auto;
+}
+.suggest.hidden { display:none; }
+.suggest-item { padding:8px 12px; cursor:pointer; white-space:nowrap; font-size:14px; }
+.suggest-item:hover { background:var(--bg); color:var(--blue); }
+
+/* ---- user dropdown ---- */
+.dropdown {
+  position:absolute; right:12px; top:52px; z-index:90; min-width:190px;
+  background:var(--card); border:1px solid var(--line); border-radius:10px;
+  box-shadow:0 10px 28px rgb(0 0 0 / .12); padding:6px; display:flex; flex-direction:column; gap:2px;
+}
+.dropdown .dd-head { padding:8px 10px; font-weight:600; border-bottom:1px solid var(--line); margin-bottom:4px; word-break:break-all; }
+.dropdown a, .dropdown button {
+  text-align:left; background:none; border:0; padding:8px 10px; border-radius:6px;
+  color:var(--ink); font-size:14px; text-decoration:none; width:100%;
+}
+.dropdown a:hover, .dropdown button:hover { background:var(--bg); color:var(--blue); }

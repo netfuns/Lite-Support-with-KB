@@ -28,12 +28,26 @@ init_db()
 app = FastAPI(title="RankEZ Support", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
 
+DEFAULT_MODULES = ["PAC", "PSM", "CPM", "VAULT", "CP", "REMOTEAPP", "CLM", "RAG"]
+DEPLOY_TYPES = ["ON-PREM", "SaaS"]
+
+
+def _seed_setting(conn, key, value):
+    if not conn.execute("SELECT key FROM settings WHERE key=?", (key,)).fetchone():
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, value))
+
+
 def _seed():
     conn = get_db()
     rbac.seed(conn)
-    # default groups
-    for g in ("管理员", "售后人员"):
+    # default groups (internal = staff group that may edit the knowledge base)
+    for g in ("管理员", "售后人员", "internal"):
         conn.execute("INSERT OR IGNORE INTO user_groups(name,builtin) VALUES(?,1)", (g,))
+    # site settings
+    _seed_setting(conn, "modules", json.dumps(DEFAULT_MODULES, ensure_ascii=False))
+    _seed_setting(conn, "internal_domains", "[]")
+    _seed_setting(conn, "session_timeout", "480")
+    _seed_setting(conn, "theme", "light")
     # default collections
     for name, vis in (("公开知识", "public"), ("注册用户", "registered"), ("内部管理", "internal")):
         if not conn.execute("SELECT id FROM kb_collections WHERE name=?", (name,)).fetchone():
@@ -50,9 +64,17 @@ def _seed():
         aid = cur.lastrowid
         role = conn.execute("SELECT id FROM roles WHERE name='管理员'").fetchone()
         conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (aid, role["id"]))
-        g = conn.execute("SELECT id FROM user_groups WHERE name='管理员'").fetchone()
-        conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (aid, g["id"]))
+        for gname in ("管理员", "internal"):
+            g = conn.execute("SELECT id FROM user_groups WHERE name=?", (gname,)).fetchone()
+            if g:
+                conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (aid, g["id"]))
         print("[seed] admin@rankez.local / Admin@12345")
+    # make sure the existing admin also belongs to the internal group (KB edit rights)
+    arow = conn.execute("SELECT id FROM users WHERE email=?", ("admin@rankez.local",)).fetchone()
+    if arow:
+        gi = conn.execute("SELECT id FROM user_groups WHERE name='internal'").fetchone()
+        if gi:
+            conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (arow["id"], gi["id"]))
     conn.commit()
     conn.close()
 
@@ -85,6 +107,68 @@ def conn_():
     return get_db()
 
 
+# ------------------------------------------------------------------ site settings helpers
+def _setting_json(key, default):
+    c = conn_()
+    raw = get_setting(c, key, None)
+    c.close()
+    if not raw:
+        return default
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, type(default)) else default
+    except Exception:
+        return default
+
+
+def site_modules():
+    m = _setting_json("modules", [])
+    return [x for x in m if x] or DEFAULT_MODULES
+
+
+def site_internal_domains():
+    return [str(x).lower() for x in (_setting_json("internal_domains", []) or []) if x]
+
+
+def site_session_timeout():
+    try:
+        return int(_setting_json("session_timeout", 480) or 0)
+    except Exception:
+        return 480
+
+
+def site_theme():
+    c = conn_()
+    v = get_setting(c, "theme", "light")
+    c.close()
+    return v or "light"
+
+
+def _sync_internal_group(c, uid, email):
+    """Users whose email domain is an internal domain join the 'internal' group."""
+    dom = (email or "").split("@")[-1].lower()
+    g = c.execute("SELECT id FROM user_groups WHERE name=?", ("internal",)).fetchone()
+    if not g or not dom:
+        return
+    if dom in site_internal_domains():
+        c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, g["id"]))
+
+
+def _kb_can_edit(conn, u):
+    """Knowledge base may only be edited by the internal group or administrators."""
+    if not u:
+        return False
+    perms = rbac.user_permissions(conn, u["id"])
+    if "kb.edit" not in perms:
+        return False
+    if "user.manage" in perms:
+        return True
+    g = conn.execute("SELECT id FROM user_groups WHERE name=?", ("internal",)).fetchone()
+    if not g:
+        return False
+    return g["id"] in rbac.groups_for_user(conn, u["id"], u["email"])
+
+
 # ------------------------------------------------------------------ auth ctx
 def current_user(request: Request):
     token = request.headers.get("X-Token") or request.cookies.get("rz_token")
@@ -95,6 +179,19 @@ def current_user(request: Request):
     if not row or row["pending"]:
         c.close()
         return None
+    # session timeout (minutes; 0 = never)
+    timeout = site_session_timeout()
+    if timeout > 0 and row["created_at"]:
+        try:
+            import datetime as _dt
+            created = _dt.datetime.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S")
+            if (_dt.datetime.utcnow() - created).total_seconds() > timeout * 60:
+                c.execute("DELETE FROM tokens WHERE token=?", (token,))
+                c.commit()
+                c.close()
+                return None
+        except Exception:
+            pass
     u = c.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
     c.close()
     if not u or u["status"] != "active":
@@ -253,6 +350,7 @@ async def register(request: Request):
     c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
     role = c.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
     c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
+    _sync_internal_group(c, uid, email)
     c.commit()
     c.close()
     return ok(ok=True)
@@ -266,10 +364,14 @@ def meta(request: Request):
     products = [r["name"] for r in c.execute("SELECT * FROM products ORDER BY id")]
     u = current_user(request)
     myperms = rbac.user_permissions(c, u["id"]) if u else {"kb.view_public"}
+    can_edit_kb = _kb_can_edit(c, u) if u else False
     c.close()
     return ok(permissions=perms, products=products,
               statuses=T.STATUSES, priorities=["critical", "high", "medium", "low"],
-              my_permissions=sorted(myperms))
+              my_permissions=sorted(myperms),
+              modules=site_modules(), deploy_types=DEPLOY_TYPES,
+              session_timeout=site_session_timeout(), theme=site_theme(),
+              can_edit_kb=can_edit_kb)
 
 
 def my_perm_set(u):
@@ -340,6 +442,21 @@ def customer_delete(cid: int, request: Request):
     return ok(ok=True)
 
 
+@app.post("/api/customers/bulk")
+async def customer_bulk(request: Request):
+    require_perm(request, "customer.delete")
+    b = await request.json()
+    ids = [int(x) for x in (b.get("ids") or []) if str(x).isdigit()]
+    if not ids:
+        fail(400, "no_selection")
+    marks = ",".join("?" * len(ids))
+    c = conn_()
+    c.execute("DELETE FROM customers WHERE id IN (%s)" % marks, ids)
+    c.commit()
+    c.close()
+    return ok(ok=True, changed=len(ids))
+
+
 CUSTOMER_CSV_HEADER = ["name", "domains", "version", "service_start", "service_end", "contact_email"]
 
 
@@ -404,7 +521,8 @@ def _ticket_visible(conn, t, u):
 @app.get("/api/tickets")
 def tickets_list(request: Request, status: str = "", owner: str = "", customer: str = "",
                  priority: str = "", product: str = "", q: str = "",
-                 date_from: str = "", date_to: str = ""):
+                 date_from: str = "", date_to: str = "", module: str = "",
+                 deploy_type: str = ""):
     u = require(request)
     c = conn_()
     sql = "SELECT * FROM tickets WHERE 1=1"
@@ -413,8 +531,12 @@ def tickets_list(request: Request, status: str = "", owner: str = "", customer: 
         sql += " AND status=?"; args.append(status)
     if priority:
         sql += " AND priority=?"; args.append(priority)
+    if module and not product:
+        product = module
     if product:
         sql += " AND product=?"; args.append(product)
+    if deploy_type:
+        sql += " AND deploy_type=?"; args.append(deploy_type)
     if customer:
         sql += " AND customer_name LIKE ?"; args.append("%" + customer + "%")
     if owner:
@@ -502,6 +624,10 @@ async def ticket_create(request: Request):
         customer_name=form.get("customer_name") or "", version=form.get("version") or "",
         product=form.get("product") or "", priority=form.get("priority") or "medium",
         creator_id=u["id"], creator_email=u["email"], internal=internal, attachments=attachments)
+    dep = form.get("deploy_type") or ""
+    if dep:
+        c.execute("UPDATE tickets SET deploy_type=? WHERE id=?", (dep, t["id"]))
+    c.commit()
     c.close()
     if not internal:
         threading.Thread(target=T.notify_new_ticket, args=(conn_(), t), daemon=True).start()
@@ -637,6 +763,11 @@ def _kb_access_ok(conn, u, article, group_ids):
         return False
     if article["visibility"] == "registered" and "kb.view_registered" not in perms:
         return False
+    if article["visibility"] == "registered":
+        ag = set(r["group_id"] for r in conn.execute(
+            "SELECT group_id FROM kb_article_groups WHERE article_id=?", (article["id"],)))
+        if ag:
+            return bool(ag & group_ids)
     if article["visibility"] == "usergroup":
         ag = set(r["group_id"] for r in conn.execute("SELECT group_id FROM kb_article_groups WHERE article_id=?", (article["id"],)))
         return bool(ag & group_ids)
@@ -644,7 +775,8 @@ def _kb_access_ok(conn, u, article, group_ids):
 
 
 @app.get("/api/kb/articles")
-def kb_list(request: Request, collection: int = None, q: str = "", vis: str = ""):
+def kb_list(request: Request, collection: int = None, q: str = "", vis: str = "",
+            module: str = ""):
     u = current_user(request)
     c = conn_()
     gids = rbac.groups_for_user(c, u["id"], u["email"]) if u else set()
@@ -654,6 +786,8 @@ def kb_list(request: Request, collection: int = None, q: str = "", vis: str = ""
         sql += " AND collection_id=?"; args.append(collection)
     if vis:
         sql += " AND visibility=?"; args.append(vis)
+    if module:
+        sql += " AND module=?"; args.append(module)
     if q:
         sql += " AND (title LIKE ? OR body LIKE ?)"; args += ["%" + q + "%"] * 2
     sql += " ORDER BY id DESC LIMIT 500"
@@ -679,8 +813,12 @@ def kb_get(aid: int, request: Request):
         c.close()
         fail(403, "login_required" if not u else "no_permission")
     atts = [dict(r) for r in c.execute("SELECT * FROM attachments WHERE article_id=?", (aid,))]
+    groups = [r["group_id"] for r in c.execute("SELECT group_id FROM kb_article_groups WHERE article_id=?", (aid,))]
+    can_edit = _kb_can_edit(c, u)
     c.close()
-    return ok(article=dict(a), attachments=atts)
+    a = dict(a)
+    a["group_ids"] = groups
+    return ok(article=a, attachments=atts, can_edit=can_edit)
 
 
 @app.post("/api/kb/articles")
@@ -689,13 +827,17 @@ async def kb_create(request: Request):
     u = require(request)
     b = await request.json()
     c = conn_()
+    if not _kb_can_edit(c, u):
+        c.close()
+        fail(403, "no_permission")
     vis = b.get("visibility") or "registered"
     if vis == "internal" and "kb.view_internal" not in rbac.user_permissions(c, u["id"]):
         c.close()
         fail(403, "no_permission")
     cur = c.execute(
-        "INSERT INTO kb_articles(title,body,source,visibility,collection_id,author_id) VALUES(?,?,?,?,?,?)",
-        (b.get("title", ""), b.get("body", ""), "manual", vis, b.get("collection_id"), u["id"]))
+        "INSERT INTO kb_articles(title,body,source,visibility,module,collection_id,author_id) VALUES(?,?,?,?,?,?,?)",
+        (b.get("title", ""), b.get("body", ""), "manual", vis, b.get("module", ""),
+         b.get("collection_id"), u["id"]))
     aid = cur.lastrowid
     for gid in (b.get("group_ids") or []):
         c.execute("INSERT OR IGNORE INTO kb_article_groups(article_id,group_id) VALUES(?,?)", (aid, gid))
@@ -714,12 +856,16 @@ async def kb_update(aid: int, request: Request):
     if not a:
         c.close()
         fail(404, "not_found")
+    if not _kb_can_edit(c, u):
+        c.close()
+        fail(403, "no_permission")
     vis = b.get("visibility") or a["visibility"]
     if vis == "internal" and "kb.view_internal" not in rbac.user_permissions(c, u["id"]):
         c.close()
         fail(403, "no_permission")
-    c.execute("UPDATE kb_articles SET title=?, body=?, visibility=?, collection_id=?, updated_at=datetime('now') WHERE id=?",
-              (b.get("title", a["title"]), b.get("body", a["body"]), vis, b.get("collection_id"), aid))
+    c.execute("UPDATE kb_articles SET title=?, body=?, visibility=?, module=?, collection_id=?, updated_at=datetime('now') WHERE id=?",
+              (b.get("title", a["title"]), b.get("body", a["body"]), vis,
+               b.get("module", a["module"] or ""), b.get("collection_id"), aid))
     c.execute("DELETE FROM kb_article_groups WHERE article_id=?", (aid,))
     for gid in (b.get("group_ids") or []):
         c.execute("INSERT OR IGNORE INTO kb_article_groups(article_id,group_id) VALUES(?,?)", (aid, gid))
@@ -731,7 +877,11 @@ async def kb_update(aid: int, request: Request):
 @app.delete("/api/kb/articles/{aid}")
 def kb_delete(aid: int, request: Request):
     require_perm(request, "kb.delete")
+    u = require(request)
     c = conn_()
+    if not _kb_can_edit(c, u):
+        c.close()
+        fail(403, "no_permission")
     c.execute("DELETE FROM kb_articles WHERE id=?", (aid,))
     c.commit()
     c.close()
@@ -915,9 +1065,92 @@ async def admin_user_create(request: Request):
                      b.get("status", "active")))
     uid = cur.lastrowid
     _set_roles_groups(c, uid, b.get("roles"), b.get("group_ids"))
+    _sync_internal_group(c, uid, email)
     c.commit()
     c.close()
     return ok(id=uid)
+
+
+@app.post("/api/admin/users/bulk")
+async def admin_users_bulk(request: Request):
+    """Bulk enable / disable / delete / update attributes for selected users."""
+    require_perm(request, "user.manage")
+    b = await request.json()
+    ids = [int(x) for x in (b.get("ids") or []) if str(x).isdigit()]
+    action = b.get("action") or ""
+    if not ids:
+        fail(400, "no_selection")
+    marks = ",".join("?" * len(ids))
+    c = conn_()
+    changed = 0
+    if action == "delete":
+        c.execute("DELETE FROM users WHERE id IN (%s)" % marks, ids)
+        changed = len(ids)
+    elif action in ("disable", "enable"):
+        st = "disabled" if action == "disable" else "active"
+        c.execute("UPDATE users SET status=? WHERE id IN (%s)" % marks, [st] + ids)
+        changed = len(ids)
+    elif action == "update":
+        if "status" in b and b.get("status"):
+            c.execute("UPDATE users SET status=? WHERE id IN (%s)" % marks, [b["status"]] + ids)
+        for uid in ids:
+            _set_roles_groups(c, uid, b.get("roles"), b.get("group_ids"))
+        changed = len(ids)
+    else:
+        c.close()
+        fail(400, "bad_action")
+    c.commit()
+    c.close()
+    return ok(ok=True, changed=changed)
+
+
+USER_CSV_HEADER = ["email", "display_name", "password", "roles", "status"]
+
+
+@app.get("/api/admin/users/template.csv")
+def admin_users_template(request: Request):
+    require_perm(request, "user.manage")
+    csv_data = ",".join(USER_CSV_HEADER) + "\n" + \
+        "l1@rankez.local,L1 Agent,Change@123,L1售后人员,active\n" + \
+        "l2@rankez.local,L2 Engineer,Change@123,L2售后人员,active\n"
+    return Response(content=csv_data.encode("utf-8-sig"), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=users_template.csv"})
+
+
+@app.post("/api/admin/users/import")
+async def admin_users_import(request: Request, file: UploadFile = File(...)):
+    require_perm(request, "user.manage")
+    raw = await file.read()
+    if raw[:3] == b"\xef\xbb\xbf":
+        raw = raw[3:]
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8", "replace")))
+    c = conn_()
+    created = updated = 0
+    for row in reader:
+        email = (row.get("email") or "").strip().lower()
+        if "@" not in email:
+            continue
+        exists = c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone()
+        roles = [x.strip() for x in (row.get("roles") or "").split("|") if x.strip()]
+        if exists:
+            uid = exists["id"]
+            c.execute("UPDATE users SET display_name=COALESCE(NULLIF(?,''),display_name), status=? WHERE id=?",
+                      ((row.get("display_name") or "").strip(),
+                       (row.get("status") or "active").strip(), uid))
+            updated += 1
+        else:
+            cur = c.execute("INSERT INTO users(email,display_name,password_hash,status) VALUES(?,?,?,?)",
+                            (email, (row.get("display_name") or email.split("@")[0]).strip(),
+                             auth.hash_password(row.get("password") or "Change@123"),
+                             (row.get("status") or "active").strip()))
+            uid = cur.lastrowid
+            created += 1
+        if roles:
+            _set_roles_groups(c, uid, roles, None)
+        _sync_internal_group(c, uid, email)
+    c.commit()
+    c.close()
+    return ok(created=created, updated=updated)
 
 
 def _set_roles_groups(c, uid, roles, group_ids):
@@ -947,6 +1180,8 @@ async def admin_user_update(uid: int, request: Request):
     if b.get("password"):
         c.execute("UPDATE users SET password_hash=? WHERE id=?", (auth.hash_password(b["password"]), uid))
     _set_roles_groups(c, uid, b.get("roles"), b.get("group_ids"))
+    if "email" in b:
+        _sync_internal_group(c, uid, (b["email"] or "").lower())
     c.commit()
     c.close()
     return ok(ok=True)
@@ -1069,6 +1304,42 @@ def admin_group_delete(gid: int, request: Request):
     require_perm(request, "group.manage")
     c = conn_()
     c.execute("DELETE FROM user_groups WHERE id=? AND builtin=0", (gid,))
+    c.commit()
+    c.close()
+    return ok(ok=True)
+
+
+# =============================== ADMIN: SITE SETTINGS ===============================
+@app.get("/api/admin/site")
+def admin_site(request: Request):
+    require_perm(request, "settings.mail")
+    return ok(modules=site_modules(), internal_domains=site_internal_domains(),
+              session_timeout=site_session_timeout(), theme=site_theme(),
+              deploy_types=DEPLOY_TYPES)
+
+
+@app.post("/api/admin/site")
+async def admin_site_save(request: Request):
+    require_perm(request, "settings.mail")
+    b = await request.json()
+    c = conn_()
+    if "modules" in b:
+        mods = [str(x).strip() for x in (b.get("modules") or []) if str(x).strip()]
+        set_setting(c, "modules", json.dumps(mods, ensure_ascii=False))
+    if "internal_domains" in b:
+        doms = [str(x).strip().lower() for x in (b.get("internal_domains") or []) if str(x).strip()]
+        set_setting(c, "internal_domains", json.dumps(doms, ensure_ascii=False))
+    if "session_timeout" in b:
+        try:
+            set_setting(c, "session_timeout", str(int(b.get("session_timeout") or 0)))
+        except Exception:
+            pass
+    if "theme" in b:
+        set_setting(c, "theme", str(b.get("theme") or "light"))
+    c.commit()
+    # re-evaluate internal group membership for every user
+    for r in c.execute("SELECT id,email FROM users"):
+        _sync_internal_group(c, r["id"], r["email"])
     c.commit()
     c.close()
     return ok(ok=True)

@@ -190,6 +190,24 @@ def init_db():
     conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
+    migrate()
+
+
+def _columns(conn, table):
+    return {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+
+
+def migrate():
+    """Add columns introduced after the first release (idempotent)."""
+    conn = get_db()
+    tc = _columns(conn, "tickets")
+    if "deploy_type" not in tc:
+        conn.execute("ALTER TABLE tickets ADD COLUMN deploy_type TEXT DEFAULT ''")
+    ac = _columns(conn, "kb_articles")
+    if "module" not in ac:
+        conn.execute("ALTER TABLE kb_articles ADD COLUMN module TEXT DEFAULT ''")
+    conn.commit()
+    conn.close()
 
 
 def get_setting(conn, key, default=None):

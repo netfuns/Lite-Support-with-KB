@@ -182,14 +182,40 @@ let userMenu;
 function toggleUserMenu() {
   if (userMenu) { userMenu.remove(); userMenu = null; return; }
   userMenu = h("div", { class: "dropdown" },
+    h("div", { class: "dd-head" }, state.user.display_name || state.user.email),
     h("a", { href: "#/me" }, t("my_account")),
-    hasPerm("settings.mail") ? h("a", { href: "#/admin/settings" }, t("settings")) : null,
+    h("button", { onclick: () => { closeUserMenu(); openChangePassword(); } }, t("change_password")),
+    hasPerm("settings.mail") ? h("a", { href: "#/admin/site" }, t("site_settings")) : null,
     h("button", { onclick: logout }, t("logout")));
   document.querySelector(".actions").append(userMenu);
   document.addEventListener("click", function close(e) {
-    if (userMenu && !userMenu.contains(e.target)) { userMenu.remove(); userMenu = null; }
-    document.removeEventListener("click", close);
+    if (userMenu && !userMenu.contains(e.target) && !e.target.classList.contains("user")) {
+      userMenu.remove(); userMenu = null;
+      document.removeEventListener("click", close);
+    }
   });
+}
+function closeUserMenu() { if (userMenu) { userMenu.remove(); userMenu = null; } }
+
+function openChangePassword() {
+  const oldPw = h("input", { type: "password", placeholder: t("current_password") });
+  const newPw = h("input", { type: "password", placeholder: t("new_password") });
+  const newPw2 = h("input", { type: "password", placeholder: t("confirm_password") });
+  const body = h("div", { style: "min-width:320px" },
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("current_password")), oldPw),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("new_password")), newPw),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("confirm_password")), newPw2),
+    h("div", { class: "flex-between mt-2" },
+      h("button", { class: "btn btn-blue", onclick: async () => {
+        if (!oldPw.value || !newPw.value) { toast(t("fill_all"), false); return; }
+        if (newPw.value !== newPw2.value) { toast(t("password_mismatch"), false); return; }
+        try {
+          await api("/api/me/password", { method: "POST", body: JSON.stringify({ old: oldPw.value, new: newPw.value }) });
+          toast(t("saved")); closeModal();
+        } catch (e) { toast(e.message, false); }
+      } }, t("save")),
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+  showModal(t("change_password"), body);
 }
 
 function hasPerm(key) { return state.me_perms.has(key); }
@@ -211,12 +237,16 @@ function sidebar() {
   if (hasPerm("customer.view")) links.push(["#/customers", t("customers"), false]);
   const items = [];
   links.forEach(([href, label, active]) => items.push(h("a", { href, class: "active" + (active ? " active" : "") }, label)));
-  if (hasPerm("user.manage")) {
+  if (hasPerm("user.manage") || hasPerm("role.manage") || hasPerm("group.manage") || hasPerm("settings.mail")) {
     items.push(h("div", { class: "sep-label" }, t("admin")));
     if (hasPerm("user.manage")) items.push(h("a", { href: "#/admin/users" }, t("users")));
     if (hasPerm("role.manage")) items.push(h("a", { href: "#/admin/roles" }, t("roles")));
     if (hasPerm("group.manage")) items.push(h("a", { href: "#/admin/groups" }, t("groups")));
-    if (hasPerm("settings.mail")) items.push(h("a", { href: "#/admin/settings" }, t("settings")));
+    if (hasPerm("settings.mail")) {
+      items.push(h("div", { class: "sep-label" }, t("settings")));
+      items.push(h("a", { href: "#/admin/settings" }, t("mail_settings")));
+      items.push(h("a", { href: "#/admin/site" }, t("site_settings")));
+    }
   }
   return h("nav", { class: "sidebar" }, items);
 }
@@ -238,16 +268,21 @@ async function render() {
   else if (route === "ticket") view = ticketDetail(c.raw.split("/")[1]);
   else if (route === "new-ticket") view = newTicketView();
   else if (route === "kb") {
-    if (c.raw.includes("/kb/")) view = kbDetail(c.raw.split("/")[2]);
+    const seg = c.raw.split("/")[2];
+    if (seg === "new") view = kbEditorPage(null);
+    else if (seg === "edit") view = kbEditorPage(c.raw.split("/")[3]);
+    else if (seg) view = kbDetail(seg);
     else view = kbView();
   } else if (route === "customers") view = customersView();
   else if (route === "login") view = loginView();
   else if (route === "register") view = registerView();
   else if (route === "me") view = meView();
   else if (route === "admin") {
-    const sub = c.raw.split("/")[1];
-    view = ({ users: adminUsers, roles: adminRoles, groups: adminGroups, settings: adminSettings })[sub] ?
-      ({ users: adminUsers, roles: adminRoles, groups: adminGroups, settings: adminSettings })[sub]() : adminUsers();
+    // raw is "/admin/users" -> split("/") = ["", "admin", "users"]
+    const sub = c.raw.split("/")[2] || "users";
+    const map = { users: adminUsers, roles: adminRoles, groups: adminGroups,
+                  settings: adminSettings, site: adminSite };
+    view = (map[sub] || adminUsers)();
   } else view = dashboardView();
   view = await view;
   layout(view.title, view.body);
@@ -277,6 +312,9 @@ function loginView() {
         state.user = me; state.me_perms = new Set(me.permissions);
         state.meta = await api("/api/meta");
         state.products = state.meta.products;
+        state.modules = state.meta.modules || [];
+        state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
+        applyTheme(state.meta.theme);
         window.location.hash = "#/dashboard";
       } }, t("sign_in_btn")),
       h("p", { class: "muted", style: "text-align:center;margin-top:10px" },
@@ -339,14 +377,16 @@ async function dashboardView() {
 
 async function ticketsView() {
   if (!state.user) return loginView();
-  const statusSel = h("select", {}, [h("option", { value: "" }, t("filter_by_status")),
+  const statusSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("status")),
     ["new", "customer_replied", "support_replied", "closed"].map(s => h("option", { value: s }, t("st_" + s)))]);
-  const prioSel = h("select", {}, [h("option", { value: "" }, t("filter_by_priority")),
+  const prioSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("priority")),
     ["critical", "high", "medium", "low"].map(p => h("option", { value: p }, t("pr_" + p)))]);
+  const modules = (state.modules && state.modules.length) ? state.modules : (state.products || []);
+  const prodSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("module")),
+    modules.map(p => h("option", { value: p }, p))]);
   const ownerInp = h("input", { placeholder: t("filter_by_owner") });
   const custInp = h("input", { placeholder: t("filter_by_customer") });
   const verInp = h("input", { placeholder: t("filter_by_version") });
-  const prodInp = h("input", { placeholder: t("filter_by_product") });
   const dFrom = h("input", { type: "date", placeholder: t("filter_by_date_from") });
   const dTo = h("input", { type: "date", placeholder: t("filter_by_date_to") });
 
@@ -354,10 +394,10 @@ async function ticketsView() {
     const p = new URLSearchParams();
     if (statusSel.value) p.set("status", statusSel.value);
     if (prioSel.value) p.set("priority", prioSel.value);
+    if (prodSel.value) p.set("module", prodSel.value);
     if (ownerInp.value) p.set("owner", ownerInp.value);
     if (custInp.value) p.set("customer", custInp.value);
     if (verInp.value) p.set("version", verInp.value);
-    if (prodInp.value) p.set("product", prodInp.value);
     if (dFrom.value) p.set("date_from", dFrom.value);
     if (dTo.value) p.set("date_to", dTo.value);
     const r = await api("/api/tickets?" + p.toString());
@@ -365,14 +405,15 @@ async function ticketsView() {
   }
   function renderRows(items) {
     tbody.innerHTML = "";
-    if (!items.length) { tbody.append(h("tr", {}, h("td", { colspan: 7, class: "muted" }, t("no_results")))); }
+    if (!items.length) { tbody.append(h("tr", {}, h("td", { colspan: 11, class: "muted" }, t("no_results")))); }
     for (const t of items) {
       tbody.append(h("tr", {},
         h("td", {}, h("a", { href: "#/ticket/" + t.id }, t.code)),
         h("td", {}, t.title),
         h("td", {}, t.customer_name || "-"),
-        h("td", {}, t.version || "-"),
         h("td", {}, t.product || "-"),
+        h("td", {}, t.deploy_type || "-"),
+        h("td", {}, t.version || "-"),
         h("td", {}, prioTag(t.priority)),
         h("td", {}, statusTag(t.status)),
         h("td", {}, t.owner_name || "-"),
@@ -386,15 +427,15 @@ async function ticketsView() {
     h("div", { class: "flex-between" }, h("h1", {}, t("tickets")),
       hasPerm("ticket.create") ? h("button", { class: "btn btn-blue", onclick: () => window.location.hash = "#/new-ticket" }, "+" + t("new_ticket")) : null),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
-      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, statusSel, prioSel, ownerInp, custInp, verInp, prodInp, dFrom, dTo,
+      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, statusSel, prioSel, prodSel, ownerInp, custInp, verInp, dFrom, dTo,
         h("button", { class: "btn btn-ghost btn-sm", onclick: doLoad }, t("filter"))))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
         h("thead", {}, h("tr", {},
-          [t("code"), t("title"), t("customer"), t("version"), t("module"), t("priority"), t("status"), t("owner"), t("created"), t("source")]
+          [t("code"), t("title"), t("customer"), t("module"), t("deploy_type"), t("version"), t("priority"), t("status"), t("owner"), t("created"), t("source")]
             .map(c => h("th", {}, c)))),
         tbody))));
-  [statusSel, prioSel, ownerInp, custInp, verInp, prodInp, dFrom, dTo].forEach(el => {
+  [statusSel, prioSel, prodSel, ownerInp, custInp, verInp, dFrom, dTo].forEach(el => {
     el.addEventListener("change", doLoad);
     if (el.tagName === "INPUT" && el.type !== "date") el.addEventListener("input", doLoad);
   });
@@ -510,37 +551,36 @@ async function ticketDetail(id) {
 
 async function newTicketView() {
   if (!state.user) return loginView();
-  const custInp = h("input", { list: "cust-dl", placeholder: t("select_customer") });
-  const prodSel = h("select", {},
+  const custInp = h("input", { placeholder: t("select_customer"), style: "width:100%" });
+  // fuzzy customer matcher — shows a pick list while typing
+  const custWrap = attachSuggest(custInp, async val => {
+    const r = await api("/api/customers?q=" + encodeURIComponent(val));
+    return (r.items || []).map(c => ({ ...c, label: c.name + (c.domains ? "  <" + c.domains + ">" : "") }));
+  }, c => { custInp.value = c.name; });
+
+  const modules = (state.modules && state.modules.length) ? state.modules : (state.products || []);
+  const prodSel = h("select", { style: "width:100%" },
     h("option", { value: "" }, t("select_product")),
-    (state.products || []).map(p => h("option", { value: p }, p)));
-  const prioSel = h("select", {},
+    modules.map(p => h("option", { value: p }, p)));
+  const depSel = h("select", { style: "width:100%" },
+    (state.deployTypes || ["ON-PREM", "SaaS"]).map(d => h("option", { value: d, selected: d === "ON-PREM" ? "selected" : null }, d)));
+  const prioSel = h("select", { style: "width:100%" },
     ["critical", "high", "medium", "low"].map(p => h("option", { value: p, selected: p === "medium" ? "selected" : null }, t("pr_" + p))));
-  const verInp = h("input", { placeholder: t("version") });
-  const title = h("input", { placeholder: t("title"), required: true });
-  const desc = h("textarea", { rows: 4, placeholder: t("desc") });
+  const verInp = h("input", { placeholder: t("version"), style: "width:100%" });
+  const title = h("input", { placeholder: t("title"), required: true, style: "width:100%" });
+  const desc = h("textarea", { rows: 6, placeholder: t("desc"), style: "width:100%;box-sizing:border-box" });
   const intChk = h("input", { type: "checkbox" });
   const fileInp = h("input", { type: "file", multiple: true });
-
-  const dl = h("datalist", { id: "cust-dl" });
-  custInp.oninput = async () => {
-    const q = custInp.value.trim();
-    if (!q) { dl.innerHTML = ""; return; }
-    try {
-      const r = await api("/api/customers?q=" + encodeURIComponent(q));
-      dl.innerHTML = "";
-      for (const c of (r.items || [])) dl.append(h("option", { value: c.name }, c.domains));
-    } catch (e) {}
-  };
 
   const body = h("div", {},
     h("h1", {}, t("new_ticket")),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("div", {},
         h("label", { class: "muted", style: "display:block;margin:6px 0 3px" }, t("title")), title,
-        h("label", { class: "muted", style: "display:block;margin:8px 0 3px" }, t("customer")), custInp, dl,
-        h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px" },
+        h("label", { class: "muted", style: "display:block;margin:8px 0 3px" }, t("customer")), custWrap,
+        h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-top:8px" },
           h("label", { style: "display:block" }, h("span", { class: "muted" }, t("module")), prodSel),
+          h("label", { style: "display:block" }, h("span", { class: "muted" }, t("deploy_type")), depSel),
           h("label", { style: "display:block" }, h("span", { class: "muted" }, t("version")), verInp),
           h("label", { style: "display:block" }, h("span", { class: "muted" }, t("select_priority")), prioSel)),
         h("label", { class: "muted", style: "display:block;margin:8px 0 3px" }, t("desc")), desc,
@@ -552,6 +592,7 @@ async function newTicketView() {
             fd.set("title", title.value);
             fd.set("customer_name", custInp.value);
             fd.set("product", prodSel.value);
+            fd.set("deploy_type", depSel.value);
             fd.set("version", verInp.value);
             fd.set("priority", prioSel.value);
             fd.set("description", desc.value);
@@ -566,10 +607,14 @@ async function newTicketView() {
 
 async function kbView() {
   if (!state.user) return loginView();
-  const q = h("input", { placeholder: t("kb_search"), oninput: "doLoad()" });
+  const q = h("input", { placeholder: t("kb_search"), style: "flex:1;min-width:220px" });
+  const modules = (state.modules && state.modules.length) ? state.modules : [];
+  const modSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("module")),
+    modules.map(m => h("option", { value: m }, m))]);
   const colSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("collections"))]);
   const tbody = h("tbody", {});
   let cols = [];
+  const canEdit = state.meta && state.meta.can_edit_kb;
   async function loadCols() {
     try {
       const r = await api("/api/kb/collections");
@@ -582,32 +627,38 @@ async function kbView() {
   async function doLoad() {
     const p = new URLSearchParams();
     if (q.value) p.set("q", q.value);
+    if (modSel.value) p.set("module", modSel.value);
     if (colSel.value) p.set("collection", colSel.value);
     const r = await api("/api/kb/articles?" + p.toString());
     tbody.innerHTML = "";
+    if (!(r.items || []).length) {
+      tbody.append(h("tr", {}, h("td", { colspan: 5, class: "muted" }, t("no_results"))));
+      return;
+    }
     for (const a of (r.items || [])) {
-      const colName = cols.find(c => c.id === a.collection_id)?.name || "";
       tbody.append(h("tr", {},
         h("td", {}, h("a", { href: "#/kb/" + a.id }, a.title)),
-        h("td", {}, colName || "-"),
+        h("td", {}, a.module || "-"),
         h("td", {}, visTag(a.visibility)),
         h("td", {}, a.source),
-        h("td", {}, a.desensitized ? "desensitized" : "raw"),
         h("td", {}, (a.created_at || "").slice(0, 10))));
     }
   }
+  modSel.onchange = doLoad;
   colSel.onchange = doLoad;
+  q.oninput = () => { clearTimeout(q._t); q._t = setTimeout(doLoad, 250); };
   loadCols();
   doLoad();
   const body = h("div", {},
     h("div", { class: "flex-between" }, h("h1", {}, t("kb")),
-      hasPerm("kb.import") ? h("button", { class: "btn btn-ghost", onclick: () => openImportModal(colSel.value) }, t("import")) : null,
-      hasPerm("kb.create") ? h("button", { class: "btn btn-blue", onclick: () => openKbEditor(null, colSel.value) }, "+" + t("new_article")) : null),
+      h("div", {},
+        hasPerm("kb.import") ? h("button", { class: "btn btn-ghost", onclick: () => openImportModal(colSel.value) }, t("import")) : null,
+        canEdit ? h("a", { class: "btn btn-blue", href: "#/kb/new", style: "margin-left:8px" }, "+" + t("new_article")) : null)),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
-      h("div", { style: "display:flex;gap:8px" }, q, colSel))),
+      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, q, modSel, colSel))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
-        h("thead", {}, h("tr", {}, [t("title"), t("collections"), t("status"), "Source", "Data", t("created")].map(c => h("th", {}, c)))),
+        h("thead", {}, h("tr", {}, [t("title"), t("module"), t("visibility"), "Source", t("created")].map(c => h("th", {}, c)))),
         tbody))));
   return { title: "", body };
 }
@@ -633,28 +684,64 @@ function openImportModal(preCol) {
   showModal("Import", body);
 }
 
-function openKbEditor(id, preCol) {
-  const title = h("input", { placeholder: t("kb_title") });
-  const body = h("textarea", { rows: 10, placeholder: t("kb_body") });
-  const visSel = h("select", {},
-    ["public", "registered", "internal", "usergroup"].map(v => h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
-  const colSel = h("select", {}, [h("option", { value: "" }, "- " + t("collections") + " -")]);
-  const grpSel = h("select", { multiple: true, size: 5 });
-  const bodyWrap = h("div", {},
-    h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("kb_title")), title),
-    h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, t("kb_body")), body),
-    h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" },
-      h("label", {}, h("span", { class: "muted" }, t("kb_visibility")), visSel),
-      h("label", {}, h("span", { class: "muted" }, t("collections")), colSel)),
-    h("div", { class: "flex-between mt-2" },
-      h("button", { class: "btn btn-blue", onclick: async () => {
-        const b = { title: title.value, body: body.value, visibility: visSel.value, collection_id: colSel.value || null };
-        if (id) await api("/api/kb/articles/" + id, { method: "PUT", body: JSON.stringify(b) });
-        else await api("/api/kb/articles", { method: "POST", body: JSON.stringify(b) });
-        toast("OK"); window.location.hash = "#/kb";
-      } }, t("save")),
-      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
-  showModal("Edit article", bodyWrap);
+/** Full-page KB editor (new or edit) — never a modal, so nothing is lost on outside click. */
+async function kbEditorPage(id) {
+  if (!state.user) return loginView();
+  let art = null;
+  if (id) {
+    try { const resp = await api("/api/kb/articles/" + id); art = resp.article; } catch (e) { art = null; }
+  }
+  const canEdit = state.meta && state.meta.can_edit_kb;
+  if (!canEdit) return noAccess();
+
+  const title = h("input", { value: art ? art.title : "", placeholder: t("kb_title"),
+    style: "width:100%;box-sizing:border-box;font-size:18px;padding:8px" });
+  const bodyTa = h("textarea", { rows: 14, placeholder: t("kb_body"),
+    style: "width:100%;box-sizing:border-box;font-family:ui-monospace,Menlo,Consolas,monospace;line-height:1.6" });
+  bodyTa.value = art ? (art.body || "") : "";
+  // auto-grow with content
+  const autoGrow = () => { bodyTa.style.height = "auto"; bodyTa.style.height = Math.max(320, bodyTa.scrollHeight + 24) + "px"; };
+  bodyTa.addEventListener("input", autoGrow);
+
+  const visSel = h("select", { style: "width:100%" },
+    ["public", "registered", "internal"].map(v => h("option", { value: v, selected: (art ? art.visibility : "registered") === v ? "selected" : null }, t(v))));
+  const grpSel = h("select", { style: "width:100%" }, [h("option", { value: "" }, "- " + t("groups") + " -")]);
+  const modules = (state.modules && state.modules.length) ? state.modules : [];
+  const modSel = h("select", { style: "width:100%" },
+    h("option", { value: "" }, "- " + t("module") + " -"),
+    modules.map(m => h("option", { value: m, selected: art && art.module === m ? "selected" : null }, m)));
+  loadGroupOptions(grpSel, art ? (art.group_ids || []) : []);
+
+  const grpRow = h("label", { style: "display:block" }, h("span", { class: "muted" }, t("usergroup")), grpSel);
+  const syncGrp = () => { grpRow.style.display = visSel.value === "registered" ? "block" : "none"; };
+  visSel.addEventListener("change", syncGrp);
+
+  const body = h("div", {},
+    h("div", { class: "flex-between mb-2" },
+      h("h1", {}, id ? t("edit_article") : t("new_article_title")),
+      h("div", {},
+        h("a", { class: "btn btn-ghost btn-sm", href: id ? "#/kb/" + id : "#/kb" }, t("back")),
+        h("button", { class: "btn btn-blue btn-sm", style: "margin-left:8px", onclick: async () => {
+          if (!title.value.trim()) { toast(t("kb_title") + " *", false); return; }
+          const payload = { title: title.value, body: bodyTa.value, visibility: visSel.value,
+                            module: modSel.value,
+                            group_ids: visSel.value === "registered" && grpSel.value ? [Number(grpSel.value)] : [] };
+          try {
+            if (id) await api("/api/kb/articles/" + id, { method: "PUT", body: JSON.stringify(payload) });
+            else { const r = await api("/api/kb/articles", { method: "POST", body: JSON.stringify(payload) }); id = r.id; }
+            toast(t("saved")); window.location.hash = "#/kb/" + id; render();
+          } catch (e) { toast(e.message, false); }
+        } }, t("save")))),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("kb_title")), title),
+      h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px" },
+        h("label", {}, h("span", { class: "muted" }, t("visibility")), visSel),
+        grpRow,
+        h("label", {}, h("span", { class: "muted" }, t("module")), modSel)),
+      h("label", { style: "display:block;margin:12px 0 6px" }, h("span", { class: "muted" }, t("kb_body")), bodyTa))));
+  setTimeout(autoGrow, 0);
+  syncGrp();
+  return { title: "", body };
 }
 
 function showModal(head, bodyEl) {
@@ -699,76 +786,153 @@ async function kbDetail(id) {
       h("h1", {}, t("need_login")), h("a", { href: "#/login" }, t("login")))) };
   }
   const a = data.article;
-  const canEdit = hasPerm("kb.edit");
+  const canEdit = !!(data.can_edit || (state.meta && state.meta.can_edit_kb));
   const canExport = hasPerm("kb.export_pdf");
   const canShare = hasPerm("kb.share_email");
-  const canDelete = hasPerm("kb.delete");
-  const body = h("div", { style: "max-width:900px" },
+  const canDelete = hasPerm("kb.delete") && canEdit;
+  const body = h("div", { style: "max-width:1100px" },
+    h("div", { class: "flex-between mb-2" },
+      h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+        // go back to the filtered list; fall back to #/kb
+        if (history.length > 1) history.back(); else window.location.hash = "#/kb";
+      } }, "← " + t("back")),
+      h("div", { style: "display:flex;gap:6px" },
+        canExport ? h("a", { class: "btn btn-ghost btn-sm", href: "/api/kb/export/" + a.id, target: "_blank" }, t("export_pdf")) : null,
+        canShare ? h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+          const email = prompt("Email to share with");
+          if (!email) return;
+          await api("/api/kb/share", { method: "POST", body: JSON.stringify({ article_id: a.id, email }) });
+          toast("OK");
+        } }, t("share")) : null,
+        canEdit ? h("a", { class: "btn btn-blue btn-sm", href: "#/kb/edit/" + a.id }, t("edit")) : null,
+        canDelete ? h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
+          if (!confirm(t("confirm_delete"))) return;
+          try { await api("/api/kb/articles/" + a.id, { method: "DELETE" }); window.location.hash = "#/kb"; }
+          catch (e) { toast(e.message, false); }
+        } }, t("delete")) : null)),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("div", { class: "flex-between" },
-        h("h1", {}, a.title, " ", visTag(a.visibility)),
-        h("div", { style: "display:flex;gap:6px" },
-          canExport ? h("a", { class: "btn btn-ghost btn-sm", href: "/api/kb/export/" + a.id, target: "_blank" }, t("export_pdf")) : null,
-          canShare ? h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-            const email = prompt("Email to share with");
-            if (!email) return;
-            await api("/api/kb/share", { method: "POST", body: JSON.stringify({ article_id: a.id, email }) });
-            toast("OK");
-          } }, t("share")) : null,
-          canEdit ? h("button", { class: "btn btn-ghost btn-sm", onclick: () => openKbEditor(a.id) }, t("save")) : null,
-          canDelete ? h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
-            await api("/api/kb/articles/" + a.id, { method: "DELETE" }); window.location.hash = "#/kb";
-          } }, t("delete")) : null)),
+        h("h1", { style: "margin:0" }, a.title, " ", visTag(a.visibility)), null),
       h("div", { class: "muted mb-2" },
-        [a.source, a.desensitized ? "desensitized" : "raw", a.created_at].filter(Boolean).join(" · ")),
+        [a.module ? t("module") + ": " + a.module : null, a.source,
+          a.desensitized ? "desensitized" : "raw", a.created_at].filter(Boolean).join(" · ")),
       h("div", { class: "markdown", innerHTML: mdToHtml(a.body) }),
       (data.attachments || []).filter(x => x.content_type.startsWith("image/")).map(x =>
         h("img", { src: "/files/" + x.stored_name, style: "max-height:300px;margin:8px 0" })))));
   return { title: "", body };
 }
 
+function openCustomerEditor(cust, onDone) {
+  const isNew = !cust;
+  const f = (key, type) => h("input", { value: cust ? (cust[key] || "") : "", type: type || "text", placeholder: t(key), style: "width:100%" });
+  const name = f("name"), domains = f("domains"), version = f("version");
+  const start = f("service_start", "date"), end = f("service_end", "date"), contact = f("contact_email", "email");
+  const body = h("div", { style: "min-width:460px" },
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("name")), name),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("domains")), domains),
+    h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px" },
+      h("label", {}, h("span", { class: "muted" }, t("version")), version),
+      h("label", {}, h("span", { class: "muted" }, t("service_start")), start),
+      h("label", {}, h("span", { class: "muted" }, t("service_end")), end)),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("contact_email")), contact),
+    h("div", { class: "flex-between mt-2" },
+      h("button", { class: "btn btn-blue", onclick: async () => {
+        if (!name.value || !domains.value) { toast(t("name") + " / " + t("domains") + " *", false); return; }
+        const payload = { name: name.value, domains: domains.value, version: version.value,
+                          service_start: start.value, service_end: end.value, contact_email: contact.value };
+        try {
+          if (isNew) await api("/api/customers", { method: "POST", body: JSON.stringify(payload) });
+          else await api("/api/customers/" + cust.id, { method: "PUT", body: JSON.stringify(payload) });
+          toast(t("saved")); closeModal(); onDone && onDone();
+        } catch (e) { toast(e.message, false); }
+      } }, t("save")),
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+  showModal(isNew ? t("add_customer") : t("edit_customer"), body);
+}
+
 async function customersView() {
-  if (!hasPerm("customer.view")) return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
+  if (!hasPerm("customer.view")) return noAccess();
   const tbody = h("tbody", {});
-  async function doLoad() {
-    const r = await api("/api/customers");
+  const selected = new Set();
+  let rows = [];
+
+  const q = h("input", { placeholder: t("search_customer"), style: "width:280px" });
+  const qWrap = attachSuggest(q, async val => {
+    const r = await api("/api/customers?q=" + encodeURIComponent(val));
+    return (r.items || []).map(c => ({ ...c, label: c.name + (c.domains ? "  <" + c.domains + ">" : "") }));
+  }, c => { q.value = c.name; doLoad(); });
+
+  const selectAll = h("input", { type: "checkbox", onchange: e => {
+    const on = e.target.checked;
+    selected.clear();
+    if (on) rows.forEach(c => selected.add(c.id));
+    renderRows();
+  } });
+
+  function renderRows() {
     tbody.innerHTML = "";
-    for (const c of (r.items || [])) {
+    if (!rows.length) {
+      tbody.append(h("tr", {}, h("td", { colspan: 7, class: "muted" }, t("no_results"))));
+      return;
+    }
+    for (const c of rows) {
+      const cb = h("input", { type: "checkbox", checked: selected.has(c.id) ? "checked" : null, onchange: e => {
+        if (e.target.checked) selected.add(c.id); else selected.delete(c.id);
+        selectAll.checked = rows.length > 0 && rows.every(x => selected.has(x.id));
+      } });
       tbody.append(h("tr", {},
-        h("td", {}, c.name), h("td", {}, c.domains), h("td", {}, c.version || "-"),
+        h("td", {}, cb),
+        h("td", {}, h("a", { href: "javascript:void(0)", onclick: () => openCustomerEditor(c, doLoad) }, c.name)),
+        h("td", {}, c.domains), h("td", {}, c.version || "-"),
         h("td", {}, c.service_start || "-"), h("td", {}, c.service_end || "-"),
         h("td", {}, c.contact_email || "-"),
-        h("td", {}, h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-          const b = await api("/api/customers/" + c.id, { method: "DELETE" }); toast("OK"); doLoad();
+        h("td", {}, h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
+          if (!confirm(t("confirm_delete") + " " + c.name)) return;
+          await api("/api/customers/" + c.id, { method: "DELETE" }); toast(t("saved")); doLoad();
         } }, t("delete")))));
     }
   }
-  const custInp = h("input", { placeholder: t("add_customer") });
-  const domInp = h("input", { placeholder: t("domains") });
-  const form = h("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:12px" },
-    custInp, domInp,
-    hasPerm("customer.create") ? h("button", { class: "btn btn-blue btn-sm", onclick: async () => {
-      if (!custInp.value || !domInp.value) { toast("name and domains required", false); return; }
-      await api("/api/customers", { method: "POST", body: JSON.stringify({ name: custInp.value, domains: domInp.value }) });
-      custInp.value = ""; domInp.value = ""; toast("OK"); doLoad();
-    } }, "+") : null);
-  const importBtn = h("label", { class: "btn btn-ghost btn-sm", style: "cursor:pointer" },
-    t("import_csv") + " · " + h("span", { class: "muted" }, t("download_template")) + " ",
-    h("a", { href: "/api/customers/template.csv", download: true, style: "color:var(--blue)" }, "↓"),
-    h("input", { type: "file", accept: ".csv", style: "display:none", onchange: async e => {
-      const f = e.target.files[0]; if (!f) return;
-      const fd = new FormData(); fd.append("file", f);
+
+  async function doLoad() {
+    const r = await api("/api/customers?q=" + encodeURIComponent((q.value || "").trim()));
+    rows = r.items || [];
+    selected.clear(); selectAll.checked = false;
+    renderRows();
+  }
+
+  async function bulkDelete() {
+    const ids = Array.from(selected);
+    if (!ids.length) { toast(t("select_first"), false); return; }
+    if (!confirm(t("confirm_delete") + " (" + ids.length + ")")) return;
+    try {
+      await api("/api/customers/bulk", { method: "POST", body: JSON.stringify({ ids }) });
+      toast(t("saved")); doLoad();
+    } catch (e) { toast(e.message, false); }
+  }
+
+  const importInput = h("input", { type: "file", accept: ".csv", style: "display:none", onchange: async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append("file", f);
+    try {
       const r = await apiForm("/api/customers/import", fd);
-      toast("Imported " + r.created + " new / " + r.updated + " updated");
-      e.target.value = ""; doLoad();
-    } }));
+      toast(t("imported") + ": " + r.created + " / " + r.updated); doLoad();
+    } catch (err) { toast(err.message, false); }
+    e.target.value = "";
+  } });
+
   const body = h("div", {},
-    h("div", { class: "flex-between" }, h("h1", {}, t("customers")),
-      hasPerm("customer.import_csv") ? importBtn : null),
-    form,
+    h("div", { class: "toolbar" },
+      h("div", { class: "toolbar-left" }, qWrap),
+      h("div", { class: "toolbar-right" },
+        h("label", { class: "btn btn-ghost btn-sm" }, t("import_csv"), importInput,
+          h("a", { href: "/api/customers/template.csv", download: true, style: "margin-left:6px;color:var(--blue)" }, "↓ " + t("download_template"))),
+        hasPerm("customer.create") ? h("button", { class: "btn btn-blue btn-sm", onclick: () => openCustomerEditor(null, doLoad) }, "+" + t("add_customer")) : null,
+        hasPerm("customer.delete") ? h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: bulkDelete }, t("delete")) : null)),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
-        h("thead", {}, h("tr", {}, [t("name"), t("domains"), t("version"), t("service_start"), t("service_end"), t("contact_email"), t("actions")].map(c => h("th", {}, c)))),
+        h("thead", {}, h("tr", {},
+          h("th", { style: "width:36px" }, selectAll),
+          [t("name"), t("domains"), t("version"), t("service_start"), t("service_end"), t("contact_email"), t("actions")].map(c => h("th", {}, c)))),
         tbody))));
   doLoad();
   return { title: "", body };
@@ -820,49 +984,214 @@ function meView() {
   return { title: "", body };
 }
 
+/** Wraps an input with a fuzzy suggestion dropdown. */
+function attachSuggest(input, loader, onPick) {
+  const box = h("div", { class: "suggest hidden" });
+  const wrap = h("div", { class: "suggest-wrap" }, input, box);
+  let timer;
+  const hide = () => box.classList.add("hidden");
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const val = (input.value || "").trim();
+      if (!val) return hide();
+      let items = [];
+      try { items = await loader(val); } catch (e) { return hide(); }
+      box.innerHTML = "";
+      if (!items.length) return hide();
+      for (const it of items.slice(0, 12)) {
+        box.append(h("div", { class: "suggest-item", onmousedown: () => { hide(); onPick(it); } }, it.label));
+      }
+      box.classList.remove("hidden");
+    }, 180);
+  });
+  input.addEventListener("blur", () => setTimeout(hide, 250));
+  input.addEventListener("keydown", e => { if (e.key === "Escape") hide(); });
+  return wrap;
+}
+
+function noAccess() {
+  return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
+}
+
+async function loadRoleOptions(select, includeEmpty, selected) {
+  try {
+    const r = await api("/api/admin/roles");
+    select.innerHTML = "";
+    if (includeEmpty) select.append(h("option", { value: "" }, "- " + t("role") + " -"));
+    for (const x of (r.items || [])) {
+      select.append(h("option", { value: x.name, selected: selected && selected.includes(x.name) ? "selected" : null }, x.name));
+    }
+  } catch (e) {}
+}
+
+async function loadGroupOptions(select, selected) {
+  try {
+    const r = await api("/api/admin/groups");
+    select.innerHTML = "";
+    select.append(h("option", { value: "" }, "- " + t("groups") + " -"));
+    for (const g of (r.items || [])) {
+      select.append(h("option", { value: g.id, selected: selected && selected.includes(g.id) ? "selected" : null }, g.name));
+    }
+  } catch (e) {}
+}
+
+/** Create / edit user modal. */
+function openUserEditor(user, onDone) {
+  const isNew = !user;
+  const email = h("input", { type: "email", value: user ? user.email : "", placeholder: t("email"), style: "width:100%" });
+  const name = h("input", { value: user ? (user.display_name || "") : "", placeholder: t("display_name"), style: "width:100%" });
+  const pw = h("input", { type: "password", placeholder: isNew ? t("password") : t("new_password"), style: "width:100%" });
+  const roleSel = h("select", { style: "width:100%" });
+  const statusSel = h("select", { style: "width:100%" },
+    h("option", { value: "active", selected: !user || user.status === "active" ? "selected" : null }, t("active")),
+    h("option", { value: "disabled", selected: user && user.status === "disabled" ? "selected" : null }, t("disabled")));
+  loadRoleOptions(roleSel, true, user ? (user.roles || []) : []);
+
+  const body = h("div", { style: "min-width:420px" },
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("email")), email),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("display_name")), name),
+    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, isNew ? t("password") : t("new_password")), pw),
+    h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" },
+      h("label", {}, h("span", { class: "muted" }, t("role")), roleSel),
+      h("label", {}, h("span", { class: "muted" }, t("status")), statusSel)),
+    h("div", { class: "flex-between mt-2" },
+      h("button", { class: "btn btn-blue", onclick: async () => {
+        if (!email.value) { toast(t("email") + " *", false); return; }
+        const payload = { email: email.value, display_name: name.value, status: statusSel.value,
+                          roles: roleSel.value ? [roleSel.value] : [] };
+        if (pw.value) payload.password = pw.value;
+        try {
+          if (isNew) await api("/api/admin/users", { method: "POST", body: JSON.stringify(payload) });
+          else await api("/api/admin/users/" + user.id, { method: "PUT", body: JSON.stringify(payload) });
+          toast(t("saved")); closeModal(); onDone && onDone();
+        } catch (e) { toast(e.message, false); }
+      } }, t("save")),
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+  showModal(isNew ? t("add_user") : t("edit_user"), body);
+}
+
 async function adminUsers() {
-  if (!hasPerm("user.manage")) return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
+  if (!hasPerm("user.manage")) return noAccess();
   const tbody = h("tbody", {});
-  const q = h("input", { placeholder: t("email") + " / " + t("display_name"), oninput: doLoad });
-  async function doLoad() {
-    const r = await api("/api/admin/users?q=" + encodeURIComponent(q.value || ""));
+  const selected = new Set();
+  let rows = [];
+
+  const q = h("input", { placeholder: t("search_user"), style: "width:280px" });
+  const qWrap = attachSuggest(q, async val => {
+    const r = await api("/api/admin/users?q=" + encodeURIComponent(val));
+    return (r.items || []).map(u => ({ ...u, label: (u.display_name || "") + "  <" + u.email + ">" }));
+  }, u => { q.value = u.email; doLoad(); });
+
+  const selectAll = h("input", { type: "checkbox", onchange: e => {
+    const on = e.target.checked;
+    selected.clear();
+    if (on) rows.forEach(u => selected.add(u.id));
+    renderRows();
+  } });
+
+  function renderRows() {
     tbody.innerHTML = "";
-    for (const u of (r.items || [])) {
+    if (!rows.length) {
+      tbody.append(h("tr", {}, h("td", { colspan: 5, class: "muted" }, t("no_results"))));
+      return;
+    }
+    for (const u of rows) {
+      const cb = h("input", { type: "checkbox", checked: selected.has(u.id) ? "checked" : null, onchange: e => {
+        if (e.target.checked) selected.add(u.id); else selected.delete(u.id);
+        selectAll.checked = rows.length > 0 && rows.every(x => selected.has(x.id));
+      } });
+      const disabled = u.status === "disabled";
       tbody.append(h("tr", {},
-        h("td", {}, u.email, h("br"), u.display_name || ""),
-        h("td", {}, (u.roles || []).join(", ")),
-        h("td", {}, u.status),
-        h("td", {}, h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-          const p = prompt("Set new password for " + u.email, ""); if (p) await api("/api/admin/users/" + u.id, { method: "PUT", body: JSON.stringify({ password: p }) });
-          toast("OK");
-        } }, t("save")),
+        h("td", {}, cb),
+        h("td", {},
+          h("a", { href: "javascript:void(0)", onclick: () => openUserEditor(u, doLoad) },
+            u.display_name || u.email),
+          h("div", { class: "muted", style: "font-size:12px" }, u.email)),
+        h("td", {}, (u.roles || []).join(", ") || "-"),
+        h("td", {}, h("span", { class: "tag " + (disabled ? "closed" : "open") }, disabled ? t("disabled") : t("active"))),
+        h("td", {},
+          h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+            await api("/api/admin/users/" + u.id, { method: "PUT", body: JSON.stringify({ status: disabled ? "active" : "disabled" }) });
+            toast(t("saved")); doLoad();
+          } }, disabled ? t("enable") : t("disable")),
           hasPerm("user.reset_totp") ? h("button", { class: "btn btn-ghost btn-sm", style: "margin-left:4px", onclick: async () => {
             await api("/api/admin/users/" + u.id + "/reset_totp", { method: "POST" }); toast("OK");
           } }, t("reset_totp")) : null,
           h("button", { class: "btn btn-ghost btn-sm", style: "margin-left:4px;color:#dc2626", onclick: async () => {
-            await api("/api/admin/users/" + u.id, { method: "DELETE" }); toast("OK"); doLoad();
+            if (!confirm(t("confirm_delete") + " " + u.email)) return;
+            await api("/api/admin/users/" + u.id, { method: "DELETE" }); toast(t("saved")); doLoad();
           } }, t("delete")))));
     }
   }
-  const emailInp = h("input", { placeholder: t("email") });
-  const nameInp = h("input", { placeholder: t("display_name") });
-  const pwInp = h("input", { placeholder: t("password") });
-  const roleInp = h("select", { multiple: true, size: 4 });
-  (async () => {
-    try { const r = await api("/api/admin/roles"); (r.items || []).forEach(x => roleInp.append(h("option", { value: x.name }, x.name))); } catch (e) {}
-  })();
-  const addBtn = h("button", { class: "btn btn-blue btn-sm", onclick: async () => {
-    const roles = Array.from(roleInp.selectedOptions).map(o => o.value);
-    await api("/api/admin/users", { method: "POST", body: JSON.stringify({ email: emailInp.value, display_name: nameInp.value, password: pwInp.value, roles }) });
-    emailInp.value = ""; nameInp.value = ""; pwInp.value = ""; toast("OK"); doLoad();
-  } }, "+" + t("add_user"));
+
+  async function doLoad() {
+    const r = await api("/api/admin/users?q=" + encodeURIComponent((q.value || "").trim()));
+    rows = r.items || [];
+    selected.clear();
+    selectAll.checked = false;
+    renderRows();
+  }
+
+  async function bulk(action, extra) {
+    const ids = Array.from(selected);
+    if (!ids.length) { toast(t("select_first"), false); return; }
+    if (action === "delete" && !confirm(t("confirm_delete") + " (" + ids.length + ")")) return;
+    try {
+      await api("/api/admin/users/bulk", { method: "POST", body: JSON.stringify(Object.assign({ ids, action }, extra || {})) });
+      toast(t("saved")); doLoad();
+    } catch (e) { toast(e.message, false); }
+  }
+
+  function openBulkEdit() {
+    const roleSel = h("select", { style: "width:100%" });
+    const statusSel = h("select", { style: "width:100%" },
+      h("option", { value: "" }, "- " + t("no_change") + " -"),
+      h("option", { value: "active" }, t("active")),
+      h("option", { value: "disabled" }, t("disabled")));
+    loadRoleOptions(roleSel, true, []);
+    const body = h("div", { style: "min-width:380px" },
+      h("p", { class: "muted" }, t("bulk_update_hint") + " (" + selected.size + ")"),
+      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("role")), roleSel),
+      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("status")), statusSel),
+      h("div", { class: "flex-between mt-2" },
+        h("button", { class: "btn btn-blue", onclick: async () => {
+          const extra = {};
+          if (roleSel.value) extra.roles = [roleSel.value];
+          if (statusSel.value) extra.status = statusSel.value;
+          closeModal();
+          await bulk("update", extra);
+        } }, t("save")),
+        h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+    showModal(t("bulk_update"), body);
+  }
+
+  const importInput = h("input", { type: "file", accept: ".csv", style: "display:none", onchange: async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append("file", f);
+    try {
+      const r = await apiForm("/api/admin/users/import", fd);
+      toast(t("imported") + ": " + r.created + " / " + r.updated);
+      doLoad();
+    } catch (err) { toast(err.message, false); }
+    e.target.value = "";
+  } });
+
   const body = h("div", {},
-    h("h1", {}, t("users")),
-    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
-      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center" }, q, emailInp, nameInp, pwInp, roleInp, addBtn))),
+    h("div", { class: "toolbar" },
+      h("div", { class: "toolbar-left" }, qWrap),
+      h("div", { class: "toolbar-right" },
+        h("label", { class: "btn btn-ghost btn-sm" }, t("bulk_import"), importInput,
+          h("a", { href: "/api/admin/users/template.csv", download: true, style: "margin-left:6px;color:var(--blue)" }, "↓ " + t("download_template"))),
+        h("button", { class: "btn btn-blue btn-sm", onclick: () => openUserEditor(null, doLoad) }, "+" + t("add_user")),
+        h("button", { class: "btn btn-ghost btn-sm", onclick: openBulkEdit }, t("bulk_update")),
+        h("button", { class: "btn btn-ghost btn-sm", onclick: () => bulk("disable") }, t("disable")),
+        h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: () => bulk("delete") }, t("delete")))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
-        h("thead", {}, h("tr", {}, [t("email"), t("role"), t("status"), t("actions")].map(c => h("th", {}, c)))),
+        h("thead", {}, h("tr", {},
+          h("th", { style: "width:36px" }, selectAll),
+          [t("name"), t("role"), t("status"), t("actions")].map(c => h("th", {}, c)))),
         tbody))));
   doLoad();
   return { title: "", body };
@@ -929,6 +1258,100 @@ async function adminGroups() {
   return { title: "", body };
 }
 
+async function adminSite() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  let s;
+  try { s = await api("/api/admin/site"); } catch (e) { return { title: "", body: h("div", {}, t("no_results")) }; }
+  const modules = (s.modules || []).slice();
+  const domains = (s.internal_domains || []).slice();
+
+  // --- modules CRUD ---
+  const modList = h("div", {});
+  const modInput = h("input", { placeholder: "PAC" });
+  function renderMods() {
+    modList.innerHTML = "";
+    if (!modules.length) modList.append(h("div", { class: "muted" }, t("no_results")));
+    modules.forEach((m, i) => {
+      modList.append(h("div", { class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
+        h("span", {}, m),
+        h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: () => {
+          modules.splice(i, 1); renderMods();
+        } }, t("delete"))));
+    });
+  }
+  renderMods();
+
+  // --- internal domains ---
+  const domList = h("div", {});
+  const domInput = h("input", { placeholder: "rankez.local" });
+  function renderDoms() {
+    domList.innerHTML = "";
+    if (!domains.length) domList.append(h("div", { class: "muted" }, t("no_results")));
+    domains.forEach((d, i) => {
+      domList.append(h("div", { class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
+        h("span", {}, d),
+        h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: () => {
+          domains.splice(i, 1); renderDoms();
+        } }, t("delete"))));
+    });
+  }
+  renderDoms();
+
+  const timeoutInp = h("input", { type: "number", min: 0, value: String(s.session_timeout || 0), style: "width:120px" });
+  const themeSel = h("select", {},
+    [["light", t("theme_light")], ["dark", t("theme_dark")], ["system", t("theme_system")]]
+      .map(([v, label]) => h("option", { value: v, selected: (s.theme || "light") === v ? "selected" : null }, label)));
+
+  const body = h("div", { style: "max-width:860px" },
+    h("h1", {}, t("site_settings")),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("session_timeout")),
+      h("p", { class: "muted" }, t("session_timeout_hint")),
+      h("div", { style: "display:flex;gap:8px;align-items:center" }, timeoutInp,
+        h("span", { class: "muted" }, t("minutes"))),
+      h("h3", { style: "margin-top:14px" }, t("page_theme")),
+      h("div", { style: "display:flex;gap:8px;align-items:center" }, themeSel))),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("modules")),
+      h("p", { class: "muted" }, t("modules_hint")),
+      modList,
+      h("div", { style: "display:flex;gap:8px;margin-top:8px" }, modInput,
+        h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          const v = modInput.value.trim(); if (!v) return;
+          if (!modules.includes(v)) modules.push(v);
+          modInput.value = ""; renderMods();
+        } }, "+" + t("add"))))),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("internal_domains")),
+      h("p", { class: "muted" }, t("internal_domains_hint")),
+      domList,
+      h("div", { style: "display:flex;gap:8px;margin-top:8px" }, domInput,
+        h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          const v = domInput.value.trim().toLowerCase(); if (!v) return;
+          if (!domains.includes(v)) domains.push(v);
+          domInput.value = ""; renderDoms();
+        } }, "+" + t("add"))))),
+    h("div", { style: "display:flex;gap:8px" },
+      h("button", { class: "btn btn-blue", onclick: async () => {
+        try {
+          await api("/api/admin/site", { method: "POST", body: JSON.stringify({
+            modules, internal_domains: domains,
+            session_timeout: Number(timeoutInp.value || 0), theme: themeSel.value }) });
+          applyTheme(themeSel.value);
+          toast(t("saved"));
+          const m = await api("/api/meta");
+          state.modules = m.modules; state.deployTypes = m.deploy_types; render();
+        } catch (e) { toast(e.message, false); }
+      } }, t("save"))));
+  return { title: "", body };
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (!theme || theme === "system") root.removeAttribute("data-theme");
+  else root.setAttribute("data-theme", theme);
+}
+
 async function adminSettings() {
   if (!hasPerm("settings.mail")) return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
   let cfg;
@@ -950,7 +1373,8 @@ async function adminSettings() {
     toast("Sent: " + (r.sent ? "yes" : "no"));
   } }, t("test"));
   const body = h("div", { style: "max-width:760px" },
-    h("h1", {}, t("settings")),
+    h("div", { class: "flex-between mb-2" }, h("h1", {}, t("mail_settings")),
+      h("a", { class: "btn btn-ghost btn-sm", href: "#/admin/site" }, t("site_settings"))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("label", { style: "display:block;margin:6px 0" }, h("span", { class: "muted" }, "SMTP host"), f("smtp_host")),
       h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px" },
@@ -999,6 +1423,9 @@ document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh
       state.me_perms = new Set(state.user.permissions);
       state.meta = await api("/api/meta");
       state.products = state.meta.products;
+      state.modules = state.meta.modules || [];
+      state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
+      applyTheme(state.meta.theme);
     } catch (e) { state.user = null; state.token = null; }
   }
   render();
