@@ -2302,7 +2302,9 @@ async function adminInternalDomains() {
 
   const list = h("div", {});
   const inp = h("input", { placeholder: "rankez.local", style: "flex:1" });
+  let paintSite = () => {};
   const paint = () => {
+    paintSite();
     list.innerHTML = "";
     if (!domains.length) list.append(h("div", { class: "muted" }, "\u2014"));
     domains.forEach((d, i) => list.append(h("div", {
@@ -2312,6 +2314,31 @@ async function adminInternalDomains() {
         onclick: () => { domains.splice(i, 1); paint(); } }, t("delete")))));
   };
   paint();
+
+  // Domains this installation recognised as its own (Settings > Mail + the
+  // staff accounts that already exist). They may register even when they are
+  // not listed above; the "+" promotes one to a real internal domain.
+  const detected = (s.site_domains || []).slice();
+  const siteCard = [];
+  if (detected.length) {
+    const siteBox = h("div", {});
+    paintSite = () => {
+      siteBox.innerHTML = "";
+      const left = detected.filter(d => !domains.includes(d));
+      if (!left.length) { siteBox.append(h("div", { class: "muted" }, "\u2014")); return; }
+      left.forEach(d => siteBox.append(h("div", {
+        class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
+        h("span", {}, d),
+        h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          domains.push(d); paint();
+        } }, "+" + t("add")))));
+    };
+    paintSite();
+    siteCard.push(h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("internal_domains_detected")),
+      h("p", { class: "muted" }, t("internal_domains_detected_hint")),
+      siteBox)));
+  }
 
   // Who the current rule already covers -- the assignee candidates.
   const usersTitle = h("h3", {});
@@ -2349,6 +2376,7 @@ async function adminInternalDomains() {
           toast(t("saved"));
         } catch (e) { toast(e.message, false); }
       } }, t("save")))),
+    ...siteCard,
     h("div", { class: "card" }, h("div", { class: "card-body" },
       usersTitle,
       h("p", { class: "muted" }, t("internal_domains_users_hint")),

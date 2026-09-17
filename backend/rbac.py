@@ -207,6 +207,78 @@ def _internal_domains(conn):
         return []
 
 
+# Free / public mail providers are never treated as "this installation's own
+# domain" -- deriving them would open registration to the whole world.
+PUBLIC_MAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "hotmail.co.uk",
+    "live.com", "live.cn", "msn.com", "yahoo.com", "yahoo.co.jp", "yahoo.com.cn",
+    "icloud.com", "me.com", "mac.com", "aol.com", "protonmail.com", "proton.me",
+    "gmx.com", "gmx.net", "mail.ru", "yandex.ru", "yandex.com", "zoho.com",
+    "qq.com", "foxmail.com", "163.com", "126.com", "yeah.net", "sina.com",
+    "sina.cn", "sohu.com", "aliyun.com", "139.com", "189.cn", "21cn.com",
+    "tom.com", "outlook.jp", "naver.com", "daum.net", "hanmail.net",
+}
+
+# Settings > Mail: the mailboxes this installation sends / reads as.
+SITE_MAILBOX_KEYS = ("smtp_from", "smtp_user", "imap_user", "o365_mailbox")
+
+# Roles that only ever exist for the operator's own staff.
+STAFF_ROLE_NAMES = ("管理员", "L1售后人员", "L2售后人员")
+
+
+def _domain_of(value):
+    s = (value or "").strip().lower()
+    if "@" not in s:
+        return ""
+    d = s.split("@", 1)[1].strip().strip(">").strip(")").rstrip(".")
+    return d if ("." in d and " " not in d) else ""
+
+
+def derived_site_domains(conn):
+    """Domains that obviously belong to THIS installation.
+
+    Collected from the mailboxes configured under Settings > Mail and from the
+    addresses of the staff accounts that already exist (the administrators and
+    the members of the internal group). It is what makes a fresh install usable:
+    without it, registering `someone@the-site-domain` was rejected with
+    `domain_not_allowed` because the registration gate only looked at customer,
+    partner and *configured* internal domains -- and nobody had configured them.
+
+    These domains let an address register; they do NOT enrol anybody in the
+    internal group, which stays a decision of Settings > Internal domains
+    (otherwise self-registration on the site's own domain would hand out desk
+    permissions to whoever signs up).
+    """
+    out = []
+
+    def add(d):
+        d = (d or "").strip().lower()
+        if d and d not in PUBLIC_MAIL_DOMAINS and d not in out:
+            out.append(d)
+
+    for k in SITE_MAILBOX_KEYS:
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+        except Exception:  # noqa: BLE001 - settings table shaping differs per build
+            row = None
+        if row:
+            add(_domain_of(row["value"]))
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT u.email FROM users u "
+            "LEFT JOIN user_roles ur ON ur.user_id=u.id "
+            "LEFT JOIN roles r ON r.id=ur.role_id "
+            "LEFT JOIN user_groups_rel g ON g.user_id=u.id "
+            "LEFT JOIN user_groups ig ON ig.id=g.group_id AND ig.name=? "
+            "WHERE (r.name IN (?,?,?) OR ig.id IS NOT NULL)",
+            (INTERNAL_GROUP,) + STAFF_ROLE_NAMES)
+        for r in rows:
+            add(_domain_of(r["email"]))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def ensure_internal_group(conn):
     """Create (or return) the built-in staff group that matches internal domains."""
     g = conn.execute("SELECT id FROM user_groups WHERE name=?", (INTERNAL_GROUP,)).fetchone()
@@ -278,13 +350,17 @@ def known_domains(conn):
     """Every domain the system knows about: customers + partners + internal.
 
     Registration (self-service or added by an administrator) is only accepted
-    when the address belongs to one of them.
+    when the address belongs to one of them. The site's own domains (see
+    `derived_site_domains`) are part of it too -- otherwise a fresh install
+    rejects the operator's own address until somebody configures the internal
+    domains first.
     """
     out = []
     for table in ("customers", "partners"):
         for r in conn.execute("SELECT domains FROM %s" % table):
             out += [d.strip().lower() for d in (r["domains"] or "").split(",") if d.strip()]
     out += _internal_domains(conn)
+    out += derived_site_domains(conn)
     seen, uniq = set(), []
     for d in out:
         if d not in seen:

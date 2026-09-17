@@ -2127,8 +2127,16 @@ def admin_group_member_remove(gid: int, uid: int, request: Request):
 
 # =============================== ADMIN: INTERNAL DOMAINS ===============================
 def _internal_domains_payload(c):
-    """The configured suffixes + everyone they currently make desk staff."""
-    return {"domains": site_internal_domains(), "users": rbac.internal_users(c)}
+    """The configured suffixes + everyone they currently make desk staff.
+
+    `site_domains` are the domains this installation recognised as its own
+    (Settings > Mail + the staff accounts that already exist). They are always
+    allowed to register; listing them here tells the administrator why an
+    address went through even though it is not in the list above.
+    """
+    doms = site_internal_domains()
+    derived = [d for d in rbac.derived_site_domains(c) if d not in doms]
+    return {"domains": doms, "site_domains": derived, "users": rbac.internal_users(c)}
 
 
 def _normalize_domain(x):
