@@ -95,9 +95,11 @@ def create_ticket(conn, *, title, description="", customer_name="", customer_id=
     for e in (participant_emails or []):
         conn.execute("INSERT OR IGNORE INTO ticket_participants(ticket_id,email) VALUES(?,?)",
                      (tid, e.lower()))
-    conn.execute("INSERT INTO messages(ticket_id,author_email,body,internal,source) VALUES(?,?,?,?,?)",
-                 (tid, creator_email, description, 0, source))
-    _save_attachments(conn, tid, None, attachments)
+    cur = conn.execute("INSERT INTO messages(ticket_id,author_email,body,internal,source) VALUES(?,?,?,?,?)",
+                       (tid, creator_email, description, 0, source))
+    # the files belong to the opening message: without the id the detail endpoint
+    # (which groups attachments per message) would never show them
+    _save_attachments(conn, tid, cur.lastrowid, attachments)
     conn.commit()
     return conn.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
 
@@ -121,7 +123,7 @@ def _save_attachments(conn, ticket_id, message_id, attachments):
 
 def add_message(conn, ticket_id, *, body, user_id=None, author_email="", author_name="",
                 internal=0, source="web", attachments=None):
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO messages(ticket_id,user_id,author_email,author_name,body,internal,source) "
         "VALUES(?,?,?,?,?,?,?)",
         (ticket_id, user_id, (author_email or "").lower(), author_name, body, 1 if internal else 0, source))
@@ -129,7 +131,8 @@ def add_message(conn, ticket_id, *, body, user_id=None, author_email="", author_
     if author_email:
         conn.execute("INSERT OR IGNORE INTO ticket_participants(ticket_id,email) VALUES(?,?)",
                      (ticket_id, author_email.lower()))
-    _save_attachments(conn, ticket_id, None, attachments)
+    # same reason as in create_ticket: an attachment without its message is invisible
+    _save_attachments(conn, ticket_id, cur.lastrowid, attachments)
     conn.commit()
 
 
@@ -154,27 +157,110 @@ def support_recipients(conn):
     return [r["email"] for r in rows]
 
 
-def archive_to_kb(conn, ticket_id, visibility="registered", desensitize=True):
+def _message_attachments(conn, ticket_id, message_id):
+    return conn.execute(
+        "SELECT * FROM attachments WHERE message_id=? OR (message_id IS NULL AND ticket_id=?)",
+        (message_id, ticket_id))
+
+
+def raw_dialogue(conn, t):
+    """Full dialogue, identity unmasked, images inlined and files linked."""
+    parts = ["# " + (t["title"] or "")]
+    meta = []
+    if t["version"]:
+        meta.append("Version: %s" % t["version"])
+    if t["product"]:
+        meta.append("Module: %s" % t["product"])
+    if t["customer_name"]:
+        meta.append("Customer: %s" % t["customer_name"])
+    if t["source"]:
+        meta.append("Source: %s" % t["source"])
+    if meta:
+        parts.append("_%s_" % " · ".join(meta))
+    if t["description"]:
+        parts.append("")
+        parts.append(t["description"])
+    # internal notes never travel, masked or not -- the customer must not leak
+    # a remark they were never allowed to read
+    for m in conn.execute(
+            "SELECT * FROM messages WHERE ticket_id=? AND internal=0 ORDER BY id", (t["id"],)):
+        who = m["author_name"] or m["author_email"] or "user"
+        when = (m["created_at"] or "")[:16]
+        parts.append("")
+        parts.append("**%s**  <sub>%s</sub>  \n%s" % (who, when, m["body"] or ""))
+        for a in _message_attachments(conn, t["id"], m["id"]):
+            if (a["content_type"] or "").startswith("image/"):
+                parts.append("")
+                parts.append("![%s](/files/%s)" % (a["filename"], a["stored_name"]))
+            else:
+                parts.append("")
+                parts.append("[%s](/files/%s)" % (a["filename"], a["stored_name"]))
+    return "\n".join(parts)
+
+
+def _link_attachments(conn, ticket_id, article_id):
+    """Expose the ticket's files on the article (same stored blob, no copy)."""
+    n = 0
+    for a in conn.execute("SELECT * FROM attachments WHERE ticket_id=? AND article_id IS NULL",
+                          (ticket_id,)):
+        conn.execute(
+            "INSERT INTO attachments(article_id,ticket_id,filename,stored_name,content_type,size) "
+            "VALUES(?,?,?,?,?,?)",
+            (article_id, ticket_id, a["filename"], a["stored_name"],
+             a["content_type"], a["size"]))
+        n += 1
+    return n
+
+
+def archive_to_kb(conn, ticket_id, visibility="registered", desensitize=True,
+                  share_attachments=None, close_ticket=True):
+    """Publish a ticket thread as a KB article.
+
+    * ``desensitize=True`` (default) -- the dialogue with every customer name,
+      e-mail, IP and domain replaced by xxxxxx, and **no attachments at all**.
+    * ``desensitize=False`` -- the raw dialogue *with* its attachments and
+      images, for the case the user explicitly asked for the real data.
+
+    Idempotent per ticket: publishing twice updates the same article instead of
+    leaving duplicates behind.
+    """
     t = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
     if not t:
         return None
+    if share_attachments is None:
+        share_attachments = not desensitize
     if desensitize:
         from desens import desensitize_ticket
         body = desensitize_ticket(conn, ticket_id)
     else:
-        parts = ["# " + (t["title"] or "")]
-        for m in conn.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (ticket_id,)):
-            who = m["author_name"] or m["author_email"] or "user"
-            parts.append("\n**%s**  \n%s" % (who, m["body"]))
-        body = "\n".join(parts)
-    cur = conn.execute(
-        "INSERT INTO kb_articles(title,body,source,visibility,author_id,ticket_id,desensitized) "
-        "VALUES(?,?,?,?,?,?,?)",
-        (t["title"] or ("Ticket " + t["code"]), body, "ticket", visibility,
-         t["owner_id"] or t["creator_id"], ticket_id, 1 if desensitize else 0))
-    aid = cur.lastrowid
-    conn.execute("UPDATE tickets SET archived=1, kb_article_id=?, status='closed' WHERE id=?",
-                 (aid, ticket_id))
+        body = raw_dialogue(conn, t)
+
+    title = t["title"] or ("Ticket " + t["code"])
+    prev = conn.execute("SELECT id FROM kb_articles WHERE ticket_id=?", (ticket_id,)).fetchone()
+    if prev:
+        aid = prev["id"]
+        conn.execute(
+            "UPDATE kb_articles SET title=?, body=?, visibility=?, desensitized=?, "
+            "source='ticket', updated_at=datetime('now') WHERE id=?",
+            (title, body, visibility, 1 if desensitize else 0, aid))
+        conn.execute("DELETE FROM attachments WHERE article_id=?", (aid,))
+    else:
+        cur = conn.execute(
+            "INSERT INTO kb_articles(title,body,source,visibility,author_id,ticket_id,desensitized) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (title, body, "ticket", visibility, t["owner_id"] or t["creator_id"],
+             ticket_id, 1 if desensitize else 0))
+        aid = cur.lastrowid
+    if share_attachments:
+        _link_attachments(conn, ticket_id, aid)
+    # closing the ticket and publishing it are two different intents: the close
+    # button does both, the desk's "share to KB" button only shares.
+    if close_ticket:
+        conn.execute("UPDATE tickets SET archived=1, kb_article_id=?, status='closed' WHERE id=?",
+                     (aid, ticket_id))
+    else:
+        conn.execute("UPDATE tickets SET archived=1, kb_article_id=? WHERE id=?",
+                     (aid, ticket_id))
     conn.commit()
     return aid
 

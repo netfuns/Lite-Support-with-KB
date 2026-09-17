@@ -991,14 +991,14 @@ def ticket_get(tid: int, request: Request):
     msgs = [dict(m) for m in c.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (tid,))]
     atts = [dict(a) for a in c.execute("SELECT * FROM attachments WHERE ticket_id=? OR message_id IN (SELECT id FROM messages WHERE ticket_id=?)", (tid, tid))]
     parts = [r["email"] for r in c.execute("SELECT email FROM ticket_participants WHERE ticket_id=?", (tid,))]
-    perms = rbac.user_permissions(c, u["id"])
-    internal_ok = bool({"ticket.view_all", "kb.view_internal"} & perms)
-    if not internal_ok:
+    # The desk's privileges are group-based: membership of the internal group
+    # decides both the workflow buttons and whether an internal note is visible
+    # at all -- a role alone must not expose a note the customer cannot see.
+    internal_user = rbac.is_internal_user(c, u["id"])
+    if not internal_user:
         msgs = [m for m in msgs if not m["internal"]]
-        atts = [a for a in atts if True]
     for m in msgs:
         m["attachments"] = [a for a in atts if a["message_id"] == m["id"]]
-    internal_user = rbac.is_internal_user(c, u["id"])
     c.close()
     return ok(ticket=dict(t), messages=msgs, participants=parts, internal_user=internal_user)
 
@@ -1096,23 +1096,46 @@ async def ticket_status(tid: int, request: Request):
     c.execute("UPDATE tickets SET status=?, updated_at=datetime('now') WHERE id=?", (new_status, tid))
     c.commit()
     # archive on close
-    if new_status == "closed" and str(b.get("archive", "")) in ("1", "true", "on"):
-        vis = b.get("kb_visibility") or "registered"
-        des = str(b.get("kb_desensitize", "1")) in ("1", "true", "on")
-        archive = T.archive_to_kb(c, tid, visibility=vis, desensitize=des)
+    if new_status == "closed" and (_truthy(b.get("share_kb")) or _truthy(b.get("archive"))):
+        archive = T.archive_to_kb(c, tid,
+                                  visibility=_kb_visibility(b.get("kb_visibility"), True),
+                                  desensitize=_truthy(b.get("kb_desensitize"), "1"))
         c.close()
-        return ok(ok=True, archived=archive)
+        return ok(ok=True, archived=archive, shared=True)
     c.close()
     return ok(ok=True)
+
+
+KB_VISIBILITIES = ("public", "registered", "internal")
+
+
+def _truthy(v, default="0"):
+    return str(default if v is None else v).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _kb_visibility(value, internal):
+    """Normalise a requested KB visibility.
+
+    Customers and partners close their own tickets and may publish the result,
+    but the most they get to ask for is "registered users" -- picking an
+    audience wider or narrower than that is the desk's call.
+    """
+    v = str(value or "").strip().lower()
+    if v not in KB_VISIBILITIES:
+        v = "registered"
+    if not internal and v != "registered":
+        v = "registered"
+    return v
 
 
 @app.post("/api/tickets/{tid}/close")
 async def ticket_close(tid: int, request: Request):
     """Close a ticket -- the one action every user may perform.
 
-    Anyone who can *see* the ticket may close it: the customer who filed it, the
-    partner watching over it, the internal desk. Archiving the thread to the
-    knowledge base remains a staff-only side effect.
+    Anyone who can *see* the ticket may close it, and whoever closes it decides
+    whether the solution goes to the knowledge base. The customer / partner side
+    is asked in a dialog that is ticked by default and masks the identity data;
+    the desk may also publish the raw thread with its attachments.
     """
     u = require(request)
     try:
@@ -1127,16 +1150,51 @@ async def ticket_close(tid: int, request: Request):
     if not _ticket_visible(c, t, u):
         c.close()
         fail(403, "no_permission")
-    if rbac.is_internal_user(c, u["id"]) and str(b.get("archive", "")) in ("1", "true", "on"):
-        vis = b.get("kb_visibility") or "registered"
-        des = str(b.get("kb_desensitize", "1")) in ("1", "true", "on")
-        aid = T.archive_to_kb(c, tid, visibility=vis, desensitize=des)
-        c.close()
-        return ok(ok=True, archived=aid)
-    c.execute("UPDATE tickets SET status='closed', updated_at=datetime('now') WHERE id=?", (tid,))
-    c.commit()
+    internal = rbac.is_internal_user(c, u["id"])
+    # `archive` is the legacy name of the same switch, kept so an old client
+    # keeps working.
+    share = _truthy(b.get("share_kb")) or _truthy(b.get("archive"))
+    des = _truthy(b.get("kb_desensitize"), "1")
+    aid = None
+    if share:
+        aid = T.archive_to_kb(c, tid, visibility=_kb_visibility(b.get("kb_visibility"), internal),
+                              desensitize=des)
+    else:
+        c.execute("UPDATE tickets SET status='closed', updated_at=datetime('now') WHERE id=?", (tid,))
+        c.commit()
     c.close()
-    return ok(ok=True)
+    return ok(ok=True, shared=bool(aid), archived=aid)
+
+
+@app.post("/api/tickets/{tid}/share_kb")
+async def ticket_share_kb(tid: int, request: Request):
+    """Publish a ticket thread to the knowledge base -- the desk only.
+
+    The thread becomes a searchable KB article whose audience is picked here:
+    public / registered users / internal only. Publishing twice updates the same
+    article; the ticket is left open, sharing is not closing.
+    """
+    u = require(request)
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    c = conn_()
+    t = c.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+    if not t:
+        c.close()
+        fail(404, "not_found")
+    if not _ticket_visible(c, t, u):
+        c.close()
+        fail(403, "no_permission")
+    if not rbac.is_internal_user(c, u["id"]):
+        c.close()
+        fail(403, "internal_only")
+    vis = _kb_visibility(b.get("visibility"), True)
+    des = _truthy(b.get("desensitize"), "1")
+    aid = T.archive_to_kb(c, tid, visibility=vis, desensitize=des, close_ticket=False)
+    c.close()
+    return ok(ok=True, article_id=aid, visibility=vis, desensitized=des)
 
 
 @app.post("/api/tickets/{tid}/reply")

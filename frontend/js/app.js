@@ -597,6 +597,61 @@ async function ticketsView() {
   return { title: "", body };
 }
 
+const KB_VIS = ["public", "registered", "internal"];
+
+/**
+ * Closing a ticket asks a single question: does this solution go to the
+ * knowledge base, and in which form? Masked is ticked by default -- unmasking
+ * is the deliberate opt-out, and it is the only mode that carries files.
+ */
+function openCloseDialog(T, internal, onConfirm) {
+  const desChk = h("input", { type: "checkbox", checked: true, style: "margin-top:3px" });
+  const visSel = h("select", {}, KB_VIS.map(v =>
+    h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
+  const body = h("div", {},
+    h("p", {}, t("close_share_prompt")),
+    h("label", { style: "display:flex;gap:8px;align-items:flex-start;margin:12px 0" },
+      desChk,
+      h("span", {}, h("b", {}, t("share_desensitized")),
+        h("div", { class: "muted", style: "font-size:12px;margin-top:2px" }, t("share_desensitized_hint")))),
+    h("div", { class: "muted", style: "font-size:12px;border-left:3px solid var(--line,#e4e7eb);padding-left:8px" },
+      t("share_raw_hint")),
+    internal ? h("label", { class: "field", style: "margin-top:12px" },
+      h("span", { class: "muted" }, t("kb_visibility")), visSel) : null,
+    h("div", { class: "flex-between", style: "margin-top:16px;gap:8px" },
+      h("button", { class: "btn btn-ghost", onclick: () => { closeModal(); onConfirm({ share: 0 }); } },
+        t("close_without_share")),
+      h("button", { class: "btn btn-blue", onclick: () => {
+        closeModal();
+        onConfirm({ share: 1, desensitize: desChk.checked ? 1 : 0,
+                    visibility: visSel.value });
+      } }, t("close_and_share"))));
+  showModal(t("close_ticket"), body);
+}
+
+/** The desk publishing a thread by hand, with the audience it should reach. */
+function openShareDialog(T, onConfirm) {
+  const desChk = h("input", { type: "checkbox", checked: true, style: "margin-top:3px" });
+  const visSel = h("select", {}, KB_VIS.map(v =>
+    h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
+  const body = h("div", {},
+    h("p", {}, t("share_kb_prompt")),
+    h("label", { class: "field", style: "margin-top:10px" },
+      h("span", { class: "muted" }, t("kb_visibility")), visSel),
+    h("label", { style: "display:flex;gap:8px;align-items:flex-start;margin:12px 0" },
+      desChk,
+      h("span", {}, h("b", {}, t("share_desensitized")),
+        h("div", { class: "muted", style: "font-size:12px;margin-top:2px" }, t("share_desensitized_hint")))),
+    h("div", { class: "muted", style: "font-size:12px" }, t("share_raw_hint")),
+    h("div", { class: "flex-between", style: "margin-top:16px;gap:8px" },
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel")),
+      h("button", { class: "btn btn-blue", onclick: () => {
+        closeModal();
+        onConfirm({ visibility: visSel.value, desensitize: desChk.checked ? 1 : 0 });
+      } }, t("save_and_share"))));
+  showModal(t("share_to_kb"), body);
+}
+
 async function ticketDetail(id) {
   if (!state.user) return loginView();
   if (!id) { window.location.hash = "#/tickets"; return { title: "", body: h("div", {}) }; }
@@ -646,34 +701,52 @@ async function ticketDetail(id) {
   const closeSel = h("select", {},
     h("option", { value: "" }, t("status") + "…"),
     ["new", "customer_replied", "support_replied", "closed"].map(s => h("option", { value: s, selected: T.status === s ? "selected" : null }, t("st_" + s))));
-  const archChk = h("input", { type: "checkbox", checked: true });
-  const desChk = h("input", { type: "checkbox", checked: true });
-  const visSel = h("select", {},
-    ["registered", "internal"].map(v => h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
 
-  const statusBtn = h("button", { class: "btn btn-ghost", onclick: async () => {
-    if (!closeSel.value) return;
-    const body = { status: closeSel.value };
-    if (closeSel.value === "closed") { body.archive = archChk.checked ? "1" : "0"; body.kb_desensitize = desChk.checked ? "1" : "0"; body.kb_visibility = visSel.value; }
+  const sendStatus = async (body) => {
     try {
       await api("/api/tickets/" + id + "/status", { method: "PUT", body: JSON.stringify(body) });
       toast("OK"); setTimeout(() => render(), 400);
     } catch (e) { toast(e.message, false); }
+  };
+  const statusBtn = h("button", { class: "btn btn-ghost", onclick: () => {
+    if (!closeSel.value) return;
+    const st = closeSel.value;
+    // the desk closing a ticket is asked the same sharing question
+    if (st === "closed") {
+      openCloseDialog(T, true, r => sendStatus(Object.assign({ status: st },
+        r.share ? { share_kb: 1, kb_desensitize: r.desensitize, kb_visibility: r.visibility }
+                : { share_kb: 0 })));
+    } else sendStatus({ status: st });
   } }, "Update " + t("status"));
 
-  // Everyone may close a ticket; only the desk may also archive it meanwhile.
-  const closeBtn = T.status === "closed" ? null : h("button", { class: "btn btn-ghost", onclick: async () => {
-    const body = {};
-    if (internal) {
-      body.archive = archChk.checked ? "1" : "0";
-      body.kb_desensitize = desChk.checked ? "1" : "0";
-      body.kb_visibility = visSel.value;
-    }
-    try {
-      await api("/api/tickets/" + id + "/close", { method: "POST", body: JSON.stringify(body) });
-      toast("OK"); setTimeout(() => render(), 400);
-    } catch (e) { toast(e.message, false); }
+  // Everyone may close a ticket, and whoever closes it decides whether -- and
+  // in which form -- the solution is published to the knowledge base.
+  const closeBtn = T.status === "closed" ? null : h("button", { class: "btn btn-ghost", onclick: () => {
+    openCloseDialog(T, internal, async r => {
+      try {
+        await api("/api/tickets/" + id + "/close", { method: "POST", body: JSON.stringify(
+          r.share ? { share_kb: 1, kb_desensitize: r.desensitize, kb_visibility: r.visibility }
+                  : { share_kb: 0 }) });
+        toast(r.share ? t("share_saved") : "OK"); setTimeout(() => render(), 600);
+      } catch (e) { toast(e.message, false); }
+    });
   } }, t("close_ticket"));
+
+  // The desk may publish a thread at any time -- open or closed -- and picks
+  // the audience that will be able to search it.
+  const shareBtn = internal ? h("button", { class: "btn btn-ghost", onclick: () => {
+    openShareDialog(T, async r => {
+      try {
+        const res = await api("/api/tickets/" + id + "/share_kb", { method: "POST", body: JSON.stringify(r) });
+        toast(t("share_saved") + " · #" + res.article_id); setTimeout(() => render(), 600);
+      } catch (e) { toast(e.message, false); }
+    });
+  } }, t("share_to_kb")) : null;
+
+  const kbLink = T.kb_article_id
+    ? h("a", { class: "tag", style: "text-decoration:none", href: "#/kb/" + T.kb_article_id },
+        t("shared_to_kb") + " ↗")
+    : null;
 
   // reply box
   const msgInp = h("textarea", { rows: 3, placeholder: t("reply") + "…" });
@@ -712,13 +785,13 @@ async function ticketDetail(id) {
         [t("customer") + " " + (T.customer_name || "-"), t("module") + " " + (T.product || "-"),
           t("version") + " " + (T.version || "-"), t("source") + " " + T.source,
           t("created") + " " + T.created_at].join(" · ")),
-      h("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px" },
+      h("div", { class: "ticket-actions" },
         can.claim ? claimBtn : null,
         can.owner ? h("label", {}, ownerSel) : null,
         can.status ? h("label", {}, closeSel, statusBtn) : null,
         closeBtn,
-        internal ? h("label", {}, archChk, t("archive"), " · ", visSel) : null,
-        internal ? h("label", {}, desChk, t("desensitize")) : null,
+        shareBtn,
+        kbLink,
         can.export ? h("a", { class: "btn btn-ghost", href: "/api/kb/export/" + (T.kb_article_id || id), target: "_blank" }, t("export_pdf")) : null,
       ),
       h("div", { class: "card-body", style: "background:var(--bg)" },
@@ -1012,8 +1085,12 @@ async function kbDetail(id) {
         [a.module ? t("module") + ": " + a.module : null, a.source,
           a.desensitized ? "desensitized" : "raw", a.created_at].filter(Boolean).join(" · ")),
       h("div", { class: "markdown", innerHTML: mdToHtml(a.body) }),
-      (data.attachments || []).filter(x => x.content_type.startsWith("image/")).map(x =>
-        h("img", { src: "/files/" + x.stored_name, style: "max-height:300px;margin:8px 0" })))));
+      h("div", { style: "margin-top:8px" },
+        (data.attachments || []).map(x => (x.content_type || "").startsWith("image/")
+          ? h("img", { src: "/files/" + x.stored_name, style: "max-height:300px;margin:8px 0;display:block" })
+          : h("a", { class: "btn btn-ghost btn-sm", style: "margin:4px 6px 0 0",
+                      href: "/files/" + x.stored_name, target: "_blank" },
+              "📎 " + x.filename))))));
   return { title: "", body };
 }
 

@@ -234,6 +234,15 @@ def migrate():
     cc = _columns(conn, "customers")
     if "partner_id" not in cc:
         conn.execute("ALTER TABLE customers ADD COLUMN partner_id INTEGER")
+    # Attachments used to be stored with a NULL message_id, and the detail
+    # endpoint groups files by message -- so every file uploaded with a ticket or
+    # a reply stayed invisible. Re-attach the old rows to their ticket's first
+    # message; new writes carry the real id (see tickets._save_attachments).
+    conn.execute(
+        "UPDATE attachments SET message_id=("
+        "  SELECT MIN(m.id) FROM messages m WHERE m.ticket_id=attachments.ticket_id"
+        ") WHERE message_id IS NULL AND ticket_id IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM messages m WHERE m.ticket_id=attachments.ticket_id)")
     conn.commit()
     conn.close()
 

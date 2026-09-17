@@ -1,49 +1,92 @@
-"""Desensitization: replace customer domains and names in archived KB text.
+"""Desensitization: mask a ticket's identity before it reaches the KB.
 
-Rule from spec:
-- Customer domain abc.com -> xxxxx.com (label masked, TLD kept)
-- Any customer name keyword in dialogue -> xxxxxx
-When desensitize is on, images/attachments are dropped (handled by caller) and only
-the dialogue text is kept.
+One mask covers every kind of identity data -- customer / partner name,
+e-mail address, IP literal, host name and domain -- all become ``xxxxxx``:
+
+    Acme Inc          -> xxxxxx
+    alice@abc.com     -> xxxxxx
+    abc.com           -> xxxxxx
+    192.168.254.10    -> xxxxxx
+
+When desensitization is on the caller also drops every attachment and image
+(see tickets.archive_to_kb): only the dialogue text is published.
 """
 import re
 
+MASK = "xxxxxx"
 
-def mask_domain(domain: str) -> str:
-    domain = domain.strip().lower()
-    if "." in domain:
-        label, _, tld = domain.partition(".")
-        return "xxxxx." + tld
-    return "xxxxxx"
+# Only these suffixes make a dotted token look like a host name. Without the
+# list "app.js" or "v1.2" inside a bug report would be masked too.
+_TLDS = (
+    "com|cn|net|org|io|ai|co|edu|gov|mil|dev|test|local|internal|intranet|lan|"
+    "corp|company|group|xyz|top|info|biz|me|cc|tv|site|online|shop|store|tech|"
+    "cloud|app|vip|club|live|link|work|fun|pro|asia|mobi|name|plus|"
+    "中国|公司|网络|集团"
+)
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}")
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# Written-out v6 (6+ groups) or the compressed "::" form. A plain 12:30:45 is
+# deliberately not matched -- masking every clock time would ruin the article.
+IPV6_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){5,7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f:])"
+    r"|(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){1,7}:"
+    r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?![0-9A-Fa-f:])")
+DOMAIN_RE = re.compile(
+    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+(?:%s)\b" % _TLDS,
+    re.IGNORECASE)
+
+
+# Words that are far too common to mask on their own -- "Test Customer Ltd"
+# must not turn every "customer" in the thread into xxxxxx.
+_STOPWORDS = {
+    "inc", "inc.", "ltd", "ltd.", "co", "co.", "corp", "corp.", "llc", "gmbh",
+    "group", "company", "customer", "client", "test", "demo", "tech",
+    "technology", "technologies", "solutions", "solution", "system", "systems",
+    "service", "services", "software", "network", "networks", "data", "digital",
+    "china", "beijing", "shanghai", "shenzhen", "guangzhou", "international",
+    "global", "info", "support", "admin", "team", "office", "holdings",
+}
 
 
 def build_replacements(customer_name: str, domains_csv: str):
+    """Explicit literals to mask, so a name/domain is caught even when it is
+    written in a way the generic patterns would miss."""
     repl = {}
     for d in (domains_csv or "").split(","):
         d = d.strip()
         if d:
-            repl[d] = mask_domain(d)
-            # also bare label occurrences rarely; keep full domain only
+            repl[d] = MASK
     name = (customer_name or "").strip()
     if name:
-        repl[name] = "xxxxxx"
+        repl[name] = MASK
+        # a two-word company name is normally written shortened as well
+        for word in name.split():
+            if len(word) >= 4 and word.lower() not in _STOPWORDS:
+                repl.setdefault(word, MASK)
     return repl
 
 
-def desensitize_text(text: str, repl: dict) -> str:
+def desensitize_text(text: str, repl=None) -> str:
     if not text:
         return text
     out = text
-    # longest keys first to avoid partial overlaps
-    for key in sorted(repl.keys(), key=len, reverse=True):
-        if not key:
-            continue
-        out = re.sub(re.escape(key), repl[key], out, flags=re.IGNORECASE)
+    # Whole shapes first: an address must go in one piece, otherwise masking its
+    # domain first would leave the local part behind ("alice@xxxxxx").
+    out = EMAIL_RE.sub(MASK, out)
+    out = IPV4_RE.sub(MASK, out)
+    out = IPV6_RE.sub(MASK, out)
+    out = DOMAIN_RE.sub(MASK, out)
+    # then the explicit literals of this customer, longest key first to avoid
+    # partial overlaps; a bare company word is caught here
+    for key in sorted((repl or {}).keys(), key=len, reverse=True):
+        if key:
+            out = re.sub(re.escape(key), MASK, out, flags=re.IGNORECASE)
     return out
 
 
 def desensitize_ticket(conn, ticket_id: int) -> str:
-    """Return markdown dialogue of a ticket with customer data masked."""
+    """Return the markdown dialogue of a ticket with its identity masked."""
     t = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
     if not t:
         return ""
@@ -76,4 +119,6 @@ def desensitize_ticket(conn, ticket_id: int) -> str:
         body = desensitize_text(m["body"] or "", repl)
         lines.append("")
         lines.append("**%s**  \n%s" % (who, body))
+    # attachments are deliberately not referenced: a masked thread never carries
+    # a file that could leak the identity we just removed.
     return "\n".join(lines)

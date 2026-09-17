@@ -104,6 +104,12 @@ table td a { color:var(--blue); }
 .tag.internal { background:#fef3c7; color:#92400e; }
 .tag.usergroup { background:#ede9fe; color:#5b21b6; }
 .tag.partner { background:#e0f2fe; color:#075985; }
+
+/* ticket detail toolbar: claim / owner / status / close / share, each control
+   keeps its own label so the row wraps cleanly instead of colliding */
+.ticket-actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:8px; }
+.ticket-actions > label { display:inline-flex; align-items:center; gap:6px; }
+.ticket-actions > a.tag { font-weight:600; }
 input, select, textarea { padding:7px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font-size:14px; }
 input:focus, select:focus, textarea:focus { outline:none; border-color:var(--blue); }
 input[type=checkbox], input[type=radio] { width:16px; height:16px; }
