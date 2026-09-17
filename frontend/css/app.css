@@ -103,6 +103,7 @@ table td a { color:var(--blue); }
 .tag.registered { background:#dcfce8; color:#15803d; }
 .tag.internal { background:#fef3c7; color:#92400e; }
 .tag.usergroup { background:#ede9fe; color:#5b21b6; }
+.tag.partner { background:#e0f2fe; color:#075985; }
 input, select, textarea { padding:7px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font-size:14px; }
 input:focus, select:focus, textarea:focus { outline:none; border-color:var(--blue); }
 input[type=checkbox], input[type=radio] { width:16px; height:16px; }

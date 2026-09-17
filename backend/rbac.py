@@ -13,6 +13,8 @@ import json
 # Grants:
 #   * a customer-bound group  -> read + create on that customer's tickets
 #     (which tickets are visible is scoped to the customer by the queries)
+#   * a partner-bound group   -> READ on every ticket of the customers that were
+#     assigned to that partner (nothing else: no create, no edit, no delete)
 #   * the internal group      -> read + edit on every ticket, NEVER delete
 # ---------------------------------------------------------------------------
 # Stable machine key kept as "internal" (it is referenced in the database by
@@ -20,8 +22,17 @@ import json
 INTERNAL_GROUP = "internal"
 INTERNAL_GROUP_LABEL = "内部用户组"
 
+# Group naming: "Customer-<customer name>" / "Partner-<partner name>".
+# Both a customer and a partner are "registered users" (已注册用户) in the UI.
+CUSTOMER_GROUP_PREFIX = "Customer-"
+PARTNER_GROUP_PREFIX = "Partner-"
+
 CUSTOMER_GROUP_PERMS = [
     "ticket.create", "ticket.view_own", "ticket.reply", "ticket.change_status",
+]
+# A partner sees the tickets of its customers, and nothing more.
+PARTNER_GROUP_PERMS = [
+    "ticket.view_own", "ticket.view_partner",
 ]
 INTERNAL_GROUP_PERMS = [
     "ticket.view_all", "ticket.create", "ticket.edit", "ticket.reply",
@@ -34,6 +45,7 @@ PERMISSIONS = [
     ("ticket.create", "Tickets"),
     ("ticket.view_all", "Tickets"),
     ("ticket.view_own", "Tickets"),
+    ("ticket.view_partner", "Tickets"),
     ("ticket.edit", "Tickets"),
     ("ticket.delete", "Tickets"),
     ("ticket.claim", "Tickets"),
@@ -58,6 +70,11 @@ PERMISSIONS = [
     ("customer.edit", "Customers"),
     ("customer.delete", "Customers"),
     ("customer.import_csv", "Customers"),
+    # partners (resellers)
+    ("partner.view", "Partners"),
+    ("partner.create", "Partners"),
+    ("partner.edit", "Partners"),
+    ("partner.delete", "Partners"),
     # admin
     ("user.manage", "Administration"),
     ("user.reset_totp", "Administration"),
@@ -88,6 +105,9 @@ MENU_ITEMS = [
     {"key": "customers", "label": "Customers",
      "read": ["customer.view"],
      "edit": ["customer.create", "customer.edit", "customer.delete", "customer.import_csv"]},
+    {"key": "partners", "label": "Partners",
+     "read": ["partner.view"],
+     "edit": ["partner.create", "partner.edit", "partner.delete"]},
     {"key": "users", "label": "Users",
      "read": ["user.manage"], "edit": ["user.manage", "user.reset_totp"]},
     {"key": "roles", "label": "Roles", "read": ["role.manage"], "edit": ["role.manage"]},
@@ -158,14 +178,15 @@ def seed(conn):
         "ticket.change_status", "ticket.delete", "ticket.export",
         "kb.view_public", "kb.view_registered", "kb.view_internal", "kb.create", "kb.edit", "kb.delete",
         "kb.import", "kb.export_pdf", "kb.share_email",
-        "customer.view",
+        "customer.view", "partner.view",
     ])
     role("客户", [
         "ticket.create", "ticket.view_own", "ticket.reply", "ticket.change_status",
         "kb.view_public", "kb.view_registered",
     ])
     role("代理商", [
-        "ticket.create", "ticket.view_own", "ticket.reply", "ticket.change_status",
+        # a partner reads the tickets of the customers assigned to it -- read only
+        "ticket.view_own", "ticket.view_partner",
         "kb.view_public", "kb.view_registered",
         "kb.export_pdf",
     ])
@@ -198,8 +219,12 @@ def internal_group_id(conn):
 
 
 def managed_group_ids(conn):
-    """Groups whose membership is owned by the e-mail-domain rule."""
-    ids = {r["id"] for r in conn.execute("SELECT id FROM user_groups WHERE customer_id IS NOT NULL")}
+    """Groups whose membership is owned by the e-mail-domain rule.
+
+    Every customer-bound and partner-bound group plus the internal one.
+    """
+    ids = {r["id"] for r in conn.execute(
+        "SELECT id FROM user_groups WHERE customer_id IS NOT NULL OR partner_id IS NOT NULL")}
     gi = internal_group_id(conn)
     if gi:
         ids.add(gi)
@@ -219,7 +244,7 @@ def domain_matches(domain, patterns):
 
 
 def auto_group_ids(conn, email):
-    """Group ids implied by an e-mail address (customer domains + internal)."""
+    """Group ids implied by an e-mail address (customer + partner domains + internal)."""
     gids = set()
     if not email or "@" not in email:
         return gids
@@ -232,30 +257,67 @@ def auto_group_ids(conn, email):
             g = conn.execute("SELECT id FROM user_groups WHERE customer_id=?", (c["id"],)).fetchone()
             if g:
                 gids.add(g["id"])
+    for p in conn.execute("SELECT id,domains FROM partners"):
+        ds = [d.strip().lower() for d in (p["domains"] or "").split(",") if d.strip()]
+        if domain_matches(domain, ds):
+            g = conn.execute("SELECT id FROM user_groups WHERE partner_id=?", (p["id"],)).fetchone()
+            if g:
+                gids.add(g["id"])
     gi = internal_group_id(conn)
     if gi and domain_matches(domain, _internal_domains(conn)):
         gids.add(gi)
     return gids
 
 
-def sync_email_groups(conn, uid, email, remove_stale=True, only=None):
+def known_domains(conn):
+    """Every domain the system knows about: customers + partners + internal.
+
+    Registration (self-service or added by an administrator) is only accepted
+    when the address belongs to one of them.
+    """
+    out = []
+    for table in ("customers", "partners"):
+        for r in conn.execute("SELECT domains FROM %s" % table):
+            out += [d.strip().lower() for d in (r["domains"] or "").split(",") if d.strip()]
+    out += _internal_domains(conn)
+    seen, uniq = set(), []
+    for d in out:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+
+
+def email_domain_allowed(conn, email):
+    """True when the address' domain is one of the known domains."""
+    if not email or "@" not in email:
+        return False
+    return domain_matches(email.split("@", 1)[1], known_domains(conn))
+
+
+def sync_email_groups(conn, uid, email, remove_stale=True, only=None, scope_ids=None):
     """Re-align domain-driven memberships.
 
-      * always joins the group of every customer whose domain the address matches,
-        plus the internal group when the domain is an internal domain
+      * always joins the group of every customer / partner whose domain the
+        address matches, plus the internal group for an internal domain
       * with remove_stale, also leaves any managed group that no longer matches
         (so changing to an unrelated address drops the old customer group)
       * `only="internal"` limits the whole pass to the internal group, which is
         what a change of internal domains should touch
+      * `scope_ids={...}` limits the whole pass to those groups, which is how a
+        single customer's / partner's domains can be re-evaluated without ever
+        touching an unrelated membership
 
     remove_stale is opt-in because "an administrator put this user in the group"
     and "the domain rule put this user in the group" are indistinguishable in the
-    table; only an e-mail change (or an internal-domain edit) may evict a member.
+    table; only an e-mail change (or a domain edit) may evict a member.
     """
     if uid is None:
         return set()
     want = auto_group_ids(conn, email)
-    if only == "internal":
+    if scope_ids is not None:
+        managed = set(scope_ids)
+    elif only == "internal":
         gi = internal_group_id(conn)
         managed = {gi} if gi else set()
     else:
@@ -294,9 +356,11 @@ def group_derived_perms(conn, uid):
         return perms
     marks = ",".join("?" * len(gids))
     for r in conn.execute(
-            "SELECT id,name,customer_id FROM user_groups WHERE id IN (%s)" % marks, list(gids)):
+            "SELECT id,name,customer_id,partner_id FROM user_groups WHERE id IN (%s)" % marks, list(gids)):
         if r["name"] == INTERNAL_GROUP:
             perms.update(INTERNAL_GROUP_PERMS)
+        elif r["partner_id"]:
+            perms.update(PARTNER_GROUP_PERMS)
         elif r["customer_id"]:
             perms.update(CUSTOMER_GROUP_PERMS)
     return perms
@@ -335,11 +399,84 @@ def customer_groups_for_user(conn, uid):
 
 
 def ensure_customer_group(conn, customer_id, customer_name):
-    """Create (or return) the built-in user group bound to a customer."""
-    g = conn.execute("SELECT id FROM user_groups WHERE customer_id=?", (customer_id,)).fetchone()
+    """Create (or return) the built-in user group bound to a customer.
+
+    The name is "Customer-<customer name>" and is kept in step with the customer
+    record, so renaming a customer also renames its group.
+    """
+    want = CUSTOMER_GROUP_PREFIX + (customer_name or "").strip()
+    g = conn.execute("SELECT id,name FROM user_groups WHERE customer_id=?", (customer_id,)).fetchone()
     if g:
+        if g["name"] != want:
+            _rename_group(conn, g["id"], want)
         return g["id"]
-    name = "客户组:" + customer_name
     cur = conn.execute(
-        "INSERT INTO user_groups(name,customer_id,builtin) VALUES(?,?,1)", (name, customer_id))
+        "INSERT INTO user_groups(name,customer_id,builtin) VALUES(?,?,1)", (want, customer_id))
     return cur.lastrowid
+
+
+def ensure_partner_group(conn, partner_id, partner_name):
+    """Create (or return) the built-in user group bound to a partner (代理商)."""
+    want = PARTNER_GROUP_PREFIX + (partner_name or "").strip()
+    g = conn.execute("SELECT id,name FROM user_groups WHERE partner_id=?", (partner_id,)).fetchone()
+    if g:
+        if g["name"] != want:
+            _rename_group(conn, g["id"], want)
+        return g["id"]
+    cur = conn.execute(
+        "INSERT INTO user_groups(name,partner_id,builtin) VALUES(?,?,1)", (want, partner_id))
+    return cur.lastrowid
+
+
+def _rename_group(conn, gid, new_name):
+    """Rename a group, keeping the UNIQUE constraint happy."""
+    if conn.execute("SELECT id FROM user_groups WHERE name=? AND id<>?", (new_name, gid)).fetchone():
+        return False
+    conn.execute("UPDATE user_groups SET name=? WHERE id=?", (new_name, gid))
+    return True
+
+
+def sync_builtin_group_names(conn):
+    """One-off, idempotent tidy-up: legacy "客户组:X" -> "Customer-X".
+
+    Driven by the customer rows rather than by string surgery, so it cannot
+    invent a group that no longer has a customer behind it.
+    """
+    changed = 0
+    for r in conn.execute("SELECT id,customer_id,name FROM user_groups WHERE customer_id IS NOT NULL"):
+        c = conn.execute("SELECT name FROM customers WHERE id=?", (r["customer_id"],)).fetchone()
+        if not c:
+            continue
+        want = CUSTOMER_GROUP_PREFIX + (c["name"] or "").strip()
+        if r["name"] != want and _rename_group(conn, r["id"], want):
+            changed += 1
+    for r in conn.execute("SELECT id,partner_id,name FROM user_groups WHERE partner_id IS NOT NULL"):
+        p = conn.execute("SELECT name FROM partners WHERE id=?", (r["partner_id"],)).fetchone()
+        if not p:
+            continue
+        want = PARTNER_GROUP_PREFIX + (p["name"] or "").strip()
+        if r["name"] != want and _rename_group(conn, r["id"], want):
+            changed += 1
+    return changed
+
+
+def partner_ids_for_user(conn, uid):
+    """Partner ids the user is attached to through partner-group membership."""
+    if uid is None:
+        return set()
+    out = set()
+    for gid in groups_for_user(conn, uid):
+        row = conn.execute("SELECT partner_id FROM user_groups WHERE id=?", (gid,)).fetchone()
+        if row and row["partner_id"]:
+            out.add(row["partner_id"])
+    return out
+
+
+def partner_customer_ids(conn, uid):
+    """Customer ids whose tickets a partner user is allowed to read."""
+    pids = partner_ids_for_user(conn, uid)
+    if not pids:
+        return set()
+    marks = ",".join("?" * len(pids))
+    return {r["id"] for r in
+            conn.execute("SELECT id FROM customers WHERE partner_id IN (%s)" % marks, list(pids))}

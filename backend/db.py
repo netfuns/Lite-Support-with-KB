@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS user_groups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE NOT NULL,
   customer_id INTEGER,
+  partner_id INTEGER,
   builtin INTEGER DEFAULT 0,
   description TEXT DEFAULT ''
 );
@@ -80,6 +81,20 @@ CREATE TABLE IF NOT EXISTS customers (
   service_start TEXT DEFAULT '',
   service_end TEXT DEFAULT '',
   contact_email TEXT DEFAULT '',
+  partner_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- A partner (代理商) is a reseller that may serve several customers. Its domains
+-- form part of the registration allow-list, and every partner owns a user group
+-- named "Partner-<name>" whose members may read the tickets of the customers
+-- that point at it.
+CREATE TABLE IF NOT EXISTS partners (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT UNIQUE NOT NULL,
+  domains TEXT DEFAULT '',
+  contact_email TEXT DEFAULT '',
+  description TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -214,6 +229,11 @@ def migrate():
     gc = _columns(conn, "user_groups")
     if "description" not in gc:
         conn.execute("ALTER TABLE user_groups ADD COLUMN description TEXT DEFAULT ''")
+    if "partner_id" not in gc:
+        conn.execute("ALTER TABLE user_groups ADD COLUMN partner_id INTEGER")
+    cc = _columns(conn, "customers")
+    if "partner_id" not in cc:
+        conn.execute("ALTER TABLE customers ADD COLUMN partner_id INTEGER")
     conn.commit()
     conn.close()
 

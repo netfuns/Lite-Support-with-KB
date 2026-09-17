@@ -20,6 +20,14 @@ async function loadBrand() {
 }
 
 // ----------------------------------------------------------------- api
+/** Headers for a raw fetch: the X-Token header only when we hold a token (after a
+ *  refresh the HttpOnly cookie authenticates instead -- sending "null" would break it). */
+function authHeaders(extra) {
+  const out = Object.assign({}, extra || {});
+  if (state.token) out["X-Token"] = state.token;
+  return out;
+}
+
 async function api(path, opts = {}) {
   opts.headers = { "Content-Type": "application/json" };
   if (state.token) opts.headers["X-Token"] = state.token;
@@ -346,7 +354,8 @@ function sidebar() {
   items.push(navLink("#/tickets", t("tickets")));
   if (hasPerm("ticket.create")) items.push(navLink("#/new-ticket", "+" + t("new_ticket")));
   items.push(navLink("#/kb", t("kb")));
-  if (hasPerm("customer.view")) items.push(navLink("#/customers", t("customers")));
+  if (hasPerm("customer.view")) items.push(navLink("#/customers", t("tab_customers")));
+  if (hasPerm("partner.view")) items.push(navLink("#/partners", t("partners")));
   if (hasPerm("user.manage") || hasPerm("role.manage") || hasPerm("group.manage") || hasPerm("settings.mail")) {
     items.push(h("div", { class: "sep-label" }, t("admin")));
     if (hasPerm("user.manage")) items.push(navLink("#/admin/users", t("users")));
@@ -395,6 +404,7 @@ async function render() {
     else if (arg) view = kbDetail(arg);
     else view = kbView();
   } else if (route === "customers") view = customersView();
+  else if (route === "partners") view = partnersView();
   else if (route === "login") view = loginView();
   else if (route === "register") view = registerView();
   else if (route === "me") view = meView();
@@ -480,7 +490,8 @@ function registerView() {
           body: JSON.stringify({ email: email.value, display_name: name.value, password: pw.value }) });
         const d = await r.json();
         if (r.ok) { toast("OK"); window.location.hash = "#/login"; }
-        else toast((d && d.detail) || d.error || "failed", false);
+        // t() falls back to the key itself, so an unmapped server error still shows something
+        else toast(t((d && (d.error || d.detail)) || "failed"), false);
       } }, t("register")))),
   );
   return { title: "", body };
@@ -980,18 +991,37 @@ async function kbDetail(id) {
   return { title: "", body };
 }
 
-function openCustomerEditor(cust, onDone) {
+/** Create / edit a customer. A partner (代理商) may be assigned, or left unset. */
+async function openCustomerEditor(cust, onDone) {
   const isNew = !cust;
   // an <input type="date"> silently blanks any value that is not YYYY-MM-DD
   const dv = v => (/^\d{4}-\d{2}-\d{2}/.test(v || "") ? String(v).slice(0, 10) : "");
   const f = (key, type) => h("input", {
     value: cust ? (type === "date" ? dv(cust[key]) : (cust[key] || "")) : "",
-    type: type || "text", placeholder: t(key), style: "width:100%" });
+    type: type || "text", placeholder: t(key) });
   const name = f("name"), domains = f("domains"), version = f("version");
   const start = f("service_start", "date"), end = f("service_end", "date"), contact = f("contact_email", "email");
+
+  // partner picker -- optional, "— none —" means the customer has no partner
+  let partnerSel = null;
+  if (hasPerm("partner.view")) {
+    partnerSel = h("select", {}, h("option", { value: "" }, t("no_partner")));
+    try {
+      const r = await api("/api/partners");
+      for (const p of (r.items || [])) {
+        partnerSel.append(h("option", { value: String(p.id) }, p.name + (p.domains ? "  <" + p.domains + ">" : "")));
+      }
+    } catch (e) { /* no partner permission / backend down: keep the empty list */ }
+    partnerSel.value = cust && cust.partner_id ? String(cust.partner_id) : "";
+  }
+
   const body = h("div", { class: "page" },
     h("label", { class: "field" }, h("span", { class: "muted" }, t("name")), name),
     h("label", { class: "field" }, h("span", { class: "muted" }, t("domains")), domains),
+    partnerSel ? h("div", { class: "grid-2" },
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("linked_partner")), partnerSel),
+      h("div", { class: "field" }, h("span", { class: "muted" }, "\u00a0"),
+        h("p", { class: "muted", style: "font-size:12px;margin:0" }, t("partner_hint")))) : null,
     h("div", { class: "grid-3" },
       h("label", { class: "field" }, h("span", { class: "muted" }, t("version")), version),
       h("label", { class: "field" }, h("span", { class: "muted" }, t("service_start")), start),
@@ -1007,6 +1037,7 @@ function openCustomerEditor(cust, onDone) {
         if (isNew && !domains.value.trim()) { toast(t("name") + " / " + t("domains") + " *", false); return; }
         const payload = { name: name.value, domains: domains.value, version: version.value,
                           service_start: start.value, service_end: end.value, contact_email: contact.value };
+        if (partnerSel) payload.partner_id = partnerSel.value ? Number(partnerSel.value) : null;
         try {
           if (isNew) await api("/api/customers", { method: "POST", body: JSON.stringify(payload) });
           else await api("/api/customers/" + cust.id, { method: "PUT", body: JSON.stringify(payload) });
@@ -1039,7 +1070,7 @@ async function customersView() {
   function renderRows() {
     tbody.innerHTML = "";
     if (!rows.length) {
-      tbody.append(h("tr", {}, h("td", { colspan: 7, class: "muted" }, t("no_results"))));
+      tbody.append(h("tr", {}, h("td", { colspan: 9, class: "muted" }, t("no_results"))));
       return;
     }
     for (const c of rows) {
@@ -1050,7 +1081,11 @@ async function customersView() {
       tbody.append(h("tr", {},
         h("td", {}, cb),
         h("td", {}, h("a", { href: "javascript:void(0)", onclick: () => openCustomerEditor(c, doLoad) }, c.name)),
-        h("td", {}, c.domains), h("td", {}, c.version || "-"),
+        h("td", {}, c.domains),
+        h("td", {}, c.partner_name
+          ? h("span", { class: "tag partner" }, c.partner_name)
+          : h("span", { class: "muted" }, "\u2014")),
+        h("td", {}, c.version || "-"),
         h("td", {}, c.service_start || "-"), h("td", {}, c.service_end || "-"),
         h("td", {}, c.contact_email || "-"),
         h("td", {}, h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
@@ -1088,6 +1123,8 @@ async function customersView() {
   } });
 
   const body = h("div", {},
+    h("h1", {}, t("registered_users")),
+    registeredTabs("customers"),
     h("div", { class: "toolbar" },
       h("div", { class: "toolbar-left" }, qWrap),
       h("div", { class: "toolbar-right" },
@@ -1099,10 +1136,154 @@ async function customersView() {
       h("table", {},
         h("thead", {}, h("tr", {},
           h("th", { style: "width:36px" }, selectAll),
-          [t("name"), t("domains"), t("version"), t("service_start"), t("service_end"), t("contact_email"), t("actions")].map(c => h("th", {}, c)))),
+          [t("name"), t("domains"), t("linked_partner"), t("version"), t("service_start"), t("service_end"), t("contact_email"), t("actions")].map(c => h("th", {}, c)))),
         tbody))));
   doLoad();
   return { title: "", body };
+}
+
+/** Customers and partners are both "registered users" -- the tabs switch between them. */
+function registeredTabs(active) {
+  if (!hasPerm("partner.view") && !hasPerm("customer.view")) return null;
+  const tabs = [];
+  if (hasPerm("customer.view")) tabs.push(["customers", "tab_customers"]);
+  if (hasPerm("partner.view")) tabs.push(["partners", "tab_partners"]);
+  return h("div", { class: "tabs" }, tabs.map(([key, label]) =>
+    // a plain "tab" + " active" concatenation would yield the class "tabnull"
+    h("a", { href: "#/" + key, class: active === key ? "tab active" : "tab" }, t(label))));
+}
+
+/** Partners (代理商): create / edit by clicking the name, search, single + bulk delete. */
+async function partnersView() {
+  if (!hasPerm("partner.view")) return noAccess();
+  const tbody = h("tbody", {});
+  const selected = new Set();
+  let rows = [];
+
+  const q = h("input", { placeholder: t("search_partner") });
+  const qWrap = attachSuggest(q, async val => {
+    const r = await api("/api/partners?q=" + encodeURIComponent(val));
+    return (r.items || []).map(p => ({ ...p, label: p.name + (p.domains ? "  <" + p.domains + ">" : "") }));
+  }, p => { q.value = p.name; doLoad(); });
+
+  const selectAll = h("input", { type: "checkbox", onchange: e => {
+    const on = e.target.checked;
+    selected.clear();
+    if (on) rows.forEach(p => selected.add(p.id));
+    renderRows();
+  } });
+
+  function renderRows() {
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      tbody.append(h("tr", {}, h("td", { colspan: 7, class: "muted" }, t("no_results"))));
+      return;
+    }
+    for (const p of rows) {
+      const cb = h("input", { type: "checkbox", checked: selected.has(p.id) ? "checked" : null, onchange: e => {
+        if (e.target.checked) selected.add(p.id); else selected.delete(p.id);
+        selectAll.checked = rows.length > 0 && rows.every(x => selected.has(x.id));
+      } });
+      tbody.append(h("tr", {},
+        h("td", {}, cb),
+        h("td", {}, h("a", { href: "javascript:void(0)", onclick: () => openPartnerEditor(p, doLoad) }, p.name),
+          p.description ? h("div", { class: "muted", style: "font-size:12px" }, p.description) : null),
+        h("td", {}, p.domains || "-"),
+        h("td", {}, String(p.customer_count || 0),
+          (p.customers || []).length
+            ? h("div", { class: "muted", style: "font-size:12px" }, p.customers.join(", ")) : null),
+        h("td", {}, String(p.member_count || 0)),
+        h("td", {}, p.contact_email || "-"),
+        h("td", {}, h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
+          if (!confirm(t("confirm_delete") + " " + p.name)) return;
+          try {
+            const r = await api("/api/partners/" + p.id, { method: "DELETE" });
+            toast(r.unlinked ? t("saved") + " · " + r.unlinked + " " + t("partner_delete_unlink") : t("saved"));
+            doLoad();
+          } catch (e) { toast(e.message, false); }
+        } }, t("delete")))));
+    }
+  }
+
+  async function doLoad() {
+    try {
+      const r = await api("/api/partners?q=" + encodeURIComponent((q.value || "").trim()));
+      rows = r.items || [];
+    } catch (e) { rows = []; toast(e.message, false); }
+    selected.clear(); selectAll.checked = false;
+    renderRows();
+  }
+
+  async function bulkDelete() {
+    const ids = Array.from(selected);
+    if (!ids.length) { toast(t("select_first"), false); return; }
+    if (!confirm(t("confirm_delete") + " (" + ids.length + ")")) return;
+    try {
+      const r = await api("/api/partners/bulk", { method: "POST", body: JSON.stringify({ ids }) });
+      toast(r.unlinked ? t("saved") + " · " + r.unlinked + " " + t("partner_delete_unlink") : t("saved"));
+      doLoad();
+    } catch (e) { toast(e.message, false); }
+  }
+
+  const body = h("div", {},
+    h("h1", {}, t("registered_users")),
+    registeredTabs("partners"),
+    h("div", { class: "toolbar" },
+      h("div", { class: "toolbar-left" }, qWrap),
+      h("div", { class: "toolbar-right" },
+        hasPerm("partner.create") ? h("button", { class: "btn btn-blue btn-sm", onclick: () => openPartnerEditor(null, doLoad) }, "+" + t("add_partner")) : null,
+        hasPerm("partner.delete") ? h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: bulkDelete }, t("delete")) : null)),
+    h("p", { class: "muted" }, t("partner_hint")),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("table", {},
+        h("thead", {}, h("tr", {},
+          h("th", { style: "width:36px" }, selectAll),
+          [t("partner_name"), t("domains"), t("partner_customers"), t("members"), t("contact_email"), t("actions")]
+            .map(x => h("th", {}, x)))),
+        tbody))));
+  doLoad();
+  return { title: "", body };
+}
+
+/** Create / edit one partner. Name + domains are mandatory, exactly like a customer. */
+function openPartnerEditor(p, onDone) {
+  const isNew = !p;
+  const name = h("input", { value: p ? (p.name || "") : "", placeholder: t("partner_name") });
+  const domains = h("input", { value: p ? (p.domains || "") : "", placeholder: t("domains") });
+  const contact = h("input", { type: "email", value: p ? (p.contact_email || "") : "", placeholder: t("contact_email") });
+  const desc = h("input", { value: p ? (p.description || "") : "", placeholder: t("group_desc") });
+
+  const body = h("div", { class: "page" },
+    h("div", { class: "grid-2" },
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("partner_name")), name),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("domains")), domains)),
+    h("div", { class: "grid-2" },
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("contact_email")), contact),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("group_desc")), desc)),
+    h("p", { class: "muted", style: "font-size:13px" }, t("partner_hint")),
+    p ? h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("partner_customers") + " (" + (p.customer_count || 0) + ")"),
+      (p.customers || []).length
+        ? h("p", { class: "muted" }, p.customers.join(", "))
+        : h("p", { class: "muted" }, t("no_results")),
+      h("p", { class: "muted", style: "font-size:13px" }, t("auto_by_partner")))) : null,
+    h("div", { class: "flex-between mt-2" },
+      h("button", { class: "btn btn-blue", onclick: async () => {
+        if (!name.value.trim()) { toast(t("name") + " *", false); return; }
+        if (!domains.value.trim()) { toast(t("name") + " / " + t("domains") + " *", false); return; }
+        const payload = { name: name.value.trim(), domains: domains.value.trim(),
+                          contact_email: contact.value, description: desc.value };
+        try {
+          if (isNew) await api("/api/partners", { method: "POST", body: JSON.stringify(payload) });
+          else await api("/api/partners/" + p.id, { method: "PUT", body: JSON.stringify(payload) });
+          toast(t("saved")); closeModal(); onDone && onDone();
+        } catch (e) {
+          toast(e.message === "partner_name_taken" ? t("partner_name_taken") : e.message, false);
+        }
+      } }, t("save")),
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+
+  showModal(isNew ? t("add_partner") : t("edit_partner"), body);
 }
 
 function meView() {
@@ -1111,19 +1292,19 @@ function meView() {
   const pw2 = h("input", { type: "password", placeholder: t("password") + " (new)" });
   const savePw = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
     if (!pw1.value || !pw2.value) { toast("enter passwords", false); return; }
-    const r = await fetch("/api/me/password", { method: "POST", headers: { "Content-Type": "application/json", "X-Token": state.token }, body: JSON.stringify({ old: pw1.value, new: pw2.value }) });
+    const r = await fetch("/api/me/password", { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ old: pw1.value, new: pw2.value }) });
     toast(r.ok ? "Password changed" : "failed", r.ok);
     pw1.value = ""; pw2.value = "";
   } }, t("save"));
   let totp = null;
   const totpEnableBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-    const r = await fetch("/api/me/totp/enable", { method: "POST", headers: { "X-Token": state.token } });
+    const r = await fetch("/api/me/totp/enable", { method: "POST", headers: authHeaders() });
     const d = await r.json();
     totp.textContent = "Secret: " + d.secret + "\nURI: " + d.uri + "\n\nScan with your TOTP app, then save.";
     totp.classList.remove("hidden");
   } }, "Enable TOTP");
   const totpDisableBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-    await fetch("/api/me/totp/disable", { method: "POST", headers: { "X-Token": state.token } });
+    await fetch("/api/me/totp/disable", { method: "POST", headers: authHeaders() });
     toast("OK"); render();
   } }, "Disable TOTP");
   totp = h("pre", { class: "muted hidden" }, "");
@@ -1140,7 +1321,7 @@ function meView() {
           h("div", { class: "muted", style: "margin-top:6px" }, "Permissions: " + perms))),
       h("label", { class: "field" }, h("span", { class: "muted" }, t("display_name")), name),
       h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-        await fetch("/api/me/name", { method: "POST", headers: { "Content-Type": "application/json", "X-Token": state.token }, body: JSON.stringify({ display_name: name.value }) });
+        await fetch("/api/me/name", { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ display_name: name.value }) });
         state.user.display_name = name.value; toast("OK");
       } }, t("save")),
       h("div", { class: "inline-field", style: "margin-top:12px" },
@@ -1339,7 +1520,8 @@ async function adminUsers() {
     const fd = new FormData(); fd.append("file", f);
     try {
       const r = await apiForm("/api/admin/users/import", fd);
-      toast(t("imported") + ": " + r.created + " / " + r.updated);
+      toast(t("imported") + ": " + r.created + " / " + r.updated
+        + ((r.skipped || []).length ? " · " + t("import_skipped") + ": " + (r.skipped || []).join(", ") : ""), !(r.skipped || []).length);
       doLoad();
     } catch (err) { toast(err.message, false); }
     e.target.value = "";
@@ -1467,16 +1649,19 @@ function openRoleEditor(role, menu) {
 
 /** Type chip for a user group. */
 function groupKindTag(g) {
-  const kind = g.kind || (g.customer_id ? "customer" : "manual");
-  const cls = kind === "internal" ? "internal" : kind === "customer" ? "registered" : "usergroup";
+  const kind = g.kind || (g.partner_id ? "partner" : g.customer_id ? "customer" : "manual");
+  const cls = kind === "internal" ? "internal" : kind === "customer" ? "registered"
+            : kind === "partner" ? "partner" : "usergroup";
   const label = kind === "internal" ? t("kind_internal")
-              : kind === "customer" ? t("kind_customer") : t("kind_manual");
+              : kind === "customer" ? t("kind_customer")
+              : kind === "partner" ? t("kind_partner") : t("kind_manual");
   return h("span", { class: "tag " + cls }, label);
 }
 
-/** A group is system-owned when it is bound to a customer or is the internal group. */
+/** A group is system-owned when it is bound to a customer / partner or is the internal group. */
 function isBuiltinGroup(g) {
-  return !!(g && (g.builtin || g.customer_id || g.kind === "internal"));
+  return !!(g && (g.builtin || g.customer_id || g.partner_id || g.kind === "internal"
+                  || g.kind === "customer" || g.kind === "partner"));
 }
 
 /** User groups: every group is listed, click a name to open the editor. */
@@ -1493,7 +1678,7 @@ async function adminGroups() {
           g.display_name || g.name),
         g.description ? h("div", { class: "muted", style: "font-size:12px" }, g.description) : null),
       h("td", {}, groupKindTag(g)),
-      h("td", { class: "muted" }, g.kind === "customer" ? (g.domains || "-")
+      h("td", { class: "muted" }, g.kind === "customer" || g.kind === "partner" ? (g.domains || "-")
                           : g.kind === "internal" ? t("auto_members") : "\u2014"),
       h("td", {}, String(g.member_count)),
       h("td", { class: "muted", style: "font-size:12px" },
@@ -1578,8 +1763,11 @@ function openGroupEditor(g, onDone) {
       h("h3", {}, t("auto_members")),
       h("p", { class: "muted" },
         g.kind === "internal" ? t("auto_by_internal")
-        : g.kind === "customer" ? t("auto_by_customer") : t("auto_manual_hint")),
-      g.kind === "customer" ? h("p", { class: "muted" }, t("linked_customer") + ": " + (g.customer_name || "-")
+        : g.kind === "customer" ? t("auto_by_customer")
+        : g.kind === "partner" ? t("auto_by_partner") : t("auto_manual_hint")),
+      (g.kind === "customer" || g.kind === "partner") ? h("p", { class: "muted" },
+        t(g.kind === "partner" ? "linked_partner" : "linked_customer") + ": "
+        + (g.partner_name || g.customer_name || "-")
         + " · " + t("linked_domains") + ": " + (g.domains || "-")) : null,
       h("h3", { style: "margin-top:12px" }, t("grants")),
       h("p", { class: "muted" }, (g.grants || []).length ? g.grants.join(", ") : t("no_grants")))) : null,
@@ -1718,7 +1906,8 @@ function settingsTabs(active) {
   ];
   return h("div", { class: "tabs" },
     tabs.map(([key, label]) => h("a", {
-      href: "#/admin/" + key, class: "tab" + (active === key ? " active" : null) }, t(label))));
+      // inactive tabs used to get class "tabnull" and render as bare links
+      href: "#/admin/" + key, class: active === key ? "tab active" : "tab" }, t(label))));
 }
 
 async function loadSiteSettings() {
@@ -1818,6 +2007,9 @@ async function adminDomains() {
   };
   paint();
 
+  // Registration policy + the domain allow-list it is built from.
+  const known = (s.known_domains || []);
+  const knownBox = h("input", { type: "checkbox", checked: s.require_known_domain ? "checked" : null });
   const body = h("div", { class: "page-narrow" },
     settingsTabs("domains"),
     h("h1", {}, t("bind_domains")),
@@ -1834,10 +2026,17 @@ async function adminDomains() {
         } }, "+" + t("add"))),
       h("button", { class: "btn btn-blue", style: "margin-top:12px", onclick: async () => {
         try {
-          await api("/api/admin/site", { method: "POST", body: JSON.stringify({ allowed_hosts: hosts }) });
+          await api("/api/admin/site", { method: "POST", body: JSON.stringify({
+            allowed_hosts: hosts, require_known_domain: knownBox.checked }) });
           toast(t("saved"));
         } catch (e) { toast(e.message, false); }
-      } }, t("save")))));
+      } }, t("save")))),
+    h("div", { class: "card", style: "margin-top:14px" }, h("div", { class: "card-body" },
+      h("div", { class: "inline-field" }, knownBox,
+        h("b", {}, t("require_known_domain"))),
+      h("p", { class: "muted" }, t("require_known_domain_hint")),
+      h("h3", { style: "margin-top:12px" }, t("known_domains") + " (" + known.length + ")"),
+      h("p", { class: "muted" }, known.length ? known.join(", ") : t("no_known_domains")))));
   return { title: "", body };
 }
 
@@ -1933,19 +2132,20 @@ state.lang = localStorage.getItem("rz_lang") || "en";
 document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh" ? "zh-CN" : "zh-TW");
 (async function boot() {
   await loadBrand();
-  const tk = document.cookie.split(";").map(x => x.trim()).find(x => x.startsWith("rz_token="));
-  if (tk) {
-    state.token = tk.split("=")[1];
-    try {
-      state.user = await api("/api/me");
-      state.me_perms = new Set(state.user.permissions);
-      state.meta = await api("/api/meta");
-      state.products = state.meta.products;
-      state.modules = state.meta.modules || [];
-      state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
-      applyTheme(state.meta.theme);
-      startIdleWatchdog();
-    } catch (e) { state.user = null; state.token = null; }
+  // The session cookie is HttpOnly, so document.cookie can never see it -- ask the
+  // server instead. A same-origin fetch sends the cookie, so a page refresh keeps
+  // the session, and a 401 puts us cleanly back on the login screen.
+  try {
+    state.user = await api("/api/me");
+    state.me_perms = new Set(state.user.permissions);
+    state.meta = await api("/api/meta");
+    state.products = state.meta.products;
+    state.modules = state.meta.modules || [];
+    state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
+    applyTheme(state.meta.theme);
+    startIdleWatchdog();
+  } catch (e) {
+    state.user = null; state.token = null; state.me_perms = new Set();
   }
   render();
 })();

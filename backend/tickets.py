@@ -29,6 +29,18 @@ def match_customer(conn, email):
     return None
 
 
+def match_partner(conn, email):
+    """The partner (代理商) whose domain list covers this address, if any."""
+    if not email or "@" not in email:
+        return None
+    domain = email.split("@", 1)[1].lower()
+    for p in conn.execute("SELECT * FROM partners"):
+        ds = [d.strip().lower() for d in (p["domains"] or "").split(",") if d.strip()]
+        if domain in ds or any(domain.endswith("." + d) for d in ds):
+            return p
+    return None
+
+
 def find_or_create_user(conn, email, display_name=""):
     email = (email or "").strip().lower()
     row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
@@ -37,8 +49,9 @@ def find_or_create_user(conn, email, display_name=""):
     name = display_name or email.split("@", 1)[0]
     cur = conn.execute("INSERT INTO users(email,display_name) VALUES(?,?)", (email, name))
     uid = cur.lastrowid
-    # e-mail-domain rule: join the matching customer group (+ the internal group
-    # when the domain is internal). Add-only — nothing to evict on a fresh user.
+    # e-mail-domain rule: join the matching customer / partner group (+ the
+    # internal group when the domain is internal). Add-only — nothing to evict on
+    # a fresh user.
     rbac.sync_email_groups(conn, uid, email, remove_stale=False)
     # default role customer
     role = conn.execute("SELECT id FROM roles WHERE name='客户'").fetchone()

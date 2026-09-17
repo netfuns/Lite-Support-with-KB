@@ -79,9 +79,11 @@ def _seed():
     # default groups ("内部用户组" = staff: reads + edits every ticket, never deletes)
     for g in ("管理员", "售后人员"):
         conn.execute("INSERT OR IGNORE INTO user_groups(name,builtin) VALUES(?,1)", (g,))
-    # one-off, idempotent tidy-up of the customer-group names from the first
-    # release ("客户:X" -> "客户组:X"; the pattern cannot re-match afterwards)
-    conn.execute("UPDATE user_groups SET name='客户组:'||substr(name,4) WHERE name LIKE '客户:%'")
+    # one-off, idempotent tidy-up of the auto-created group names: the customer
+    # groups go from "客户组:X" / "客户:X" to "Customer-X", partner groups are
+    # "Partner-X". Driven by the customer/partner rows, so it cannot invent a
+    # group with nothing behind it.
+    rbac.sync_builtin_group_names(conn)
     rbac.ensure_internal_group(conn)
     conn.commit()
     # site settings
@@ -95,6 +97,9 @@ def _seed():
     _seed_setting(conn, "welcome_md", DEFAULT_WELCOME)
     _seed_setting(conn, "allowed_hosts", "[]")
     _seed_setting(conn, "mail_provider", "smtp")
+    # Registration policy: an address is only accepted when its domain belongs to
+    # a customer, a partner or the internal domains (see rbac.known_domains).
+    _seed_setting(conn, "require_known_domain", "1")
     # default collections
     for name, vis in (("公开知识", "public"), ("注册用户", "registered"), ("内部管理", "internal")):
         if not conn.execute("SELECT id FROM kb_collections WHERE name=?", (name,)).fetchone():
@@ -230,6 +235,41 @@ def site_theme():
     v = get_setting(c, "theme", "light")
     c.close()
     return v or "light"
+
+
+def site_require_known_domain():
+    """True = only addresses on a known customer/partner/internal domain may register."""
+    c = conn_()
+    v = get_setting(c, "require_known_domain", "1")
+    c.close()
+    return str(v) != "0"
+
+
+def _registration_allowed(conn, email):
+    """Registration policy gate. Returns None when allowed, else an error key."""
+    if not site_require_known_domain():
+        return None
+    if rbac.email_domain_allowed(conn, email):
+        return None
+    return "domain_not_allowed"
+
+
+def _resync_all_domain_groups(evict_ids=None):
+    """Re-align every user's domain-driven group membership.
+
+    Add-only by default; `evict_ids` names the groups that may also lose members
+    (used when a customer's or a partner's domains change). Scoping the eviction
+    keeps an unrelated membership — e.g. the administrator's manual internal-group
+    seat — from being cleared by a routine domain edit.
+    """
+    c = conn_()
+    for r in c.execute("SELECT id,email FROM users"):
+        rbac.sync_email_groups(c, r["id"], r["email"], remove_stale=False)
+    if evict_ids:
+        for r in c.execute("SELECT id,email FROM users"):
+            rbac.sync_email_groups(c, r["id"], r["email"], remove_stale=True, scope_ids=set(evict_ids))
+    c.commit()
+    c.close()
 
 
 def _sync_internal_group(c, uid, email, remove_stale=False):
@@ -368,7 +408,10 @@ async def logout(request: Request):
     c.execute("DELETE FROM tokens WHERE token=?", (token or "",))
     c.commit()
     c.close()
-    return ok(ok=True)
+    # the cookie is HttpOnly, so only the server can clear it
+    resp = ok(ok=True)
+    resp.delete_cookie("rz_token", path="/")
+    return resp
 
 
 def _me_payload(u):
@@ -460,7 +503,8 @@ async def my_totp_disable(request: Request):
     return ok(ok=True)
 
 
-# self registration (allowed if email domain is a customer's authorized domain)
+# self registration — the address must belong to a known domain (customer,
+# partner or internal); membership of the matching groups is derived from it.
 @app.post("/api/auth/register")
 async def register(request: Request):
     body = await request.json()
@@ -469,20 +513,28 @@ async def register(request: Request):
     if "@" not in email or len(pw) < 6:
         fail(400, "invalid_input")
     c = conn_()
-    cust = T.match_customer(c, email)
-    if not cust:
+    err = _registration_allowed(c, email)
+    if err:
         c.close()
-        return JSONResponse({"error": "domain_not_authorized"}, 403)
+        return JSONResponse({"error": err}, 403)
     if c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone():
         c.close()
         return JSONResponse({"error": "email_exists"}, 409)
     cur = c.execute("INSERT INTO users(email,display_name,password_hash) VALUES(?,?,?)",
                     (email, (body.get("display_name") or email.split("@")[0]), auth.hash_password(pw)))
     uid = cur.lastrowid
-    gid = rbac.ensure_customer_group(c, cust["id"], cust["name"])
-    c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
-    role = c.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
-    c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
+    cust = T.match_customer(c, email)
+    partner = T.match_partner(c, email)
+    if cust:
+        gid = rbac.ensure_customer_group(c, cust["id"], cust["name"])
+        c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+    if partner:
+        gid = rbac.ensure_partner_group(c, partner["id"], partner["name"])
+        c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+    role_name = "代理商" if (partner and not cust) else "客户"
+    role = c.execute("SELECT id FROM roles WHERE name=?", (role_name,)).fetchone()
+    if role:
+        c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
     _sync_internal_group(c, uid, email)
     c.commit()
     c.close()
@@ -516,6 +568,28 @@ def my_perm_set(u):
 
 
 # =============================== CUSTOMERS ===============================
+def _customer_row(c, r):
+    """A customer row plus the partner it was assigned to (may be None)."""
+    d = dict(r)
+    d["partner_name"] = ""
+    if d.get("partner_id"):
+        p = c.execute("SELECT name FROM partners WHERE id=?", (d["partner_id"],)).fetchone()
+        d["partner_name"] = p["name"] if p else ""
+    return d
+
+
+def _clean_partner_id(c, raw):
+    """Only an existing partner id is accepted; anything else means "no partner"."""
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if not pid:
+        return None
+    row = c.execute("SELECT id FROM partners WHERE id=?", (pid,)).fetchone()
+    return row["id"] if row else None
+
+
 @app.get("/api/customers")
 def customers_list(request: Request, q: str = ""):
     require(request)
@@ -525,8 +599,9 @@ def customers_list(request: Request, q: str = ""):
         rows = c.execute("SELECT * FROM customers WHERE name LIKE ? OR domains LIKE ? ORDER BY name", (like, like)).fetchall()
     else:
         rows = c.execute("SELECT * FROM customers ORDER BY name").fetchall()
+    out = [_customer_row(c, r) for r in rows]
     c.close()
-    return ok(items=[dict(r) for r in rows])
+    return ok(items=out)
 
 
 @app.post("/api/customers")
@@ -538,40 +613,93 @@ async def customer_create(request: Request):
     if not name or not domains:
         fail(400, "name_and_domain_required")
     c = conn_()
+    pid = _clean_partner_id(c, b.get("partner_id"))
     exists = c.execute("SELECT id FROM customers WHERE lower(name)=?", (name.lower(),)).fetchone()
     if exists:
         cid = exists["id"]
-        c.execute("UPDATE customers SET domains=?, version=?, service_start=?, service_end=?, contact_email=? WHERE id=?",
-                  (domains, b.get("version", ""), b.get("service_start", ""), b.get("service_end", ""),
-                   b.get("contact_email", ""), cid))
+        # upsert onto an existing name: same merge rule as the PUT, so an omitted
+        # key keeps its stored value instead of being blanked
+        cols, args = ["domains=?"], [domains]
+        for k in ("version", "service_start", "service_end", "contact_email"):
+            if k in b:
+                cols.append(k + "=?"); args.append(b.get(k) or "")
+        if "partner_id" in b:
+            cols.append("partner_id=?"); args.append(pid)
+        args.append(cid)
+        c.execute("UPDATE customers SET %s WHERE id=?" % ",".join(cols), args)
     else:
-        cur = c.execute("INSERT INTO customers(name,domains,version,service_start,service_end,contact_email) VALUES(?,?,?,?,?,?)",
-                        (name, domains, b.get("version", ""), b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", "")))
+        cur = c.execute("INSERT INTO customers(name,domains,version,service_start,service_end,contact_email,partner_id) VALUES(?,?,?,?,?,?,?)",
+                        (name, domains, b.get("version", ""), b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", ""), pid))
         cid = cur.lastrowid
     rbac.ensure_customer_group(c, cid, name)
     c.commit()
     c.close()
+    # a new/edited customer domain changes who may register and who belongs to which group
+    _resync_all_domain_groups(evict_ids=[g for g in [_group_id_for_customer(cid)] if g])
     return ok(id=cid)
 
 
 @app.put("/api/customers/{cid}")
 async def customer_update(cid: int, request: Request):
+    """Partial update: only the keys present in the body are written.
+
+    A PUT that carries just `partner_id` (the picker in the customer editor, or
+    an API client assigning a reseller) must never blank the other columns.
+    """
     require_perm(request, "customer.edit")
     b = await request.json()
     c = conn_()
-    c.execute("UPDATE customers SET name=?, domains=?, version=?, service_start=?, service_end=?, contact_email=? WHERE id=?",
-              (b.get("name", ""), (b.get("domains") or "").lower(), b.get("version", ""),
-               b.get("service_start", ""), b.get("service_end", ""), b.get("contact_email", ""), cid))
+    row = c.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
+    if not row:
+        c.close()
+        fail(404, "not_found")
+    cols, args = [], []
+    if "name" in b:
+        cols.append("name=?"); args.append((b.get("name") or "").strip())
+    if "domains" in b:
+        cols.append("domains=?"); args.append((b.get("domains") or "").strip().lower())
+    for k in ("version", "service_start", "service_end", "contact_email"):
+        if k in b:
+            cols.append(k + "=?"); args.append(b.get(k) or "")
+    # partner_id is only touched when it was actually sent, so a client that does
+    # not offer the picker cannot silently unassign the customer's partner.
+    if "partner_id" in b:
+        cols.append("partner_id=?"); args.append(_clean_partner_id(c, b.get("partner_id")))
+    if cols:
+        args.append(cid)
+        c.execute("UPDATE customers SET %s WHERE id=?" % ",".join(cols), args)
+    newname = (b.get("name") or row["name"]) if "name" in b else row["name"]
+    if newname:
+        rbac.ensure_customer_group(c, cid, newname)
     c.commit()
     c.close()
+    _resync_all_domain_groups(evict_ids=[g for g in [_group_id_for_customer(cid)] if g])
     return ok(ok=True)
+
+
+def _group_id_for_customer(cid):
+    c = conn_()
+    row = c.execute("SELECT id FROM user_groups WHERE customer_id=?", (cid,)).fetchone()
+    c.close()
+    return row["id"] if row else None
+
+
+def _drop_customer(c, cid):
+    """Delete a customer and the group that was auto-created for it."""
+    g = c.execute("SELECT id FROM user_groups WHERE customer_id=?", (cid,)).fetchone()
+    if g:
+        c.execute("DELETE FROM user_groups_rel WHERE group_id=?", (g["id"],))
+        c.execute("DELETE FROM kb_collections_groups WHERE group_id=?", (g["id"],))
+        c.execute("DELETE FROM kb_article_groups WHERE group_id=?", (g["id"],))
+        c.execute("DELETE FROM user_groups WHERE id=?", (g["id"],))
+    c.execute("DELETE FROM customers WHERE id=?", (cid,))
 
 
 @app.delete("/api/customers/{cid}")
 def customer_delete(cid: int, request: Request):
     require_perm(request, "customer.delete")
     c = conn_()
-    c.execute("DELETE FROM customers WHERE id=?", (cid,))
+    _drop_customer(c, cid)
     c.commit()
     c.close()
     return ok(ok=True)
@@ -584,9 +712,9 @@ async def customer_bulk(request: Request):
     ids = [int(x) for x in (b.get("ids") or []) if str(x).isdigit()]
     if not ids:
         fail(400, "no_selection")
-    marks = ",".join("?" * len(ids))
     c = conn_()
-    c.execute("DELETE FROM customers WHERE id IN (%s)" % marks, ids)
+    for cid in ids:
+        _drop_customer(c, cid)
     c.commit()
     c.close()
     return ok(ok=True, changed=len(ids))
@@ -637,6 +765,134 @@ async def customer_import(request: Request, file: UploadFile = File(...)):
     return ok(created=created, updated=updated)
 
 
+# =============================== PARTNERS (代理商) ===============================
+def _partner_row(c, r):
+    """A partner plus how many customers point at it and how many users it reaches."""
+    d = dict(r)
+    d["customers"] = [x["name"] for x in
+                      c.execute("SELECT name FROM customers WHERE partner_id=? ORDER BY name", (r["id"],))]
+    d["customer_count"] = len(d["customers"])
+    g = c.execute("SELECT id FROM user_groups WHERE partner_id=?", (r["id"],)).fetchone()
+    d["group_id"] = g["id"] if g else None
+    d["group_name"] = rbac.PARTNER_GROUP_PREFIX + (r["name"] or "").strip()
+    d["member_count"] = c.execute(
+        "SELECT COUNT(*) n FROM user_groups_rel WHERE group_id=?", (g["id"],)).fetchone()["n"] if g else 0
+    return d
+
+
+@app.get("/api/partners")
+def partners_list(request: Request, q: str = ""):
+    require_perm(request, "partner.view")
+    c = conn_()
+    if q:
+        like = "%" + q + "%"
+        rows = c.execute("SELECT * FROM partners WHERE name LIKE ? OR domains LIKE ? ORDER BY name",
+                         (like, like)).fetchall()
+    else:
+        rows = c.execute("SELECT * FROM partners ORDER BY name").fetchall()
+    out = [_partner_row(c, r) for r in rows]
+    c.close()
+    return ok(items=out)
+
+
+@app.post("/api/partners")
+async def partner_create(request: Request):
+    require_perm(request, "partner.create")
+    b = await request.json()
+    name = (b.get("name") or "").strip()
+    domains = (b.get("domains") or "").strip().lower()
+    if not name or not domains:
+        fail(400, "name_and_domain_required")
+    c = conn_()
+    if c.execute("SELECT id FROM partners WHERE lower(name)=?", (name.lower(),)).fetchone():
+        c.close()
+        fail(409, "partner_name_taken")
+    cur = c.execute("INSERT INTO partners(name,domains,contact_email,description) VALUES(?,?,?,?)",
+                    (name, domains, b.get("contact_email", ""), b.get("description", "")))
+    pid = cur.lastrowid
+    rbac.ensure_partner_group(c, pid, name)
+    c.commit()
+    c.close()
+    # the new domains may already cover existing users
+    _resync_all_domain_groups(evict_ids=[g for g in [_group_id_for_partner(pid)] if g])
+    return ok(id=pid)
+
+
+@app.put("/api/partners/{pid}")
+async def partner_update(pid: int, request: Request):
+    require_perm(request, "partner.edit")
+    b = await request.json()
+    c = conn_()
+    row = c.execute("SELECT * FROM partners WHERE id=?", (pid,)).fetchone()
+    if not row:
+        c.close()
+        fail(404, "not_found")
+    name = (b.get("name") or row["name"]).strip() or row["name"]
+    domains = (b.get("domains") if b.get("domains") is not None else row["domains"]) or ""
+    dup = c.execute("SELECT id FROM partners WHERE lower(name)=? AND id<>?", (name.lower(), pid)).fetchone()
+    if dup:
+        c.close()
+        fail(409, "partner_name_taken")
+    c.execute("UPDATE partners SET name=?, domains=?, contact_email=?, description=? WHERE id=?",
+              (name, domains.strip().lower(), b.get("contact_email", row["contact_email"]),
+               b.get("description", row["description"]), pid))
+    rbac.ensure_partner_group(c, pid, name)
+    c.commit()
+    c.close()
+    _resync_all_domain_groups(evict_ids=[g for g in [_group_id_for_partner(pid)] if g])
+    return ok(ok=True)
+
+
+def _group_id_for_partner(pid):
+    c = conn_()
+    row = c.execute("SELECT id FROM user_groups WHERE partner_id=?", (pid,)).fetchone()
+    c.close()
+    return row["id"] if row else None
+
+
+def _drop_partner(c, pid):
+    """Delete a partner: its customers are unlinked, its group disappears."""
+    c.execute("UPDATE customers SET partner_id=NULL WHERE partner_id=?", (pid,))
+    g = c.execute("SELECT id FROM user_groups WHERE partner_id=?", (pid,)).fetchone()
+    if g:
+        c.execute("DELETE FROM user_groups_rel WHERE group_id=?", (g["id"],))
+        c.execute("DELETE FROM kb_collections_groups WHERE group_id=?", (g["id"],))
+        c.execute("DELETE FROM kb_article_groups WHERE group_id=?", (g["id"],))
+        c.execute("DELETE FROM user_groups WHERE id=?", (g["id"],))
+    c.execute("DELETE FROM partners WHERE id=?", (pid,))
+
+
+@app.delete("/api/partners/{pid}")
+def partner_delete(pid: int, request: Request):
+    require_perm(request, "partner.delete")
+    c = conn_()
+    if not c.execute("SELECT id FROM partners WHERE id=?", (pid,)).fetchone():
+        c.close()
+        fail(404, "not_found")
+    unlinked = c.execute("SELECT COUNT(*) n FROM customers WHERE partner_id=?", (pid,)).fetchone()["n"]
+    _drop_partner(c, pid)
+    c.commit()
+    c.close()
+    return ok(ok=True, unlinked=unlinked)
+
+
+@app.post("/api/partners/bulk")
+async def partner_bulk(request: Request):
+    require_perm(request, "partner.delete")
+    b = await request.json()
+    ids = [int(x) for x in (b.get("ids") or []) if str(x).isdigit()]
+    if not ids:
+        fail(400, "no_selection")
+    c = conn_()
+    unlinked = 0
+    for pid in ids:
+        unlinked += c.execute("SELECT COUNT(*) n FROM customers WHERE partner_id=?", (pid,)).fetchone()["n"]
+        _drop_partner(c, pid)
+    c.commit()
+    c.close()
+    return ok(ok=True, changed=len(ids), unlinked=unlinked)
+
+
 # =============================== TICKETS ===============================
 def _ticket_visible(conn, t, u):
     perms = rbac.user_permissions(conn, u["id"])
@@ -651,6 +907,10 @@ def _ticket_visible(conn, t, u):
             g = conn.execute("SELECT id FROM user_groups WHERE customer_id=?", (t["customer_id"],)).fetchone()
             if g and g["id"] in gids:
                 return True
+    # a partner may read every ticket of the customers assigned to it
+    if "ticket.view_partner" in perms and t["customer_id"]:
+        if t["customer_id"] in rbac.partner_customer_ids(conn, u["id"]):
+            return True
     return False
 
 
@@ -688,6 +948,8 @@ def tickets_list(request: Request, status: str = "", owner: str = "", customer: 
     sql += " ORDER BY id DESC LIMIT 500"
     rows = [dict(r) for r in c.execute(sql, args)]
     perms = rbac.user_permissions(c, u["id"])
+    gids = rbac.groups_for_user(c, u["id"], u["email"]) if "ticket.view_own" in perms else set()
+    partner_cids = rbac.partner_customer_ids(c, u["id"]) if "ticket.view_partner" in perms else set()
     out = []
     for t in rows:
         vis = True
@@ -697,10 +959,11 @@ def tickets_list(request: Request, status: str = "", owner: str = "", customer: 
                 if t["creator_id"] == u["id"] or t["owner_id"] == u["id"]:
                     vis = True
                 elif t["customer_id"]:
-                    gids = rbac.groups_for_user(c, u["id"], u["email"])
                     g = c.execute("SELECT id FROM user_groups WHERE customer_id=?", (t["customer_id"],)).fetchone()
                     if g and g["id"] in gids:
                         vis = True
+            if not vis and t["customer_id"] and t["customer_id"] in partner_cids:
+                vis = True
         if not vis:
             continue
         owner_name = ""
@@ -1199,6 +1462,10 @@ async def admin_user_create(request: Request):
     if "@" not in email:
         fail(400, "bad_email")
     c = conn_()
+    err = _registration_allowed(c, email)
+    if err:
+        c.close()
+        fail(403, err)
     if c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone():
         c.close()
         fail(409, "email_exists")
@@ -1272,11 +1539,17 @@ async def admin_users_import(request: Request, file: UploadFile = File(...)):
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8", "replace")))
     c = conn_()
     created = updated = 0
+    skipped = []
     for row in reader:
         email = (row.get("email") or "").strip().lower()
         if "@" not in email:
             continue
         exists = c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone()
+        if not exists and _registration_allowed(c, email):
+            # the import is the "add many users" path, so it obeys the same
+            # domain allow-list as the single-user form
+            skipped.append(email)
+            continue
         roles = [x.strip() for x in (row.get("roles") or "").split("|") if x.strip()]
         if exists:
             uid = exists["id"]
@@ -1296,7 +1569,7 @@ async def admin_users_import(request: Request, file: UploadFile = File(...)):
         _sync_internal_group(c, uid, email)
     c.commit()
     c.close()
-    return ok(created=created, updated=updated)
+    return ok(created=created, updated=updated, skipped=skipped)
 
 
 def _set_roles_groups(c, uid, roles, group_ids):
@@ -1483,6 +1756,13 @@ def _group_row(c, r):
         d["kind"] = "internal"
         d["grants"] = list(rbac.INTERNAL_GROUP_PERMS)
         d["auto_hint"] = "internal_domains"
+    elif r["partner_id"]:
+        p = c.execute("SELECT name,domains FROM partners WHERE id=?", (r["partner_id"],)).fetchone()
+        d["kind"] = "partner"
+        d["partner_name"] = p["name"] if p else ""
+        d["domains"] = (p["domains"] if p else "") or ""
+        d["grants"] = list(rbac.PARTNER_GROUP_PERMS)
+        d["auto_hint"] = "partner_domains"
     elif r["customer_id"]:
         cust = c.execute("SELECT name,domains FROM customers WHERE id=?", (r["customer_id"],)).fetchone()
         d["kind"] = "customer"
@@ -1563,7 +1843,7 @@ def admin_group_delete(gid: int, request: Request):
     if not row:
         c.close()
         fail(404, "not_found")
-    if row["builtin"] or row["customer_id"] or row["name"] == rbac.INTERNAL_GROUP:
+    if row["builtin"] or row["customer_id"] or row["partner_id"] or row["name"] == rbac.INTERNAL_GROUP:
         c.close()
         fail(400, "builtin_group")
     c.execute("DELETE FROM user_groups_rel WHERE group_id=?", (gid,))
@@ -1639,13 +1919,17 @@ def admin_group_member_remove(gid: int, uid: int, request: Request):
 @app.get("/api/admin/site")
 def admin_site(request: Request):
     require_perm(request, "settings.mail")
+    c = conn_()
+    known = rbac.known_domains(c)
+    c.close()
     return ok(modules=site_modules(), internal_domains=site_internal_domains(),
               session_timeout=site_session_timeout(),
               session_max_lifetime=site_session_max_lifetime(),
               theme=site_theme(), deploy_types=DEPLOY_TYPES,
               company_name=site_company_name(), company_logo=site_company_logo(),
               welcome_md=site_welcome_md(), allowed_hosts=site_allowed_hosts(),
-              logo_hint=LOGO_HINT, mail_provider=site_mail_provider())
+              logo_hint=LOGO_HINT, mail_provider=site_mail_provider(),
+              require_known_domain=site_require_known_domain(), known_domains=known)
 
 
 @app.post("/api/admin/site")
@@ -1680,6 +1964,8 @@ async def admin_site_save(request: Request):
         set_setting(c, "allowed_hosts", json.dumps(hosts, ensure_ascii=False))
     if "mail_provider" in b:
         set_setting(c, "mail_provider", "o365" if str(b.get("mail_provider") or "").lower() == "o365" else "smtp")
+    if "require_known_domain" in b:
+        set_setting(c, "require_known_domain", "1" if b.get("require_known_domain") else "0")
     c.commit()
     # Re-evaluate internal-group membership for every user: dropping an internal
     # domain must evict its users. Scoped to the internal group so customer-group
