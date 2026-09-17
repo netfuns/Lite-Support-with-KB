@@ -2493,7 +2493,8 @@ async function adminSettings() {
     } catch (e) { toast(e.message, false); }
   } }, t("poll_now"));
   const testBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
-    const to = prompt("To address"); if (!to) return;
+    const to = prompt("To address (leave empty to use the sender)") || cfg.smtp_from || cfg.smtp_user || "";
+    if (!to) return;
     try {
       const r = await api("/api/admin/mail/test", { method: "POST", body: JSON.stringify({ to }) });
       toast("Sent: " + (r.sent ? "yes" : "no"));
