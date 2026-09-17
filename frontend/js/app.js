@@ -110,6 +110,58 @@ function visTag(v) {
 
 function esc(s) { return (s == null ? "" : String(s)).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+/** "1.4 MB" -- files are listed with their weight so a chip reads as a file. */
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+/**
+ * Attachments of one message, of one reply, or of one KB article.
+ *
+ * Images are previewed inline (clicking opens the original) and every other
+ * file becomes an explicit download chip: a bare inline filename was far too
+ * easy to scroll past, which made uploaded files look as if they were lost.
+ * Pass `data.attachments` straight from the API.
+ */
+function attachmentList(atts) {
+  const list = atts || [];
+  if (!list.length) return null;
+  const box = h("div", { class: "att-box" },
+    h("div", { class: "att-title" }, "\uD83D\uDCCE " + t("attachments") + " (" + list.length + ")"));
+  for (const a of list) {
+    const url = "/files/" + (a.stored_name || "");
+    const name = a.filename || "file";
+    const size = a.size ? " \u00b7 " + fmtSize(a.size) : "";
+    if ((a.content_type || "").startsWith("image/")) {
+      box.append(h("a", { class: "att-img", href: url, target: "_blank", title: name },
+        h("img", { src: url, alt: name, loading: "lazy" }),
+        h("span", { class: "att-img-name" }, name + size)));
+    } else {
+      box.append(h("a", { class: "att-chip", href: url, target: "_blank", download: name },
+        "\uD83D\uDCCE " + name + size));
+    }
+  }
+  return box;
+}
+
+/** Inline markdown (bold, code, images, links). The text is escaped first. */
+function mdInline(s) {
+  return esc(s)
+    // the raw dialogue stamps its timestamps with <sub>..</sub> (the PDF export
+    // renders that pair); let exactly that one through instead of printing it
+    .replace(/&lt;sub&gt;/g, "<sub>").replace(/&lt;\/sub&gt;/g, "</sub>")
+    // images must win over links, otherwise the [..](..) inside is swallowed
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g,
+      '<img src="$2" alt="$1" style="max-height:320px;max-width:100%;display:block;margin:8px 0">')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
 // tiny markdown renderer (headings, code, lists, paragraphs)
 function mdToHtml(md) {
   if (!md) return "";
@@ -127,11 +179,11 @@ function mdToHtml(md) {
     if ((m = L.match(/^(#{1,6})\s+(.*)$/))) { out += "<h" + m[1].length + ">" + m[2] + "</h" + m[1].length + ">"; continue; }
     if (/^\s*[-*]\s+/.test(L)) {
       if (!listOpen) { out += "<ul>"; listOpen = true; }
-      out += "<li>" + esc(L.replace(/^\s*[-*]\s+/, "")) + "</li>";
+      out += "<li>" + mdInline(L.replace(/^\s*[-*]\s+/, "")) + "</li>";
       continue;
     } else if (listOpen) { out += "</ul>"; listOpen = false; }
     if (L.trim() === "") { if (!listOpen) out += "<br>"; continue; }
-    out += "<p>" + esc(L).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>") + "</p>";
+    out += "<p>" + mdInline(L) + "</p>";
   }
   if (inPre) out += "</code></pre>";
   if (listOpen) out += "</ul>";
@@ -773,7 +825,7 @@ async function ticketDetail(id) {
           m.internal ? h("span", { class: "tag medium", style: "margin-left:8px" }, "internal") : null),
         null),
       h("div", { style: "white-space:pre-wrap;margin-top:8px" }, m.body || ""),
-      (m.attachments || []).map(a => h("a", { href: "/files/" + a.stored_name, target: "_blank", style: "display:inline-block;margin-top:6px" }, "📎 " + a.filename))));
+      attachmentList(m.attachments)));
   }));
 
   const body = h("div", {},
@@ -1086,11 +1138,13 @@ async function kbDetail(id) {
           a.desensitized ? "desensitized" : "raw", a.created_at].filter(Boolean).join(" · ")),
       h("div", { class: "markdown", innerHTML: mdToHtml(a.body) }),
       h("div", { style: "margin-top:8px" },
-        (data.attachments || []).map(x => (x.content_type || "").startsWith("image/")
-          ? h("img", { src: "/files/" + x.stored_name, style: "max-height:300px;margin:8px 0;display:block" })
-          : h("a", { class: "btn btn-ghost btn-sm", style: "margin:4px 6px 0 0",
-                      href: "/files/" + x.stored_name, target: "_blank" },
-              "📎 " + x.filename))))));
+        // a masked article carries no file at all -- say so, otherwise the
+        // reader assumes the upload was lost
+        a.desensitized
+          ? h("div", { class: "muted", style: "font-size:12px;margin-top:8px" },
+              t("kb_masked_no_files"))
+          : null,
+        attachmentList(data.attachments)))));
   return { title: "", body };
 }
 

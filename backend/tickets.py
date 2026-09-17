@@ -199,10 +199,19 @@ def raw_dialogue(conn, t):
 
 
 def _link_attachments(conn, ticket_id, article_id):
-    """Expose the ticket's files on the article (same stored blob, no copy)."""
+    """Expose the ticket's files on the article (same stored blob, no copy).
+
+    A file hanging off an internal note stays behind: the note itself never
+    reaches the KB (see ``raw_dialogue``), so neither may the screenshot or log
+    that only the desk was meant to read.
+    """
     n = 0
-    for a in conn.execute("SELECT * FROM attachments WHERE ticket_id=? AND article_id IS NULL",
-                          (ticket_id,)):
+    rows = conn.execute(
+        "SELECT * FROM attachments WHERE ticket_id=? AND article_id IS NULL "
+        "AND (message_id IS NULL OR message_id IN "
+        "     (SELECT id FROM messages WHERE ticket_id=? AND internal=0))",
+        (ticket_id, ticket_id))
+    for a in rows:
         conn.execute(
             "INSERT INTO attachments(article_id,ticket_id,filename,stored_name,content_type,size) "
             "VALUES(?,?,?,?,?,?)",
