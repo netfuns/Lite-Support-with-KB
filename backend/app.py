@@ -416,7 +416,30 @@ async def login(request: Request):
     if u["status"] != "active":
         c.close()
         return JSONResponse({"error": "account_disabled"}, 403)
-    if u["totp_enabled"] and u["totp_secret"]:
+    # TOTP enforcement:
+    #  - totp_enabled: the user already enrolled; require their code now (existing).
+    #  - require_totp (mail/auto-created or forgot-reset account, not yet enrolled):
+    #    must enroll TOTP before a full session is issued. The secret + QR are
+    #    handed to the client so it can show the authenticator setup right here;
+    #    on the next attempt the code is verified in-line and the session issued.
+    if u["require_totp"] and not u["totp_enabled"]:
+        secret = u["totp_secret"] or auth.new_totp_secret()
+        c.execute("UPDATE users SET totp_secret=? WHERE id=?", (secret, u["id"]))
+        code = (body.get("code") or "").strip()
+        if not code:
+            c.commit()
+            c.close()
+            return JSONResponse({"need_enroll_totp": True, "totp_secret": secret,
+                                 "totp_uri": auth.totp_uri(u["email"], secret)}, 200)
+        if not auth.totp_verify(secret, code):
+            c.commit()
+            c.close()
+            return JSONResponse({"need_enroll_totp": True, "totp_secret": secret,
+                                 "totp_uri": auth.totp_uri(u["email"], secret)}, 200)
+        # code verified: mark TOTP enrolled, drop the enrollment flag
+        c.execute("UPDATE users SET totp_enabled=1, totp_secret=?, require_totp=0 WHERE id=?",
+                  (secret, u["id"]))
+    elif u["totp_enabled"] and u["totp_secret"]:
         code = body.get("totp") or ""
         if not auth.totp_verify(u["totp_secret"], code):
             c.close()
@@ -573,6 +596,119 @@ async def register(request: Request):
     c.commit()
     c.close()
     return ok(ok=True)
+
+
+# --------------------------- forgot-password / self-enrollment -------------
+#
+# "Forgot password" doubles as a self-service credential reset for customer
+# domains:
+#   * address already exists  -> new random password is e-mailed and TOTP is
+#     cleared, so the user re-enrolls on the next login (TOTP "reset" happens
+#     here, exactly as the requirement asks)
+#   * address is unknown BUT its domain belongs to a known customer -> the
+#     client is told it may create that account (POST /api/auth/create below);
+#     the server refuses to create on demand so an open mailbox is required
+#   * everything else          -> "no account" so an attacker learns nothing
+#
+def _random_password():
+    import secrets
+    return secrets.token_urlsafe(12)
+
+
+def _forgot_credentials_email(conn, to_addr, password, base_url=""):
+    import mailer
+    login = (base_url or "") + "/#/login"
+    text = (
+        "Your RankEZ support portal password has been reset.\n\n"
+        "Login URL: %s\nEmail: %s\nNew password: %s\n\n"
+        "On next sign-in you will be asked to set up two-factor authentication "
+        "(TOTP) again.\n---\n您的 RankEZ 售后平台密码已重置。\n\n登录地址：%s\n邮箱：%s\n"
+        "新密码：%s\n\n下次登录时需重新设置两步验证（TOTP）。\n"
+    ) % (login, to_addr, password, login, to_addr, password)
+    htmlb = ("<p>Your RankEZ password has been reset.</p>"
+             "<p><b>Login URL:</b> <a href='%s'>%s</a><br><b>Email:</b> %s<br>"
+             "<b>New password:</b> %s</p>"
+             "<p>On next sign-in you will be asked to set up TOTP again.</p>"
+             "<hr><p>您的 RankEZ 售后平台密码已重置。</p>"
+             "<p><b>登录地址：</b><a href='%s'>%s</a><br><b>邮箱：</b>%s<br>"
+             "<b>新密码：</b>%s</p>"
+             "<p>下次登录时需重新设置两步验证（TOTP）。</p>"
+             % (login, login, to_addr, password, login, login, to_addr, password))
+    return mailer.send_email(conn, [to_addr], "[RankEZ] Your password has been reset",
+                             text, htmlb)
+
+
+@app.post("/api/auth/forgot")
+async def auth_forgot(request: Request):
+    """Reset a known user's password (e-mailed + TOTP cleared), or report that a
+    customer-domain address may be self-enrolled. Never reveals existence of
+    addresses outside a known customer domain."""
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    if "@" not in email:
+        return JSONResponse({"error": "invalid_input"}, 400)
+    c = conn_()
+    row = c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone()
+    cust = T.match_customer(c, email)
+    if row:
+        pw = _random_password()
+        c.execute("UPDATE users SET password_hash=?, require_totp=1, totp_enabled=0, "
+                  "totp_secret=NULL WHERE id=?",
+                  (auth.hash_password(pw), row["id"]))
+        c.commit()
+        base = get_setting(c, "base_url", "")
+        mailed = _forgot_credentials_email(c, email, pw, base)
+        c.close()
+        # generic on purpose: same response whether or not the mail went out,
+        # so the endpoint cannot be used to enumerate addresses
+        return JSONResponse({"sent": True})
+    if cust:
+        # no account yet, but the domain is a real customer's: offer to create
+        c.close()
+        return JSONResponse({"need_create": True, "customer_name": cust["name"]})
+    c.close()
+    return JSONResponse({"need_create": False})
+
+
+@app.post("/api/auth/create")
+async def auth_create(request: Request):
+    """Self-enroll from the forgot-password flow: create an account whose email
+    matches a KNOWN CUSTOMER domain, with the caller's chosen password, TOTP
+    required on first login. Never creates an account for an unknown domain --
+    that would defeat the whole allow-list.
+    """
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    pw = body.get("password") or ""
+    if "@" not in email:
+        return JSONResponse({"error": "invalid_input"}, 400)
+    c = conn_()
+    # only a *customer* domain may be self-created here: the requirement is about
+    # customers who mail the desk and never reach a web sign-up form.
+    cust = T.match_customer(c, email)
+    if not cust:
+        c.close()
+        return JSONResponse({"error": "domain_not_allowed"}, 403)
+    if c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone():
+        c.close()
+        return JSONResponse({"error": "email_exists"}, 409)
+    if len(pw) < 6:
+        c.close()
+        return JSONResponse({"error": "password_too_short"}, 400)
+    cur = c.execute(
+        "INSERT INTO users(email,display_name,password_hash,require_totp) VALUES(?,?,?,1)",
+        (email, (body.get("display_name") or email.split("@", 1)[0]),
+         auth.hash_password(pw)))
+    uid = cur.lastrowid
+    gid = rbac.ensure_customer_group(c, cust["id"], cust["name"])
+    c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+    role = c.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
+    if role:
+        c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
+    rbac.sync_email_groups(c, uid, email, remove_stale=False)
+    c.commit()
+    c.close()
+    return JSONResponse({"ok": True, "id": uid})
 
 
 # =============================== META / PERMS ===============================

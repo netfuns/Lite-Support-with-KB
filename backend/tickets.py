@@ -3,6 +3,7 @@ import base64
 import datetime
 import html
 import re
+import secrets
 import uuid
 
 import auth
@@ -41,24 +42,83 @@ def match_partner(conn, email):
     return None
 
 
-def find_or_create_user(conn, email, display_name=""):
+def _new_password():
+    """A pronounceable-but-random credential for auto-provisioned accounts."""
+    return secrets.token_urlsafe(12)
+
+
+def _credentials_email(conn, to_addr, password, base_url=""):
+    """Send the temporary password + TOTP-nag to a brand-new account holder."""
+    import mailer  # lazy: tickets <-> mailer
+    subject = "[RankEZ] Your account was created"
+    # bilingual: the auto-created address is on a customer domain that we do not
+    # know the locale of, so ship both English and 简体 Chinese in one mail.
+    login = (base_url or "") + "/#/login"
+    text = (
+        "Your account on the RankEZ support portal was created automatically "
+        "because you sent a message to a support ticket.\n\n"
+        "Login URL: %s\n"
+        "Email (your username): %s\n"
+        "Temporary password: %s\n\n"
+        "On first sign-in you will be asked to set up two-factor authentication "
+        "(TOTP) in your authenticator app.\n"
+        "---\n"
+        "您的 RankEZ 售后平台账号已自动创建（您刚刚发邮件到售后时触发）。\n\n"
+        "登录地址：%s\n"
+        "邮箱（即用户名）：%s\n"
+        "临时密码：%s\n\n"
+        "首次登录时需设置两步验证（TOTP）。\n"
+    ) % (login, to_addr, password, login, to_addr, password)
+    htmlb = ("<p>Your account on the RankEZ support portal was created automatically.</p>"
+             "<p><b>Login URL:</b> <a href='%s'>%s</a><br>"
+             "<b>Email (username):</b> %s<br>"
+             "<b>Temporary password:</b> %s</p>"
+             "<p>On first sign-in you will be asked to set up two-factor authentication (TOTP).</p>"
+             "<hr><p>您的 RankEZ 售后平台账号已自动创建。</p>"
+             "<p><b>登录地址：</b><a href='%s'>%s</a><br>"
+             "<b>邮箱（即用户名）：</b>%s<br>"
+             "<b>临时密码：</b>%s</b></p>"
+             "<p>首次登录时需设置两步验证（TOTP）。</p>"
+             % (login, login, to_addr, password, login, login, to_addr, password))
+    return mailer.send_email(conn, [to_addr], subject, text, htmlb)
+
+
+def find_or_create_user(conn, email, display_name="", send_credentials=False):
+    """Return ``{"id", "created"}`` for `email`, creating it when absent.
+
+    Callers that pass ``send_credentials=True`` are the inbound-mail path: a
+    sender on a customer domain who has no account yet is auto-provisioned with
+    a random password that is e-mailed to the address, and the account is
+    flagged ``require_totp`` so it enrolls TOTP on first login. Callers that
+    already hold a password (web sign-up, admin create) pass the default
+    ``send_credentials=False`` -- no provisioning, no e-mail.
+    """
     email = (email or "").strip().lower()
     row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
     if row:
-        return row["id"]
+        return {"id": row["id"], "created": False}
     name = display_name or email.split("@", 1)[0]
-    cur = conn.execute("INSERT INTO users(email,display_name) VALUES(?,?)", (email, name))
+    pw = _new_password() if send_credentials else ""
+    cur = conn.execute(
+        "INSERT INTO users(email,display_name,password_hash,require_totp) VALUES(?,?,?,?)",
+        (email, name, auth.hash_password(pw) if pw else None, 1 if send_credentials else 0))
     uid = cur.lastrowid
     # e-mail-domain rule: join the matching customer / partner group (+ the
     # internal group when the domain is internal). Add-only — nothing to evict on
     # a fresh user.
     rbac.sync_email_groups(conn, uid, email, remove_stale=False)
-    # default role customer
+    # default role customer (auto-created users are always customer-facing)
     role = conn.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
     if role:
         conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
     conn.commit()
-    return uid
+    mailed = False
+    if send_credentials:
+        from db import get_setting
+        base = get_setting(conn, "base_url", "")
+        mailed = _credentials_email(conn, email, pw, base)
+    return {"id": uid, "created": True, "password": pw if send_credentials else None,
+            "mailed": mailed}
 
 
 def create_ticket(conn, *, title, description="", customer_name="", customer_id=None,
@@ -76,7 +136,7 @@ def create_ticket(conn, *, title, description="", customer_name="", customer_id=
             cid = c["id"]
         customer_id = cid
     if creator_email and not creator_id:
-        creator_id = find_or_create_user(conn, creator_email)
+        creator_id = find_or_create_user(conn, creator_email)["id"]
     cust_name = ""
     if customer_id:
         c = conn.execute("SELECT name FROM customers WHERE id=?", (customer_id,)).fetchone()

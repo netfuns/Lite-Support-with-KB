@@ -564,6 +564,7 @@ async function render() {
   else if (route === "partners") view = partnersView();
   else if (route === "login") view = loginView();
   else if (route === "register") view = registerView();
+  else if (route === "forgot") view = forgotView();
   else if (route === "me") view = meView();
   else if (route === "admin") {
     const sub = arg || "users";
@@ -631,18 +632,47 @@ async function homeView() {
 function loginView() {
   const email = h("input", { name: "email", type: "email", placeholder: t("email"), required: true });
   const pw = h("input", { name: "password", type: "password", placeholder: t("password"), required: true });
-  const totp = h("input", { name: "totp", class: "totp hidden", type: "text", placeholder: "TOTP" });
+  const totp = h("input", { name: "totp", class: "totp hidden", type: "text", inputMode: "numeric",
+                          maxlength: 6, placeholder: t("totp_prompt") });
+  // enrollment UI shown when a freshly created account must set up TOTP
+  const enrollBox = h("div", { class: "totp hidden", style: "margin-top:8px" });
+  let enrollState = null; // {secret, uri}
+  function renderEnroll(secret, uri) {
+    enrollBox.innerHTML = "";
+    enrollBox.append(
+      h("p", { class: "muted" }, t("totp_enroll_prompt")),
+      h("p", { style: "word-break:break-all;font-family:monospace;background:#f4f5f7;padding:8px;border-radius:6px" },
+        secret || ""),
+      uri ? h("p", { style: "text-align:center" },
+        h("img", { src: "https://api.qrserver.com/v1/code-16x16.php?size=160x160&data=" + encodeURIComponent(uri),
+                   alt: "TOTP QR", style: "max-width:160px" })) : null,
+      h("p", { class: "muted", style: "font-size:12px" }, t("totp_enroll_hint")));
+  }
+  async function finishLogin(data) {
+    state.token = data.token;
+    if (data.captcha_pass) captchaSave(data.captcha_pass, 1800);
+    const me = await api("/api/me");
+    state.user = me; state.me_perms = new Set(me.permissions);
+    state.meta = await api("/api/meta");
+    state.products = state.meta.products;
+    state.modules = state.meta.modules || [];
+    state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
+    applyTheme(state.meta.theme);
+    startIdleWatchdog();
+    window.location.hash = "#/dashboard";
+  }
   const body = h("div", { style: "max-width:380px;margin:60px auto" },
     h("div", { style: "text-align:center;margin-bottom:16px" }, brandMark(34)),
     h("div", { class: "card" }, h("div", { class: "card-body" },
-      h("div", {}, email, pw, totp),
+      h("div", {}, email, pw, totp, enrollBox),
       h("button", { class: "btn btn-blue", style: "width:100%;margin-top:10px", onclick: async (e) => {
         e.preventDefault();
         const btn = e.currentTarget;
         btn.disabled = true;
         try {
           const payload = { email: email.value, password: pw.value };
-          if (totp.value) payload.totp = totp.value;
+          if (enrollState) payload.code = totp.value;        // TOTP first-login enrollment
+          else if (!totp.classList.contains("hidden")) payload.totp = totp.value; // existing 2FA
           const post = () => fetch("/api/auth/login", {
             method: "POST",
             headers: Object.assign({ "Content-Type": "application/json" },
@@ -656,27 +686,80 @@ function loginView() {
             r = await post();
             data = await r.json().catch(() => ({ error: "HTTP " + r.status }));
           }
-          if (data.need_totp) { totp.classList.remove("hidden"); totp.focus(); toast(t("totp_prompt") || "Enter your 2FA code"); return; }
+          if (data.need_enroll_totp) {
+            enrollState = { secret: data.totp_secret, uri: data.totp_uri };
+            renderEnroll(data.totp_secret, data.totp_uri);
+            enrollBox.classList.remove("hidden");
+            totp.classList.remove("hidden"); totp.focus();
+            toast(t("totp_enroll_prompt"), true);
+            return;
+          }
+          if (data.need_totp) { totp.classList.remove("hidden"); totp.focus(); toast(t("totp_prompt")); return; }
           if (data.error) { toast(data.error, false); return; }
-          state.token = data.token;
-          if (data.captcha_pass) captchaSave(data.captcha_pass, 1800);
-          const me = await api("/api/me");
-          state.user = me; state.me_perms = new Set(me.permissions);
-          state.meta = await api("/api/meta");
-          state.products = state.meta.products;
-          state.modules = state.meta.modules || [];
-          state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
-          applyTheme(state.meta.theme);
-          startIdleWatchdog();
-          window.location.hash = "#/dashboard";
+          // successful enrollment: re-issue a real session (server already
+          // flipped totp_enabled=1, require_totp=0 when the code verified) --
+          // just clear the enroll state and let finishLogin run.
+          enrollState = null;
+          enrollBox.classList.add("hidden"); totp.classList.add("hidden");
+          await finishLogin(data);
         } finally { btn.disabled = false; }
       } }, t("sign_in_btn")),
       h("p", { class: "muted", style: "text-align:center;margin-top:10px" },
-        h("a", { href: "#/register" }, t("register")),
+        h("a", { href: "#/forgot" }, t("forgot_password")),
         " \u00b7 ",
-        h("a", { href: "#/home" }, t("home"))))),
+        h("a", { href: "#/register" }, t("register"))))),
   );
   return { title: "", body };
+}
+
+
+// Forgot-password modal flow (login -> email -> reset | create): a single-page
+// wizard kept inline instead of a separate route so the slider pass that the
+// user earned on the landing page is not lost. It is driven by the public
+// /api/auth/forgot + /api/auth/create endpoints.
+function forgotView() {
+  const emailInp = h("input", { type: "email", placeholder: t("email"), required: true });
+  const pwInp = h("input", { type: "password", placeholder: t("new_password"), class: "hidden", required: true });
+  let step = "email";
+  const form = h("div", { style: "max-width:380px;margin:60px auto" },
+    h("div", { style: "text-align:center;margin-bottom:16px" }, brandMark(34)),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("div", {}, emailInp, pwInp),
+      h("button", { class: "btn btn-blue", style: "width:100%;margin-top:10px", onclick: async (e) => {
+        e.preventDefault();
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        try {
+          if (step === "email") {
+            const r = await fetch("/api/auth/forgot", { method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: emailInp.value }) });
+            const d = await r.json().catch(() => ({ error: "HTTP " + r.status }));
+            if (!r.ok) { toast(d && (d.detail || d.error) || "failed", false); return; }
+            if (d.need_create) {
+              toast(t("forgot_create_prompt", { customer: d.customer_name || "" }), true, 8000);
+              step = "create"; pwInp.classList.remove("hidden");
+              btn.textContent = t("create_account");
+            } else {
+              toast(t("forgot_sent"), true);
+              window.location.hash = "#/login";
+            }
+          } else if (step === "create") {
+            if (pwInp.value.length < 6) { toast(t("password_too_short"), false); return; }
+            const r = await fetch("/api/auth/create", { method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: emailInp.value, password: pwInp.value }) });
+            const d = await r.json().catch(() => ({ error: "HTTP " + r.status }));
+            if (!r.ok) { toast(d && (d.detail || d.error) || "failed", false); return; }
+            toast(t("forgot_created"), true);
+            window.location.hash = "#/login";
+          }
+        } finally { btn.disabled = false; }
+      } }, step === "create" ? t("create_account") : t("send_reset")),
+      h("p", { class: "muted", style: "text-align:center;margin-top:10px" },
+        h("a", { href: "#/login" }, t("back_to_login"))))),
+  );
+  return { title: "", body: form };
 }
 
 function registerView() {

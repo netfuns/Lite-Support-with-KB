@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT,
   totp_secret TEXT,
   totp_enabled INTEGER DEFAULT 0,
+  require_totp INTEGER DEFAULT 0,
   status TEXT DEFAULT 'active',
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -261,6 +262,17 @@ def migrate():
     cc = _columns(conn, "customers")
     if "partner_id" not in cc:
         conn.execute("ALTER TABLE customers ADD COLUMN partner_id INTEGER")
+    uc = _columns(conn, "users")
+    # Round 16: users that are created by the mail gateway or by the "forgot
+    # password" self-enrollment flow must enroll TOTP on first login before
+    # they are fully active. Existing accounts are untouched (no lockout).
+    if "require_totp" not in uc:
+        conn.execute("ALTER TABLE users ADD COLUMN require_totp INTEGER DEFAULT 0")
+        conn.execute("UPDATE users SET require_totp=0")
+    tc = _columns(conn, "tokens")
+    if "last_seen" not in tc:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_seen TEXT")
+        conn.execute("UPDATE tokens SET last_seen=created_at")
     # Attachments used to be stored with a NULL message_id, and the detail
     # endpoint groups files by message -- so every file uploaded with a ticket or
     # a reply stayed invisible. Re-attach the old rows to their ticket's first

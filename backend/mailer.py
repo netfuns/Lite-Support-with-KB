@@ -353,6 +353,14 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
         or rbac.is_internal_email(conn, frm)
     base_url = (cfg or {}).get("base_url", "")
     m = REF_RE.search(subject or "")
+    # An e-mail from a KNOWN customer domain always gets a user record: the
+    # inbound path auto-provisions one (random password + TOTP-on-first-login,
+    # e-mailed to the sender) when none exists yet. This is what turns a
+    # first-time customer's mail into a login-capable account instead of a
+    # "rejected: unauthorized" bounce. (Staff senders are handled below.)
+    sender_info = {"id": None, "created": False, "mailed": False}
+    if cust and frm and not staff_sender:
+        sender_info = T.find_or_create_user(conn, frm, frm_name, send_credentials=True)
     if not cust and staff_sender:
         t = conn.execute("SELECT * FROM tickets WHERE code=?", (m.group(0).upper(),)).fetchone() if m else None
         if not t:
@@ -363,7 +371,7 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
         conn.execute("UPDATE tickets SET status='support_replied' WHERE id=?", (t["id"],))
         conn.commit()
         _notify_customer_reply(conn, t, frm)
-        return {"status": "replied", "ticket": t["code"]}
+        return {"status": "replied", "ticket": t["code"], "created_user": bool(sender_info["created"])}
     if not cust:
         cfg = cfg or mail_cfg(conn)
         reject_reply(cfg, frm, "unauthorized")
@@ -374,8 +382,14 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
         if t:
             same_customer = (cust["id"] == t["customer_id"])
             if same_customer:
-                T.add_message(conn, t["id"], body=body, author_email=frm, author_name=frm_name,
-                              source="email", attachments=atts)
+                # make sure the replying sender has a user row (auto-provisioned
+                # above when they were new) so the reply is attributed correctly
+                if sender_info["id"]:
+                    uid = sender_info["id"]
+                else:
+                    uid = T.find_or_create_user(conn, frm, frm_name)["id"]
+                T.add_message(conn, t["id"], body=body, user_id=uid, author_email=frm,
+                              author_name=frm_name, source="email", attachments=atts)
                 # the reply drives the status: a desk answer -> 售后已答复 (and the
                 # customer is told), a customer answer -> 客户已答复 (and the desk
                 # is told).
@@ -386,13 +400,16 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
                     _notify_customer_reply(conn, t, frm)
                 else:
                     _notify_reply(conn, t, frm)
-                return {"status": "replied", "ticket": code}
+                return {"status": "replied", "ticket": code, "created_user": bool(sender_info["created"])}
     # new ticket
     clean_sub = REF_RE.sub("", subject or "").strip()
     clean_sub = re.sub(r"(?i)^(re|fw|fwd)\s*:\s*", "", clean_sub).strip() or "(email ticket)"
+    # the user row was auto-provisioned above when the sender was new; hand
+    # the id to create_ticket so it does not have to redo the work
     t = T.create_ticket(
         conn, title=clean_sub[:200], description=body, customer_id=cust["id"],
-        source="email", creator_email=frm, participant_emails=to_list + [frm],
+        source="email", creator_id=sender_info["id"] or None, creator_email=frm,
+        participant_emails=to_list + [frm],
         version=cust["version"] or "", attachments=atts)
     staff = T.support_recipients(conn)
     all_replies = sorted(set(staff + to_list + [frm]))
@@ -400,7 +417,8 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
         "SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (t["id"],)).fetchall(), base_url)
     send_email(conn, all_replies, "[#%s] %s" % (t["code"], t["title"]),
                "Ticket %s created from email.\n\n%s" % (t["code"], body), htmlb)
-    return {"status": "created", "ticket": t["code"]}
+    return {"status": "created", "ticket": t["code"], "created_user": bool(sender_info["created"]),
+            "user_mailed": bool(sender_info.get("mailed", False))}
 
 
 def _notify_reply(conn, t, frm):
