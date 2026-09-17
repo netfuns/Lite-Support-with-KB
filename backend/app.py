@@ -5,8 +5,11 @@ import io
 import json
 import os
 import re
+import sys
+import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
 
 import auth
@@ -15,6 +18,8 @@ import captcha as CAPTCHA
 import convert
 import desens
 import mailer
+import backup
+import md
 import tickets as T
 from db import get_db, init_db, get_setting, set_setting, UPLOAD_DIR, DB_PATH
 
@@ -210,6 +215,11 @@ def site_company_logo():
 
 def site_welcome_md():
     return _setting_raw("welcome_md", "") or DEFAULT_WELCOME
+
+
+def site_setting(key, default=""):
+    """A raw setting (used for the mail templates and the portal address)."""
+    return _setting_raw(key, default) or default
 
 
 def site_mail_provider():
@@ -416,6 +426,13 @@ async def login(request: Request):
     if u["status"] != "active":
         c.close()
         return JSONResponse({"error": "account_disabled"}, 403)
+    # The address must still sit on a domain we know. Registration only ever
+    # accepted customer / partner / internal domains, but that was checked once
+    # at creation time -- a domain removed later used to leave a working key
+    # behind. (Whoever can manage users is exempt, see rbac.login_domain_ok.)
+    if not rbac.login_domain_ok(c, u):
+        c.close()
+        return JSONResponse({"error": "domain_not_allowed"}, 403)
     # Self-heal: if this address' domain turned internal after the account was
     # created (a domain saved later, or the site domain only now detectable),
     # the membership and the default role are re-evaluated here so the user does
@@ -487,10 +504,24 @@ def _me_payload(u):
     groups = [(rbac.INTERNAL_GROUP_LABEL if r["name"] == rbac.INTERNAL_GROUP else r["name"])
               for r in c.execute(
         "SELECT g.name FROM user_groups g JOIN user_groups_rel gr ON gr.group_id=g.id WHERE gr.user_id=?", (u["id"],))]
+    # An agent (代理商) files tickets on behalf of the customers it serves, so the
+    # new-ticket form needs that short list -- and only that list -- up front.
+    pids = rbac.partner_ids_for_user(c, u["id"])
+    partner_names, partner_customers = [], []
+    if pids:
+        marks = ",".join("?" * len(pids))
+        partner_names = [r["name"] for r in
+                         c.execute("SELECT name FROM partners WHERE id IN (%s) ORDER BY name" % marks,
+                                   list(pids))]
+        partner_customers = [{"id": r["id"], "name": r["name"]} for r in
+                             c.execute("SELECT id,name FROM customers WHERE partner_id IN (%s) "
+                                       "ORDER BY name" % marks, list(pids))]
     c.close()
     return {"id": u["id"], "email": u["email"], "display_name": u["display_name"],
             "totp_enabled": bool(u["totp_enabled"]), "permissions": perms,
-            "roles": roles, "groups": groups, "is_internal": is_internal}
+            "roles": roles, "groups": groups, "is_internal": is_internal,
+            "is_partner": bool(pids), "partner_names": partner_names,
+            "partner_customers": partner_customers}
 
 
 @app.get("/api/me")
@@ -563,6 +594,44 @@ async def my_totp_disable(request: Request):
     u = require(request)
     c = conn_()
     c.execute("UPDATE users SET totp_enabled=0, totp_secret=NULL WHERE id=?", (u["id"],))
+    c.commit()
+    c.close()
+    return ok(ok=True)
+
+
+# ---------- in-app bell: "a ticket arrived / a customer answered" ----------
+
+@app.get("/api/me/alerts")
+def my_alerts(request: Request):
+    """Pending ticket alerts for this user, oldest first.
+
+    The ticket list polls this; an alert survives until the desk dismisses it,
+    so a reply nobody reacted to is still there on the next visit.
+    """
+    u = require(request)
+    c = conn_()
+    rows = c.execute(
+        "SELECT a.id, a.ticket_id, a.code, a.kind, a.created_at, t.title, t.customer_name "
+        "FROM ticket_alerts a LEFT JOIN tickets t ON t.id=a.ticket_id "
+        "WHERE a.user_id=? AND a.acked=0 AND t.archived=0 ORDER BY a.id LIMIT 20",
+        (u["id"],)).fetchall()
+    c.close()
+    return ok(items=[dict(r) for r in rows])
+
+
+@app.post("/api/me/alerts/ack")
+async def my_alerts_ack(request: Request):
+    """Dismiss alerts: the ids given, or every pending one when none is given."""
+    u = require(request)
+    body = await request.json()
+    ids = body.get("ids") or []
+    c = conn_()
+    if ids:
+        qs = ",".join("?" * len(ids))
+        c.execute("UPDATE ticket_alerts SET acked=1 WHERE user_id=? AND acked=0 "
+                  "AND id IN (%s)" % qs, [u["id"]] + [int(i) for i in ids])
+    else:
+        c.execute("UPDATE ticket_alerts SET acked=1 WHERE user_id=? AND acked=0", (u["id"],))
     c.commit()
     c.close()
     return ok(ok=True)
@@ -776,13 +845,25 @@ def _clean_partner_id(c, raw):
 
 @app.get("/api/customers")
 def customers_list(request: Request, q: str = ""):
-    require(request)
+    u = require(request)
     c = conn_()
+    perms = rbac.user_permissions(c, u["id"])
+    sql = "SELECT * FROM customers WHERE 1=1"
+    args = []
     if q:
-        like = "%" + q + "%"
-        rows = c.execute("SELECT * FROM customers WHERE name LIKE ? OR domains LIKE ? ORDER BY name", (like, like)).fetchall()
-    else:
-        rows = c.execute("SELECT * FROM customers ORDER BY name").fetchall()
+        sql += " AND (name LIKE ? OR domains LIKE ?)"; args += ["%" + q + "%"] * 2
+    if "customer.view" not in perms and "ticket.view_all" not in perms:
+        # Only the desk and the customer desk may enumerate the whole book. A
+        # customer sees his own customer, an agent sees the customers he serves
+        # -- the new-ticket picker then cannot suggest anybody else's name.
+        ids = {x["id"] for x in rbac.customer_groups_for_user(c, u["id"])}
+        ids |= rbac.partner_customer_ids(c, u["id"])
+        if not ids:
+            c.close()
+            return ok(items=[])
+        marks = ",".join("?" * len(ids))
+        sql += " AND id IN (%s)" % marks; args += list(ids)
+    rows = c.execute(sql + " ORDER BY name", args).fetchall()
     out = [_customer_row(c, r) for r in rows]
     c.close()
     return ok(items=out)
@@ -951,10 +1032,12 @@ async def customer_import(request: Request, file: UploadFile = File(...)):
 
 # =============================== PARTNERS (代理商) ===============================
 def _partner_row(c, r):
-    """A partner plus how many customers point at it and how many users it reaches."""
+    """A partner plus the customers it serves and how many users it reaches."""
     d = dict(r)
-    d["customers"] = [x["name"] for x in
-                      c.execute("SELECT name FROM customers WHERE partner_id=? ORDER BY name", (r["id"],))]
+    served = c.execute("SELECT id,name FROM customers WHERE partner_id=? ORDER BY name", (r["id"],)).fetchall()
+    # names keep the old payload shape, ids let the editor round-trip a selection
+    d["customers"] = [x["name"] for x in served]
+    d["customer_ids"] = [x["id"] for x in served]
     d["customer_count"] = len(d["customers"])
     g = c.execute("SELECT id FROM user_groups WHERE partner_id=?", (r["id"],)).fetchone()
     d["group_id"] = g["id"] if g else None
@@ -962,6 +1045,16 @@ def _partner_row(c, r):
     d["member_count"] = c.execute(
         "SELECT COUNT(*) n FROM user_groups_rel WHERE group_id=?", (g["id"],)).fetchone()["n"] if g else 0
     return d
+
+
+def _partner_selection(c, raw):
+    """The editor's selection, resolved to real customer ids (see rbac)."""
+    return rbac.clean_partner_selection(c, raw)
+
+
+def _apply_partner_customers(c, pid, ids):
+    """Point the picked customers at this partner, release the rest (see rbac)."""
+    return rbac.apply_partner_customers(c, pid, ids)
 
 
 @app.get("/api/partners")
@@ -995,11 +1088,15 @@ async def partner_create(request: Request):
                     (name, domains, b.get("contact_email", ""), b.get("description", "")))
     pid = cur.lastrowid
     rbac.ensure_partner_group(c, pid, name)
+    # the editor lets the desk pick "customers served" up front; anything it sent
+    # is applied here so a new partner is complete in one round-trip
+    sel = _partner_selection(c, b.get("customer_ids", b.get("customers")))
+    _apply_partner_customers(c, pid, sel)
     c.commit()
     c.close()
     # the new domains may already cover existing users
     _resync_all_domain_groups(evict_ids=[g for g in [_group_id_for_partner(pid)] if g])
-    return ok(id=pid)
+    return ok(id=pid, customers=len(sel))
 
 
 @app.put("/api/partners/{pid}")
@@ -1021,10 +1118,16 @@ async def partner_update(pid: int, request: Request):
               (name, domains.strip().lower(), b.get("contact_email", row["contact_email"]),
                b.get("description", row["description"]), pid))
     rbac.ensure_partner_group(c, pid, name)
+    # Only touched when the key is present: a client that does not show the
+    # "customers served" picker must not silently unlink every customer.
+    touched = "customer_ids" in b or "customers" in b
+    sel = _partner_selection(c, b.get("customer_ids", b.get("customers"))) if touched else []
+    if touched:
+        _apply_partner_customers(c, pid, sel)
     c.commit()
     c.close()
     _resync_all_domain_groups(evict_ids=[g for g in [_group_id_for_partner(pid)] if g])
-    return ok(ok=True)
+    return ok(ok=True, customers=(len(sel) if touched else None))
 
 
 def _group_id_for_partner(pid):
@@ -1078,6 +1181,28 @@ async def partner_bulk(request: Request):
 
 
 # =============================== TICKETS ===============================
+def _partner_agency_ids(conn, uid):
+    """The partner-group ids the caller belongs to (used for agency-wide reads)."""
+    out = set()
+    for pid in rbac.partner_ids_for_user(conn, uid):
+        g = conn.execute("SELECT id FROM user_groups WHERE partner_id=?", (pid,)).fetchone()
+        if g:
+            out.add(g["id"])
+    return out
+
+
+def _agency_ticket_visible(conn, t, u, agency_gids):
+    """A ticket an agent filed for his own agency (no customer) belongs to the group.
+
+    Without this an agent's "own" ticket would be readable by its author alone,
+    which defeats the point of a reseller working as a team.
+    """
+    if agency_gids and t["creator_id"] and not t["customer_id"]:
+        if agency_gids & rbac.groups_for_user(conn, t["creator_id"]):
+            return True
+    return False
+
+
 def _ticket_visible(conn, t, u):
     perms = rbac.user_permissions(conn, u["id"])
     if "ticket.view_all" in perms:
@@ -1092,8 +1217,10 @@ def _ticket_visible(conn, t, u):
             if g and g["id"] in gids:
                 return True
     # a partner may read every ticket of the customers assigned to it
-    if "ticket.view_partner" in perms and t["customer_id"]:
-        if t["customer_id"] in rbac.partner_customer_ids(conn, u["id"]):
+    if "ticket.view_partner" in perms:
+        if t["customer_id"] and t["customer_id"] in rbac.partner_customer_ids(conn, u["id"]):
+            return True
+        if _agency_ticket_visible(conn, t, u, _partner_agency_ids(conn, u["id"])):
             return True
     return False
 
@@ -1149,6 +1276,7 @@ def tickets_list(request: Request, status: str = "", owner: str = "", customer: 
     perms = rbac.user_permissions(c, u["id"])
     gids = rbac.groups_for_user(c, u["id"], u["email"]) if "ticket.view_own" in perms else set()
     partner_cids = rbac.partner_customer_ids(c, u["id"]) if "ticket.view_partner" in perms else set()
+    agency_gids = _partner_agency_ids(c, u["id"]) if "ticket.view_partner" in perms else set()
     out = []
     for t in rows:
         vis = True
@@ -1162,6 +1290,8 @@ def tickets_list(request: Request, status: str = "", owner: str = "", customer: 
                     if g and g["id"] in gids:
                         vis = True
             if not vis and t["customer_id"] and t["customer_id"] in partner_cids:
+                vis = True
+            if not vis and _agency_ticket_visible(c, t, u, agency_gids):
                 vis = True
         if not vis:
             continue
@@ -1238,19 +1368,57 @@ async def ticket_create(request: Request):
             names = [x["name"] for x in own]
             if cust_name.lower() not in [n.lower() for n in names]:
                 cust_name = names[0]
+        elif cust_name:
+            # An agent (代理商) may file for one of the customers it serves, or for
+            # its own agency (no customer at all). Anything else would auto-create
+            # a customer the agent's group cannot see, so it is dropped to "".
+            allowed = rbac.partner_customer_ids(c, u["id"])
+            hit = None
+            if allowed:
+                marks = ",".join("?" * len(allowed))
+                hit = c.execute("SELECT name FROM customers WHERE lower(name)=? AND id IN (%s)" % marks,
+                                [cust_name.lower()] + list(allowed)).fetchone()
+            cust_name = hit["name"] if hit else ""
+    # 收件人: the addresses the opener picked on the form. They become
+    # participants, which is what decides who is told when the desk answers.
+    recips = [x.strip().lower() for x in (form.get("recipients") or "").split(",")]
+    recips = [x for x in recips if "@" in x]
+    if (u["email"] or "").strip().lower() not in recips:
+        recips.append((u["email"] or "").strip().lower())
+    # a customer may only name people he can see -- otherwise the field would be
+    # a way to subscribe arbitrary addresses to a ticket's traffic
+    if "ticket.view_all" not in perms and not rbac.is_internal_user(c, u["id"]):
+        dom = (u["email"] or "").split("@", 1)[-1].lower()
+        recips = [x for x in recips if x.endswith("@" + dom)]
     t = T.create_ticket(
         c, title=title, description=form.get("description") or "",
         customer_name=cust_name, version=form.get("version") or "",
         product=form.get("product") or "", priority=form.get("priority") or "medium",
-        creator_id=u["id"], creator_email=u["email"], internal=internal, attachments=attachments)
+        creator_id=u["id"], creator_email=u["email"], internal=internal,
+        participant_emails=recips, attachments=attachments)
     dep = form.get("deploy_type") or ""
     if dep:
         c.execute("UPDATE tickets SET deploy_type=? WHERE id=?", (dep, t["id"]))
     c.commit()
+    # the bell is for the desk, an internal note-style ticket is not their queue
+    if not internal:
+        T.alert_new_ticket(c, t)
+    c.commit()
     c.close()
     if not internal:
-        threading.Thread(target=T.notify_new_ticket, args=(conn_(), t), daemon=True).start()
+        # the opener gets a receipt with his link, the desk gets told separately
+        threading.Thread(target=_notify_opened, args=(conn_(), t["id"]), daemon=True).start()
     return ok(id=t["id"], code=t["code"])
+
+
+def _notify_opened(c, tid):
+    t = c.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+    if not t:
+        c.close()
+        return
+    T.notify_ticket_opened(c, t)
+    T.notify_new_ticket(c, t)
+    c.close()
 
 
 @app.post("/api/tickets/{tid}/claim")
@@ -1329,16 +1497,20 @@ async def ticket_status(tid: int, request: Request):
     c.commit()
     # archive on close
     if new_status == "closed" and (_truthy(b.get("share_kb")) or _truthy(b.get("archive"))):
-        archive = T.archive_to_kb(c, tid,
-                                  visibility=_kb_visibility(b.get("kb_visibility"), True),
-                                  desensitize=_truthy(b.get("kb_desensitize"), "1"))
+        vis = _kb_visibility(b.get("kb_visibility"), True)
+        gids = _kb_groups(c, b, True)
+        if vis == "usergroup" and not gids:
+            vis = "internal"
+        archive = T.archive_to_kb(c, tid, visibility=vis,
+                                  desensitize=_truthy(b.get("kb_desensitize"), "1"),
+                                  group_ids=(gids if vis == "usergroup" else None))
         c.close()
-        return ok(ok=True, archived=archive, shared=True)
+        return ok(ok=True, archived=archive, shared=True, visibility=vis)
     c.close()
     return ok(ok=True)
 
 
-KB_VISIBILITIES = ("public", "registered", "internal")
+KB_VISIBILITIES = ("public", "registered", "internal", "usergroup")
 
 
 def _truthy(v, default="0"):
@@ -1387,24 +1559,44 @@ async def ticket_close(tid: int, request: Request):
     # keeps working.
     share = _truthy(b.get("share_kb")) or _truthy(b.get("archive"))
     des = _truthy(b.get("kb_desensitize"), "1")
+    vis = _kb_visibility(b.get("kb_visibility"), internal)
+    gids = _kb_groups(c, b, internal)
+    if vis == "usergroup" and not gids:
+        # an audience-free "usergroup" article would be readable by nobody;
+        # fall back to the safe inner audience rather than publishing a trap
+        vis = "internal"
     aid = None
     if share:
-        aid = T.archive_to_kb(c, tid, visibility=_kb_visibility(b.get("kb_visibility"), internal),
-                              desensitize=des)
+        aid = T.archive_to_kb(c, tid, visibility=vis, desensitize=des,
+                              group_ids=(gids if vis == "usergroup" else None))
     else:
         c.execute("UPDATE tickets SET status='closed', updated_at=datetime('now') WHERE id=?", (tid,))
         c.commit()
     c.close()
-    return ok(ok=True, shared=bool(aid), archived=aid)
+    return ok(ok=True, shared=bool(aid), archived=aid, visibility=vis)
+
+
+def _kb_groups(c, b, internal):
+    """The group binding that came with a share request.
+
+    Only an internal user may scope an article to groups -- a customer closing
+    his own ticket has no business picking somebody else's desk as the audience.
+    """
+    if not internal:
+        return []
+    return _clean_group_ids(c, b.get("kb_group_ids", b.get("group_ids")))
 
 
 @app.post("/api/tickets/{tid}/share_kb")
 async def ticket_share_kb(tid: int, request: Request):
     """Publish a ticket thread to the knowledge base -- the desk only.
 
-    The thread becomes a searchable KB article whose audience is picked here:
-    public / registered users / internal only. Publishing twice updates the same
-    article; the ticket is left open, sharing is not closing.
+    Sharing *is* closing: a thread only becomes knowledge once it is finished,
+    so the ticket is closed as part of the same call (the UI warns about this
+    before it fires). The audience is picked here -- public / registered users /
+    internal only / the specific user groups that should be able to read it.
+
+    Publishing twice updates the same article instead of leaving duplicates.
     """
     u = require(request)
     try:
@@ -1423,10 +1615,16 @@ async def ticket_share_kb(tid: int, request: Request):
         c.close()
         fail(403, "internal_only")
     vis = _kb_visibility(b.get("visibility"), True)
+    gids = _kb_groups(c, b, True)
+    if vis == "usergroup" and not gids:
+        c.close()
+        fail(400, "kb_group_required")
     des = _truthy(b.get("desensitize"), "1")
-    aid = T.archive_to_kb(c, tid, visibility=vis, desensitize=des, close_ticket=False)
+    aid = T.archive_to_kb(c, tid, visibility=vis, desensitize=des,
+                          close_ticket=True, group_ids=(gids if vis == "usergroup" else None))
     c.close()
-    return ok(ok=True, article_id=aid, visibility=vis, desensitized=des)
+    return ok(ok=True, article_id=aid, visibility=vis, groups=gids,
+              desensitized=des, closed=True)
 
 
 @app.post("/api/tickets/{tid}/reply")
@@ -1469,6 +1667,9 @@ async def ticket_reply(tid: int, request: Request):
         new_status = "support_replied" if is_internal else "customer_replied"
         c.execute("UPDATE tickets SET status=?, updated_at=datetime('now') "
                   "WHERE id=? AND status!='closed'", (new_status, tid))
+        if not is_internal:
+            # a customer or his partner answered -- ring the bell for the desk
+            T.alert_customer_reply(c, t)
     c.commit()
     c.close()
     # email notification on a public message
@@ -1498,8 +1699,14 @@ def _ticket_mail_audience(c, t, author_email, from_staff):
     if t["internal"]:
         return sorted(parts & staff)
     if from_staff:
+        # the desk answered: everybody on the customer side hears about it
         return sorted(parts - staff)
-    return sorted(parts | staff)
+    # A customer answering his own ticket does NOT mail the rest of the customer
+    # side: a partner replying would otherwise mail his client back unasked, and
+    # everybody who ever touched the ticket would get the whole thread. On an
+    # existing ticket only the desk needs to know -- the receipt for a *new*
+    # ticket goes to its opener alone.
+    return sorted(parts & staff)
 
 
 def _notify_reply_web(c, tid, uid, from_staff=False):
@@ -1523,17 +1730,32 @@ VIS_LEVEL = {"public": 0, "registered": 1, "internal": 2, "usergroup": 3}
 
 
 def _kb_access_ok(conn, u, article, group_ids):
-    """group_ids: caller-cached user group set"""
-    if not u:
-        return article["visibility"] == "public"
-    perms = rbac.user_permissions(conn, u["id"])
-    if article["visibility"] == "internal" and "kb.view_internal" not in perms:
-        return False
-    if article["visibility"] == "registered" and "kb.view_registered" not in perms:
-        return False
-    # Visibility is now a simple three-way choice (public / registered / internal);
-    # the old per-user-group binding is no longer used.
-    return True
+    """group_ids: caller-cached user group set. The rule itself lives in rbac."""
+    return rbac.kb_article_readable(conn, u, article, group_ids)
+
+
+@app.get("/api/kb/groups")
+def kb_group_options(request: Request):
+    """The groups an article may be bound to -- the "usergroup" audience picker.
+
+    Deliberately narrower than /api/admin/groups: the desk needs the names to
+    choose an audience, not the group-management payload, and it must not need
+    the group.manage permission just to share a solution.
+    """
+    require(request)
+    u = require(request)
+    c = conn_()
+    if not rbac.is_internal_user(c, u["id"]):
+        c.close()
+        fail(403, "internal_only")
+    out = []
+    for r in c.execute("SELECT id,name,builtin,customer_id,partner_id FROM user_groups ORDER BY name"):
+        kind = "internal" if r["name"] == rbac.INTERNAL_GROUP else \
+               "customer" if r["customer_id"] else "partner" if r["partner_id"] else "manual"
+        label = rbac.INTERNAL_GROUP_LABEL if r["name"] == rbac.INTERNAL_GROUP else r["name"]
+        out.append({"id": r["id"], "name": r["name"], "label": label, "kind": kind})
+    c.close()
+    return ok(items=out)
 
 
 @app.get("/api/kb/articles")
@@ -1586,6 +1808,25 @@ def kb_get(aid: int, request: Request):
     return ok(article=a, attachments=atts, can_edit=can_edit)
 
 
+def _clean_group_ids(c, raw):
+    """Numeric, existing group ids only -- a stale pick must not create a dangling row."""
+    out = []
+    if raw is None:
+        return out
+    if isinstance(raw, (str, int)):
+        raw = [raw]
+    for x in raw:
+        try:
+            gid = int(x)
+        except (TypeError, ValueError):
+            continue
+        if gid in out:
+            continue
+        if c.execute("SELECT id FROM user_groups WHERE id=?", (gid,)).fetchone():
+            out.append(gid)
+    return out
+
+
 @app.post("/api/kb/articles")
 async def kb_create(request: Request):
     require_perm(request, "kb.create")
@@ -1599,16 +1840,21 @@ async def kb_create(request: Request):
     if vis == "internal" and "kb.view_internal" not in rbac.user_permissions(c, u["id"]):
         c.close()
         fail(403, "no_permission")
+    gids = _clean_group_ids(c, b.get("group_ids"))
+    if vis == "usergroup" and not gids:
+        vis = "internal"          # no audience would be able to read it otherwise
     cur = c.execute(
         "INSERT INTO kb_articles(title,body,source,visibility,module,collection_id,author_id) VALUES(?,?,?,?,?,?,?)",
         (b.get("title", ""), b.get("body", ""), "manual", vis, b.get("module", ""),
          b.get("collection_id"), u["id"]))
     aid = cur.lastrowid
-    for gid in (b.get("group_ids") or []):
+    for gid in gids:
         c.execute("INSERT OR IGNORE INTO kb_article_groups(article_id,group_id) VALUES(?,?)", (aid, gid))
+    # a picture pasted into the editor is an orphan file until it is bound here
+    T.bind_body_files(c, b.get("body", ""), article_id=aid)
     c.commit()
     c.close()
-    return ok(id=aid)
+    return ok(id=aid, visibility=vis, groups=gids)
 
 
 @app.put("/api/kb/articles/{aid}")
@@ -1628,15 +1874,21 @@ async def kb_update(aid: int, request: Request):
     if vis == "internal" and "kb.view_internal" not in rbac.user_permissions(c, u["id"]):
         c.close()
         fail(403, "no_permission")
+    gids = _clean_group_ids(c, b.get("group_ids") if "group_ids" in b else
+                               [r["group_id"] for r in c.execute(
+                                   "SELECT group_id FROM kb_article_groups WHERE article_id=?", (aid,))])
+    if vis == "usergroup" and not gids:
+        vis = "internal"          # no audience would be able to read it otherwise
     c.execute("UPDATE kb_articles SET title=?, body=?, visibility=?, module=?, collection_id=?, updated_at=datetime('now') WHERE id=?",
               (b.get("title", a["title"]), b.get("body", a["body"]), vis,
                b.get("module", a["module"] or ""), b.get("collection_id"), aid))
     c.execute("DELETE FROM kb_article_groups WHERE article_id=?", (aid,))
-    for gid in (b.get("group_ids") or []):
+    for gid in gids:
         c.execute("INSERT OR IGNORE INTO kb_article_groups(article_id,group_id) VALUES(?,?)", (aid, gid))
+    T.bind_body_files(c, b.get("body", a["body"] or ""), article_id=aid)
     c.commit()
     c.close()
-    return ok(ok=True)
+    return ok(ok=True, visibility=vis, groups=gids)
 
 
 @app.delete("/api/kb/articles/{aid}")
@@ -1794,6 +2046,34 @@ def search(request: Request, q: str = ""):
 
 
 # =============================== ADMIN: USERS ===============================
+@app.get("/api/users")
+def user_picker(request: Request, q: str = ""):
+    """Recipients the caller may pick, for the ticket form's 收件人 field.
+
+    The desk sees everybody, but a customer or a partner only sees the people on
+    his own domain: a client picking recipients must not be able to read the
+    customer list, and a partner must not see his client's staff. An address on
+    a domain nobody registered is his own domain by definition, so he always
+    finds at least his colleagues.
+    """
+    u = require(request)
+    c = conn_()
+    perms = rbac.user_permissions(c, u["id"], u["email"])
+    wide = "ticket.view_all" in perms or rbac.is_internal_user(c, u["id"])
+    dom = (u["email"] or "").split("@", 1)[-1].lower() if "@" in (u["email"] or "") else ""
+    sql = "SELECT id,email,display_name FROM users WHERE status='active'"
+    args = []
+    if not wide:
+        sql += " AND lower(email) LIKE ?"
+        args.append("%@" + dom)
+    if q:
+        sql += " AND (email LIKE ? OR display_name LIKE ?)"
+        args += ["%" + q + "%", "%" + q + "%"]
+    rows = [dict(r) for r in c.execute(sql + " ORDER BY email LIMIT 50", args)]
+    c.close()
+    return ok(items=rows, scope=("all" if wide else ("domain:" + dom)))
+
+
 @app.get("/api/admin/users")
 def admin_users(request: Request, q: str = ""):
     require_perm(request, "user.manage")
@@ -2353,7 +2633,11 @@ def admin_site(request: Request):
               company_name=site_company_name(), company_logo=site_company_logo(),
               welcome_md=site_welcome_md(), allowed_hosts=site_allowed_hosts(),
               logo_hint=LOGO_HINT, mail_provider=site_mail_provider(),
-              require_known_domain=site_require_known_domain(), known_domains=known)
+              require_known_domain=site_require_known_domain(), known_domains=known,
+              site_url=site_setting("site_url"),
+              tpl_new_user=site_setting("tpl_new_user"),
+              tpl_new_ticket=site_setting("tpl_new_ticket"),
+              tpl_vars=list(md.TPL_VARS))
 
 
 @app.post("/api/admin/site")
@@ -2383,6 +2667,26 @@ async def admin_site_save(request: Request):
         set_setting(c, "company_name", str(b.get("company_name") or "").strip() or "RankEZ")
     if "welcome_md" in b:
         set_setting(c, "welcome_md", str(b.get("welcome_md") or ""))
+    # Portal address: the link inside notification mails. "Settings > Mail >
+    # Public URL" sets base_url; this one is the site-level fallback for the
+    # sites that never configured a mail account (see tickets.site_root).
+    if "site_url" in b:
+        set_setting(c, "site_url", str(b.get("site_url") or "").strip().rstrip("/"))
+    # Mail templates replace the built-in wording once they are filled in.
+    # Stored as {"subject": ..., "body": <markdown>}; an empty body + subject
+    # means "use the built-in mail" again (see tickets.tpl_get).
+    for key in ("tpl_new_user", "tpl_new_ticket"):
+        if key in b:
+            v = b.get(key)
+            if isinstance(v, dict):
+                v = {"subject": str(v.get("subject") or "").strip(),
+                     "body": str(v.get("body") or "")}
+            else:
+                v = {"subject": "", "body": str(v or "")}
+            if not v["subject"] and not v["body"].strip():
+                set_setting(c, key, "")
+            else:
+                set_setting(c, key, json.dumps(v, ensure_ascii=False))
     if "allowed_hosts" in b:
         hosts = [str(x).strip().lower().lstrip(".") for x in (b.get("allowed_hosts") or []) if str(x).strip()]
         set_setting(c, "allowed_hosts", json.dumps(hosts, ensure_ascii=False))
@@ -2504,13 +2808,215 @@ def mail_poll_now(request: Request):
         c.close()
 
 
+# =============================== ADMIN: BACKUP / RESTORE ===============================
+@app.get("/api/admin/backup")
+def admin_backup_get(request: Request):
+    require_perm(request, "settings.mail")
+    c = conn_()
+    conf = backup.cfg(c)
+    conf["next_run"] = backup.next_run(c)
+    listing = backup.list_archives(c)
+    c.close()
+    return ok(config=conf, items=listing["items"], dir=listing["dir"],
+              dir_exists=listing["dir_exists"], dir_writable=listing["dir_writable"],
+              free=listing["free"], legacy_timer=backup.legacy_timer_present(),
+              restoring=dict(backup.RESTORING), freq_hint=backup.FREQ_HINT)
+
+
+@app.post("/api/admin/backup")
+async def admin_backup_save(request: Request):
+    require_perm(request, "settings.mail")
+    b = await request.json()
+    c = conn_()
+    backup.save_cfg(c, b)
+    conf = backup.cfg(c)
+    conf["next_run"] = backup.next_run(c)
+    c.close()
+    return ok(config=conf)
+
+
+@app.post("/api/admin/backup/run")
+def admin_backup_run(request: Request):
+    """Take a backup now, in the request (they are small and fast)."""
+    require_perm(request, "settings.mail")
+    c = conn_()
+    res = backup.run_backup(c, reason="manual")
+    c.close()
+    if not res.get("ok"):
+        return ok(ok=False, error=res.get("error") or "", detail=res.get("detail") or "")
+    return ok(**res)
+
+
+@app.get("/api/admin/backup/download")
+def admin_backup_download(request: Request, name: str = ""):
+    require_perm(request, "settings.mail")
+    c = conn_()
+    p = backup.archive_path(c, name)
+    c.close()
+    if not p:
+        fail(404, "not_found")
+    return FileResponse(p, filename=os.path.basename(p), media_type="application/gzip")
+
+
+@app.post("/api/admin/backup/delete")
+async def admin_backup_delete(request: Request):
+    require_perm(request, "settings.mail")
+    b = await request.json()
+    c = conn_()
+    gone = backup.delete_archive(c, b.get("name") or "")
+    c.close()
+    if not gone:
+        fail(404, "not_found")
+    return ok(ok=True)
+
+
+def _exit_for_restart():
+    """Leave with a non-zero code so the unit's Restart=on-failure reloads us.
+
+    The portal runs as `rankez` and cannot call systemctl. A *clean* exit would
+    not be restarted (RestartSec only applies to a failure), and the process
+    cannot simply carry on either: it still holds connections to the database
+    file that was just replaced under it.
+    """
+    try:
+        sys.stderr.write("rankez-support: exiting for restart after restore\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(3)
+
+
+@app.post("/api/admin/backup/restore")
+async def admin_backup_restore(request: Request):
+    """Restore the whole portal from an archive, then let systemd bring it back.
+
+    Body is multipart: either ``name`` (an archive already on the server) or an
+    uploaded ``file``. ``confirm`` must read exactly ``RESTORE`` -- this
+    replaces every account, ticket and article on the site, so a stray click
+    must not be able to reach it.
+    """
+    require_perm(request, "settings.mail")
+    if backup.RESTORING["on"]:
+        fail(409, "restore_in_progress")
+    form = await request.form()
+    if str(form.get("confirm") or "") != "RESTORE":
+        fail(400, "confirm_required")
+    name = str(form.get("name") or "").strip()
+    upload = form.get("file")
+    if not name and (upload is None or not getattr(upload, "filename", "")):
+        fail(400, "no_archive")
+    c = conn_()
+    src = backup.archive_path(c, name) if name else ""
+    if name and not src:
+        c.close()
+        fail(404, "not_found")
+    tmp_path = ""
+    try:
+        if src:
+            path = src
+        else:
+            raw = await upload.read()
+            if not raw:
+                c.close()
+                fail(400, "empty_file")
+            if len(raw) > backup.MAX_ARCHIVE_BYTES:
+                c.close()
+                fail(400, "file_too_large")
+            fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz", prefix="rz-restore-up-")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+            path = tmp_path
+        info = backup.inspect_archive(path)
+        if not info["ok"]:
+            c.close()
+            fail(400, info["error"] or "bad_archive")
+        backup.RESTORING.update(on=True, since=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                error="")
+        res = backup.swap_in(path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    c.close()
+    if not res.get("ok"):
+        backup.RESTORING.update(on=False, error=res.get("error") or "restore_failed")
+        return JSONResponse(status_code=500,
+                            content={"error": "restore_failed", "detail": res.get("error") or ""})
+    # answer first, then go away: the browser gets the confirmation and the
+    # service comes back within RestartSec, on the restored data
+    threading.Timer(1.5, _exit_for_restart).start()
+    return ok(ok=True, restart=True, counts=res.get("counts") or {},
+              kept=res.get("kept") or "", members=info["members"], uploads=info["uploads"])
+
+
 # =============================== ATTACHMENTS ===============================
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+@app.post("/api/uploads")
+async def upload_image(request: Request, file: UploadFile = File(...)):
+    """Store a picture pasted into a Markdown editor and return its URL.
+
+    Pasting a screenshot straight into the text is how people report a problem,
+    so the editor needs somewhere to put the bytes *before* the message exists.
+    The file lands under a random name in the uploads directory -- not
+    guessable, so an upload the author abandons is not discoverable -- and the
+    save path then binds it to the ticket or article it ended up in
+    (``tickets.bind_body_files``), which is what puts it behind that record's
+    permissions. Only images: /files/<name> serves whatever extension it finds,
+    and an .html there would be a script running on the portal's own origin.
+    """
+    u = require(request)          # an anonymous caller must not write files
+    raw = await file.read()
+    if not raw:
+        fail(400, "empty_file")
+    if len(raw) > MAX_IMAGE_BYTES:
+        fail(400, "file_too_large")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in IMAGE_EXTS:
+        fail(400, "unsupported_image_type")
+    stored = uuid.uuid4().hex + ext
+    with open(os.path.join(UPLOAD_DIR, stored), "wb") as fh:
+        fh.write(raw)
+    return ok(url="/files/" + stored, stored=stored,
+              filename=file.filename or stored, size=len(raw), user=u["email"])
+
+
 @app.get("/files/{stored}")
 def get_file(stored: str, request: Request):
+    """Serve an uploaded file, but only to somebody allowed to see it.
+
+    Ticket links travel inside notification mails, and a URL gets forwarded,
+    pasted into chat and left in browser history -- so the link itself is not a
+    credential. An unauthenticated download here would hand out a customer's
+    screenshot or log to anyone holding the URL, walking straight past the
+    ticket's permissions. Files that are not attached to a ticket (the company
+    logo on the login screen) stay public.
+    """
     path = os.path.join(UPLOAD_DIR, stored)
     if not os.path.exists(path):
         fail(404, "not_found")
-    # access control: only if referenced by something user can see (best-effort)
+    c = conn_()
+    row = c.execute("SELECT * FROM attachments WHERE stored_name=?", (stored,)).fetchone()
+    if not row:
+        c.close()
+        return FileResponse(path)          # branding asset: public by design
+    u = require(request)          # 401 for an anonymous caller
+    allowed = False
+    if row["ticket_id"]:
+        t = c.execute("SELECT * FROM tickets WHERE id=?", (row["ticket_id"],)).fetchone()
+        allowed = bool(t) and _ticket_visible(c, t, u)
+    elif row["article_id"]:
+        a = c.execute("SELECT * FROM kb_articles WHERE id=?", (row["article_id"],)).fetchone()
+        # same ladder as the article list itself
+        if a:
+            allowed = _kb_access_ok(c, u, a, rbac.groups_for_user(c, u["id"], u["email"]))
+    c.close()
+    if not allowed:
+        fail(403, "no_permission")
     return FileResponse(path)
 
 
@@ -2537,6 +3043,9 @@ def _loop():
             c = conn_()
             if get_setting(c, "smtp_host"):
                 mailer.receive_once(c)
+            # the nightly (or weekly / monthly) backup rides on this same tick:
+            # one place that has to be alive, and no cron entry to install
+            backup.maybe_run(c)
             c.close()
         except Exception:
             pass

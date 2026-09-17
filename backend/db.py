@@ -198,6 +198,18 @@ CREATE TABLE IF NOT EXISTS captcha_pass (
   expires REAL
 );
 
+-- in-app bell: "a ticket arrived / a customer answered", one row per desk user
+-- so each of them can dismiss it on their own screen
+CREATE TABLE IF NOT EXISTS ticket_alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  ticket_id INTEGER NOT NULL,
+  code TEXT DEFAULT '',
+  kind TEXT DEFAULT 'new',
+  acked INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_msg_ticket ON messages(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ticket_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_article_coll ON kb_articles(collection_id);
@@ -212,6 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_att_article ON attachments(article_id);
 CREATE INDEX IF NOT EXISTS idx_att_msg ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_token_user ON tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_ugr_user ON user_groups_rel(user_id);
+CREATE INDEX IF NOT EXISTS idx_alert_user ON ticket_alerts(user_id, acked);
 """
 
 

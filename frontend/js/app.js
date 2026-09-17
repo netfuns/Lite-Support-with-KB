@@ -219,7 +219,8 @@ function fmtSize(n) {
   n = Number(n) || 0;
   if (n < 1024) return n + " B";
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
-  return (n / (1024 * 1024)).toFixed(1) + " MB";
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
 /**
@@ -292,6 +293,116 @@ function mdToHtml(md) {
   if (inPre) out += "</code></pre>";
   if (listOpen) out += "</ul>";
   return out;
+}
+
+// ---------------------------------------------------------------- markdown
+/** Upload one image (a pasted screenshot / a dropped file) -> its /files URL. */
+async function uploadImage(file) {
+  const fd = new FormData();
+  fd.append("file", file, file.name || "pasted.png");
+  const r = await apiForm("/api/uploads", fd);
+  return r.url;
+}
+
+/** Format bar + image paste/drop for a Markdown textarea.
+ *
+ *  The body of a ticket and of a KB article is Markdown, but a textarea gives
+ *  you no hint of that and no way to insert a screenshot -- so the reader got a
+ *  wall of text with "![](...)" in it. Returns the wrapper to place in the
+ *  layout; `ta` keeps its own identity (callers still read `ta.value`).
+ */
+function mdEditor(ta, opts = {}) {
+  const wrap = h("div", { class: "md-editor" });
+  const bar = h("div", { class: "md-bar" });
+
+  const fire = () => ta.dispatchEvent(new Event("input"));
+
+  function surround(before, after, placeholder) {
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const sel = ta.value.slice(s, e) || placeholder || "";
+    ta.value = ta.value.slice(0, s) + before + sel + after + ta.value.slice(e);
+    ta.focus();
+    ta.selectionStart = s + before.length;
+    ta.selectionEnd = s + before.length + sel.length;
+    fire();
+  }
+
+  function linePrefix(marker) {
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const start = ta.value.lastIndexOf("\n", Math.max(0, s - 1)) + 1;
+    let end = ta.value.indexOf("\n", e);
+    if (end < 0) end = ta.value.length;
+    const lines = ta.value.slice(start, end).split("\n");
+    const out = lines.map((l, i) => marker === "1. " ? (i + 1) + ". " + l : marker + l);
+    ta.value = ta.value.slice(0, start) + out.join("\n") + ta.value.slice(end);
+    ta.focus();
+    ta.selectionStart = start;
+    ta.selectionEnd = start + out.join("\n").length;
+    fire();
+  }
+
+  function insertAtCaret(text) {
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = s + text.length;
+    fire();
+  }
+
+  async function insertImage(file) {
+    try {
+      insertAtCaret("\n![" + (file.name || "image") + "](" + (await uploadImage(file)) + ")\n");
+    } catch (e) { toast(e.message || t("upload_failed"), false); }
+  }
+
+  const btn = (label, title, fn, cls) => h("button", {
+    type: "button", class: "md-btn" + (cls ? " " + cls : ""), title, tabindex: "-1",
+    onclick: ev => { ev.preventDefault(); fn(); } }, label);
+
+  if (opts.bold !== false) bar.append(btn("B", t("md_bold"), () => surround("**", "**", "bold"), "md-b"));
+  if (opts.italic !== false) bar.append(btn("I", t("md_italic"), () => surround("*", "*", "italic"), "md-i"));
+  if (opts.heading !== false) bar.append(btn("H", t("md_heading"), () => linePrefix("## ")));
+  bar.append(btn("•", t("md_list"), () => linePrefix("- ")));
+  bar.append(btn("1.", t("md_olist"), () => linePrefix("1. ")));
+  bar.append(btn("</>", t("md_code"), () => surround("`", "`", "code")));
+  bar.append(btn("🔗", t("md_link"), () => surround("[", "](https://)", t("md_link"))));
+  const imgPick = h("input", { type: "file", accept: "image/*", multiple: true, style: "display:none" });
+  imgPick.addEventListener("change", async () => {
+    for (const f of Array.from(imgPick.files || [])) await insertImage(f);
+    imgPick.value = "";
+  });
+  bar.append(btn(t("md_image"), t("md_image_hint"), () => imgPick.click()));
+  bar.append(imgPick);
+
+  // A screenshot reaches the clipboard as a file, not as text: intercept it,
+  // upload it, and drop the Markdown reference where the caret is.
+  ta.addEventListener("paste", ev => {
+    const items = (ev.clipboardData && ev.clipboardData.items) || [];
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file" && (it.type || "").startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (!files.length) return;
+    ev.preventDefault();
+    (async () => { for (const f of files) await insertImage(f); })();
+  });
+  ta.addEventListener("dragover", ev => { if (ev.dataTransfer) ev.preventDefault(); });
+  ta.addEventListener("drop", ev => {
+    const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || [])
+      .filter(f => (f.type || "").startsWith("image/"));
+    if (!files.length) return;
+    ev.preventDefault();
+    (async () => { for (const f of files) await insertImage(f); })();
+  });
+
+  wrap.append(bar);
+  if (opts.hint !== false) {
+    wrap.append(h("div", { class: "md-hint" }, opts.hintText || t("md_hint")));
+  }
+  return wrap;
 }
 
 // ----------------------------------------------------------------- layout
@@ -416,6 +527,8 @@ async function logout() {
   document.cookie = "rz_token=; Max-Age=0; path=/";
   state.user = null; state.token = null;
   stopIdleWatchdog();
+  stopTicketBell();
+  stopTicketBell();
   window.location.hash = "#/login";
 }
 
@@ -426,6 +539,9 @@ async function logout() {
 // failure, and it pings the server while the user is actually working so that a
 // long form-filling session is not killed by the server-side idle clock.
 const idle = { timer: null, lastActive: 0, lastPing: 0, warnEl: null, counter: null, timeoutMin: 0 };
+// ticket bell state -- declared next to `idle` because api()'s 401 branch tears
+// both down, and a `const` declared further down would be in its TDZ by then
+const bell = { timer: null, box: null };
 
 function markActive() { idle.lastActive = Date.now(); hideIdleWarning(); }
 ["click", "keydown", "mousemove", "wheel", "touchstart"].forEach(
@@ -476,6 +592,7 @@ async function checkIdle() {
 
 function signOutExpired() {
   stopIdleWatchdog();
+  stopTicketBell();
   document.cookie = "rz_token=; Max-Age=0; path=/";
   state.user = null; state.token = null; state.me_perms = new Set();
   if (window.location.hash !== "#/login") window.location.hash = "#/login";
@@ -496,6 +613,89 @@ function stopIdleWatchdog() {
   if (idle.timer) { clearInterval(idle.timer); idle.timer = null; }
   idle.timeoutMin = 0;
   hideIdleWarning();
+}
+
+// ----------------------------------------------------------------- ticket bell
+// A ticket that arrives by e-mail must not wait for somebody to reload the
+// page. The desk gets a bubble naming the code; it stays until somebody
+// confirms it, so an answer nobody reacted to is still waiting tomorrow.
+function startTicketBell() {
+  stopTicketBell();
+  if (!state.user || !hasPerm("ticket.view_all")) return;
+  bell.timer = setInterval(pollTicketAlerts, 30000);
+  pollTicketAlerts();
+}
+
+function stopTicketBell() {
+  if (bell.timer) { clearInterval(bell.timer); bell.timer = null; }
+  if (bell.box) { bell.box.remove(); bell.box = null; }
+}
+
+async function pollTicketAlerts() {
+  if (!state.user) return;
+  try {
+    const r = await api("/api/me/alerts", { noRedirect: true });
+    const items = r.items || [];
+    if (!items.length) {
+      if (bell.box) { bell.box.remove(); bell.box = null; }
+      return;
+    }
+    showTicketBubble(items);
+  } catch (e) {
+    /* offline or session gone: the next tick tries again */
+  }
+}
+
+function showTicketBubble(items) {
+  if (bell.box) bell.box.remove();
+  // Every row is the way into its ticket: naming a ticket in a bubble and then
+  // making the reader hunt for it in the list defeats the point of the bubble.
+  // Clicking it also clears that one alert -- the other rows stay, because they
+  // are still unanswered.
+  const rows = items.map(a => {
+    const kind = a.kind === "customer_reply" ? t("bell_new_reply") : t("bell_new_ticket");
+    const go = async ev => {
+      if (ev) ev.preventDefault();
+      try {
+        await api("/api/me/alerts/ack", {
+          method: "POST", body: JSON.stringify({ ids: [a.id] }) });
+      } catch (e) { /* acking is bookkeeping */ }
+      if (bell.box) { bell.box.remove(); bell.box = null; }
+      if (!a.ticket_id) return;
+      const want = "#/ticket/" + a.ticket_id;
+      if (window.location.hash === want) render();
+      else window.location.hash = want;
+    };
+    if (!a.ticket_id) {
+      return h("div", { class: "bell-row" },
+        h("span", { class: "bell-code" }, a.code || ""),
+        h("span", { class: "bell-kind" }, kind),
+        h("span", { class: "bell-title" }, a.title || ""));
+    }
+    return h("a", { class: "bell-row bell-go", href: "#/ticket/" + a.ticket_id, onclick: go },
+      h("span", { class: "bell-code" }, a.code || ""),
+      h("span", { class: "bell-kind" }, kind),
+      h("span", { class: "bell-title" }, a.title || ""));
+  });
+  const btn = h("button", { class: "btn btn-blue btn-sm", onclick: async () => {
+    btn.disabled = true;
+    try {
+      await api("/api/me/alerts/ack", {
+        method: "POST",
+        body: JSON.stringify({ ids: items.map(a => a.id) }) });
+    } catch (e) { /* acking is bookkeeping: never trap the user behind it */ }
+    if (bell.box) { bell.box.remove(); bell.box = null; }
+    // the queue behind the bubble has changed -- let it show
+    if ((window.location.hash || "").indexOf("#/tickets") === 0) {
+      window.location.hash = "#/dashboard";
+      window.location.hash = "#/tickets";
+    }
+  } }, t("confirm"));
+  bell.box = h("div", { class: "bell" },
+    h("div", { class: "bell-head" }, t("bell_title")),
+    h("div", { class: "bell-list" }, rows),
+    h("div", { class: "bell-foot" }, btn));
+  document.body.append(bell.box);
 }
 
 function navLink(href, label) {
@@ -571,6 +771,7 @@ async function render() {
     const map = { users: adminUsers, roles: adminRoles, groups: adminGroups,
                   settings: adminSettings, site: adminSite, welcome: adminWelcome,
                   company: adminCompany, domains: adminDomains,
+                  templates: adminTemplates, backup: adminBackup,
                   internal_domains: adminInternalDomains };
     view = (map[sub] || adminUsers)();
   } else view = state.user ? dashboardView() : homeView();
@@ -659,6 +860,7 @@ function loginView() {
     state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
     applyTheme(state.meta.theme);
     startIdleWatchdog();
+    startTicketBell();
     window.location.hash = "#/dashboard";
   }
   const body = h("div", { style: "max-width:380px;margin:60px auto" },
@@ -883,7 +1085,52 @@ async function ticketsView() {
   return { title: "", body };
 }
 
-const KB_VIS = ["public", "registered", "internal"];
+const KB_VIS = ["public", "registered", "internal", "usergroup"];
+
+/**
+ * "Who may read this article" — the visibility select plus the group list that
+ * "usergroup" reveals. Every place that picks a knowledge-base audience (close,
+ * share, the KB editor) uses this, so the question is asked the same way and a
+ * usergroup article can never be saved with an empty audience.
+ *
+ * Returns { el, value(), groups() }; groups() is [] unless "usergroup" is on.
+ */
+function visPicker(opts) {
+  const o = opts || {};
+  const sel = h("select", { style: "width:100%" }, KB_VIS.map(v =>
+    h("option", { value: v, selected: (o.value || "registered") === v ? "selected" : null }, t(v))));
+  const picked = new Set((o.groupIds || []).map(Number).filter(n => !isNaN(n)));
+  const box = h("div", { style: "max-height:170px;overflow:auto;border:1px solid var(--line,#e4e7eb);"
+    + "border-radius:6px;padding:6px 8px;margin-top:6px" },
+    h("span", { class: "muted", style: "font-size:13px" }, t("loading")));
+
+  function render(items) {
+    box.innerHTML = "";
+    // the internal group is implicit: the desk always reads the knowledge base
+    const list = (items || []).filter(g => g.kind !== "internal");
+    if (!list.length) {
+      box.append(h("span", { class: "muted", style: "font-size:13px" }, t("no_group_options")));
+      return;
+    }
+    for (const g of list) {
+      box.append(h("label", { class: "muted", style: "display:block;font-size:13px;margin:2px 0" },
+        h("input", { type: "checkbox", checked: picked.has(Number(g.id)) ? "checked" : null,
+          onchange: e => { e.target.checked ? picked.add(Number(g.id)) : picked.delete(Number(g.id)); } }),
+        " " + (g.label || g.name || "")));
+    }
+  }
+  // fetched here rather than by the caller so every dialog can stay synchronous
+  api("/api/kb/groups").then(r => render(r.items)).catch(() => render([]));
+
+  const el = h("div", { style: "margin-top:12px" },
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("kb_visibility")), sel),
+    h("div", {}, box,
+      h("div", { class: "muted", style: "font-size:12px" }, t("kb_group_hint"))));
+  const sync = () => { box.style.display = sel.value === "usergroup" ? "" : "none"; };
+  sel.addEventListener("change", sync);
+  sync();
+  return { el: el, value: () => sel.value, groups: () => (sel.value === "usergroup" ? [...picked] : []) };
+}
 
 /**
  * Closing a ticket asks a single question: does this solution go to the
@@ -892,8 +1139,7 @@ const KB_VIS = ["public", "registered", "internal"];
  */
 function openCloseDialog(T, internal, onConfirm) {
   const desChk = h("input", { type: "checkbox", checked: true, style: "margin-top:3px" });
-  const visSel = h("select", {}, KB_VIS.map(v =>
-    h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
+  const vis = internal ? visPicker({ value: "registered" }) : null;
   const body = h("div", {},
     h("p", {}, t("close_share_prompt")),
     h("label", { style: "display:flex;gap:8px;align-items:flex-start;margin:12px 0" },
@@ -902,28 +1148,38 @@ function openCloseDialog(T, internal, onConfirm) {
         h("div", { class: "muted", style: "font-size:12px;margin-top:2px" }, t("share_desensitized_hint")))),
     h("div", { class: "muted", style: "font-size:12px;border-left:3px solid var(--line,#e4e7eb);padding-left:8px" },
       t("share_raw_hint")),
-    internal ? h("label", { class: "field", style: "margin-top:12px" },
-      h("span", { class: "muted" }, t("kb_visibility")), visSel) : null,
+    vis ? vis.el : null,
     h("div", { class: "flex-between", style: "margin-top:16px;gap:8px" },
       h("button", { class: "btn btn-ghost", onclick: () => { closeModal(); onConfirm({ share: 0 }); } },
         t("close_without_share")),
       h("button", { class: "btn btn-blue", onclick: () => {
+        const v = vis ? vis.value() : "registered";
+        const g = vis ? vis.groups() : [];
+        if (v === "usergroup" && !g.length) { toast(t("kb_group_required"), false); return; }
         closeModal();
         onConfirm({ share: 1, desensitize: desChk.checked ? 1 : 0,
-                    visibility: visSel.value });
+                    visibility: v, group_ids: g });
       } }, t("close_and_share"))));
   showModal(t("close_ticket"), body);
 }
 
-/** The desk publishing a thread by hand, with the audience it should reach. */
+/**
+ * The desk publishing a thread by hand. Sharing closes the ticket — a thread
+ * only becomes knowledge once it is finished — so the dialog says so up front
+ * instead of letting the status change surprise anybody.
+ */
 function openShareDialog(T, onConfirm) {
+  const alreadyClosed = T && T.status === "closed";
   const desChk = h("input", { type: "checkbox", checked: true, style: "margin-top:3px" });
-  const visSel = h("select", {}, KB_VIS.map(v =>
-    h("option", { value: v, selected: v === "registered" ? "selected" : null }, t(v))));
+  const vis = visPicker({ value: "registered" });
   const body = h("div", {},
     h("p", {}, t("share_kb_prompt")),
-    h("label", { class: "field", style: "margin-top:10px" },
-      h("span", { class: "muted" }, t("kb_visibility")), visSel),
+    alreadyClosed
+      ? h("p", { class: "muted" }, t("share_kb_closed_note"))
+      : h("div", { style: "border-left:3px solid #dc2626;padding-left:10px;margin:10px 0;"
+          + "background:#fef2f2;border-radius:4px;padding:8px 10px" },
+          h("b", { style: "color:#b91c1c" }, "⚠ " + t("share_kb_will_close"))),
+    vis.el,
     h("label", { style: "display:flex;gap:8px;align-items:flex-start;margin:12px 0" },
       desChk,
       h("span", {}, h("b", {}, t("share_desensitized")),
@@ -932,9 +1188,12 @@ function openShareDialog(T, onConfirm) {
     h("div", { class: "flex-between", style: "margin-top:16px;gap:8px" },
       h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel")),
       h("button", { class: "btn btn-blue", onclick: () => {
+        const v = vis.value();
+        const g = vis.groups();
+        if (v === "usergroup" && !g.length) { toast(t("kb_group_required"), false); return; }
         closeModal();
-        onConfirm({ visibility: visSel.value, desensitize: desChk.checked ? 1 : 0 });
-      } }, t("save_and_share"))));
+        onConfirm({ visibility: v, desensitize: desChk.checked ? 1 : 0, group_ids: g });
+      } }, alreadyClosed ? t("save_and_share") : t("share_and_close"))));
   showModal(t("share_to_kb"), body);
 }
 
@@ -1010,7 +1269,8 @@ async function ticketDetail(id) {
     // the desk closing a ticket is asked the same sharing question
     if (st === "closed") {
       openCloseDialog(T, true, r => sendStatus(Object.assign({ status: st },
-        r.share ? { share_kb: 1, kb_desensitize: r.desensitize, kb_visibility: r.visibility }
+        r.share ? { share_kb: 1, kb_desensitize: r.desensitize, kb_visibility: r.visibility,
+                    kb_group_ids: r.group_ids }
                 : { share_kb: 0 })));
     } else sendStatus({ status: st });
   } }, "Update " + t("status"));
@@ -1021,21 +1281,26 @@ async function ticketDetail(id) {
     openCloseDialog(T, internal, async r => {
       try {
         await api("/api/tickets/" + id + "/close", { method: "POST", body: JSON.stringify(
-          r.share ? { share_kb: 1, kb_desensitize: r.desensitize, kb_visibility: r.visibility }
+          r.share ? { share_kb: 1, kb_desensitize: r.desensitize, kb_visibility: r.visibility,
+                      kb_group_ids: r.group_ids }
                   : { share_kb: 0 }) });
         toast(r.share ? t("share_saved") : "OK"); setTimeout(() => render(), 600);
       } catch (e) { toast(e.message, false); }
     });
   } }, t("close_ticket"));
 
-  // The desk may publish a thread at any time -- open or closed -- and picks
-  // the audience that will be able to search it.
+  // The desk may publish a thread at any time. Sharing now closes the ticket
+  // (a thread is knowledge once it is finished), so the dialog says so first.
   const shareBtn = internal ? h("button", { class: "btn btn-ghost", onclick: () => {
     openShareDialog(T, async r => {
       try {
         const res = await api("/api/tickets/" + id + "/share_kb", { method: "POST", body: JSON.stringify(r) });
-        toast(t("share_saved") + " · #" + res.article_id); setTimeout(() => render(), 600);
-      } catch (e) { toast(e.message, false); }
+        toast(t("share_saved") + " · #" + res.article_id
+              + (res.closed && T.status !== "closed" ? " · " + t("st_closed") : ""));
+        setTimeout(() => render(), 600);
+      } catch (e) {
+        toast(e.message === "kb_group_required" ? t("kb_group_required") : e.message, false);
+      }
     });
   } }, t("share_to_kb")) : null;
 
@@ -1044,7 +1309,7 @@ async function ticketDetail(id) {
         t("shared_to_kb") + " ↗")
     : null;
 
-  // reply box
+  // reply box -- Markdown, with a format bar and image paste
   const msgInp = h("textarea", { rows: 3, placeholder: t("reply") + "…" });
   const intChk = h("input", { type: "checkbox" });
   const fileInp = h("input", { type: "file", multiple: true });
@@ -1068,7 +1333,7 @@ async function ticketDetail(id) {
           h("span", { class: "muted" }, "  " + m.created_at),
           m.internal ? h("span", { class: "tag medium", style: "margin-left:8px" }, "internal") : null),
         null),
-      h("div", { style: "white-space:pre-wrap;margin-top:8px" }, m.body || ""),
+      h("div", { class: "markdown", style: "margin-top:8px", innerHTML: mdToHtml(m.body || "") }),
       attachmentList(m.attachments)));
   }));
 
@@ -1096,7 +1361,7 @@ async function ticketDetail(id) {
           (can.reply && internal) ? h("label", { class: "muted" }, intChk, t("internal")) : null),
         msgs2,
         can.reply ? h("div", { class: "card-body", style: "background:var(--card)" },
-          h("div", {}, msgInp, fileInp),
+          h("div", {}, mdEditor(msgInp), fileInp),
           h("div", { class: "flex-between", style: "margin-top:8px" },
             h("span", { class: "muted" }, internal ? (t("reply") + " · " + t("internal")) : t("reply")),
             replyBtn)) : null))));
@@ -1120,11 +1385,47 @@ async function newTicketView() {
   const CUST_GROUP_RE = /^(?:Customer-|客户组[:：]|客户[:：])/;
   const ownCustomers = (state.user.groups || [])
     .filter(g => CUST_GROUP_RE.test(g)).map(g => g.replace(CUST_GROUP_RE, ""));
-  const custField = isStaff
-    ? h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")), custWrap)
-    : h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")),
+
+  // ---- 代理商: an agent files either for one of the customers it serves or for
+  // its own agency. The choice is a radio + a single-select fuzzy picker over the
+  // agent's own customers only (the server sends the list, and re-checks it).
+  const myCusts = (state.user.partner_customers || []);
+  const isAgent = !isStaff && (state.user.is_partner || myCusts.length > 0);
+  const agentFor = { mode: "customer", name: "" };
+  let agentNameInp = null;
+  let custField;
+  if (isStaff) {
+    custField = h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")), custWrap);
+  } else if (isAgent) {
+    const hitName = h("input", { placeholder: t("agent_customer_ph"), style: "width:100%" });
+    agentNameInp = hitName;
+    const custWrap2 = attachSuggest(hitName, async val => {
+      const q = (val || "").trim().toLowerCase();
+      return myCusts.filter(c => !q || (c.name || "").toLowerCase().includes(q))
+                   .map(c => ({ ...c, label: c.name }));
+    }, c => { if (c && c.name) { hitName.value = c.name; agentFor.name = c.name; } });
+    const rCustomer = h("input", { type: "radio", name: "agent-for", checked: "checked" });
+    const rSelf = h("input", { type: "radio", name: "agent-for" });
+    const custLine = h("div", {},
+      custWrap2,
+      myCusts.length ? null
+        : h("div", { class: "muted", style: "font-size:12px" }, t("agent_no_customers")));
+    function syncAgentMode() {
+      agentFor.mode = rSelf.checked ? "self" : "customer";
+      custLine.style.display = agentFor.mode === "self" ? "none" : "";
+    }
+    rSelf.addEventListener("change", syncAgentMode);
+    rCustomer.addEventListener("change", syncAgentMode);
+    custField = h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")),
+      h("label", { class: "muted", style: "margin-right:14px" }, rCustomer, " " + t("agent_for_customer")),
+      h("label", { class: "muted" }, rSelf, " " + t("agent_for_self")),
+      custLine,
+      h("div", { class: "muted", style: "font-size:12px" }, t("agent_pick_hint")));
+  } else {
+    custField = h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")),
         h("input", { value: ownCustomers.join(", ") || "-", disabled: true }),
         h("div", { class: "muted", style: "font-size:12px" }, t("customer_locked_hint")));
+  }
 
   const modules = (state.modules && state.modules.length) ? state.modules : (state.products || []);
   const prodSel = h("select", { style: "width:100%" },
@@ -1140,6 +1441,30 @@ async function newTicketView() {
   const intChk = h("input", { type: "checkbox" });
   const fileInp = h("input", { type: "file", multiple: true });
 
+  // ---- 收件人: who gets told about this ticket. Fuzzy picker, multi-select;
+  // the server already hides users the caller has no business seeing, so a
+  // customer only ever finds his own colleagues here.
+  const recipients = new Set();
+  if (state.user && state.user.email) recipients.add(state.user.email);
+  const recipInp = h("input", { placeholder: t("recipients_ph"), style: "width:100%" });
+  const recipChips = h("div", { class: "chips" });
+  function renderChips() {
+    recipChips.innerHTML = "";
+    for (const m of recipients) {
+      recipChips.append(h("span", { class: "chip" }, m,
+        h("button", { class: "chip-x", title: t("remove"),
+          onclick: () => { recipients.delete(m); renderChips(); } }, "×")));
+    }
+  }
+  const recipWrap = attachSuggest(recipInp, async val => {
+    const r = await api("/api/users?q=" + encodeURIComponent(val));
+    return (r.items || []).map(x => ({
+      ...x, label: ((x.display_name || "") + "  <" + x.email + ">").trim() }));
+  }, x => {
+    if (x && x.email) { recipients.add(x.email); recipInp.value = ""; renderChips(); }
+  });
+  renderChips();
+
   const body = h("div", {},
     h("h1", {}, t("new_ticket")),
     h("div", { class: "card" }, h("div", { class: "card-body" },
@@ -1151,20 +1476,31 @@ async function newTicketView() {
           h("label", { class: "field" }, h("span", { class: "muted" }, t("deploy_type")), depSel),
           h("label", { class: "field" }, h("span", { class: "muted" }, t("version")), verInp),
           h("label", { class: "field" }, h("span", { class: "muted" }, t("select_priority")), prioSel)),
-        h("label", { class: "field" }, h("span", { class: "muted" }, t("desc")), desc),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("desc")), mdEditor(desc)),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("recipients")),
+          recipWrap, recipChips,
+          h("div", { class: "muted", style: "font-size:12px" }, t("recipients_hint"))),
         h("div", { style: "margin:8px 0" },
           isStaff ? h("label", { class: "muted" }, intChk, " " + t("internal")) : null, fileInp),
         h("div", { style: "margin-top:10px" },
           h("button", { class: "btn btn-blue", onclick: async () => {
             if (!title.value) { toast(t("title") + " *", false); return; }
+            // an agent must say who the ticket is for before it can be filed
+            let custOut = custInp.value;
+            if (isAgent) {
+              custOut = agentFor.mode === "self" ? ""
+                : (agentFor.name || (agentNameInp && agentNameInp.value) || "").trim();
+              if (agentFor.mode !== "self" && !custOut) { toast(t("agent_customer_ph"), false); return; }
+            }
             const fd = new FormData();
             fd.set("title", title.value);
-            fd.set("customer_name", custInp.value);
+            fd.set("customer_name", custOut);
             fd.set("product", prodSel.value);
             fd.set("deploy_type", depSel.value);
             fd.set("version", verInp.value);
             fd.set("priority", prioSel.value);
             fd.set("description", desc.value);
+            fd.set("recipients", [...recipients].join(","));
             if (intChk.checked) fd.set("internal", "1");
             for (const f of fileInp.files) fd.append("files", f);
             try {
@@ -1278,8 +1614,11 @@ async function kbEditorPage(id) {
   const autoGrow = () => { bodyTa.style.height = "auto"; bodyTa.style.height = Math.max(340, bodyTa.scrollHeight + 24) + "px"; };
   bodyTa.addEventListener("input", autoGrow);
 
-  const visSel = h("select", { style: "width:100%" },
-    ["public", "registered", "internal"].map(v => h("option", { value: v, selected: (art ? art.visibility : "registered") === v ? "selected" : null }, t(v))));
+  // visibility + (for "usergroup") the groups that may read it. Without the
+  // picker here, a usergroup article shared from a ticket would silently fall
+  // back to "public" the first time somebody opened and saved it.
+  const vis = visPicker({ value: art ? art.visibility : "registered",
+                          groupIds: art ? (art.group_ids || []) : [] });
   const modules = (state.modules && state.modules.length) ? state.modules : [];
   const modSel = h("select", { style: "width:100%" },
     h("option", { value: "" }, "- " + t("module") + " -"),
@@ -1291,8 +1630,10 @@ async function kbEditorPage(id) {
         h("a", { class: "btn btn-ghost btn-sm", href: id ? "#/kb/" + id : "#/kb" }, t("back")),
         h("button", { class: "btn btn-blue btn-sm", style: "margin-left:8px", onclick: async () => {
           if (!title.value.trim()) { toast(t("kb_title") + " *", false); return; }
-          const payload = { title: title.value, body: bodyTa.value, visibility: visSel.value,
-                            module: modSel.value };
+          const vv = vis.value(), vg = vis.groups();
+          if (vv === "usergroup" && !vg.length) { toast(t("kb_group_required"), false); return; }
+          const payload = { title: title.value, body: bodyTa.value, visibility: vv,
+                            module: modSel.value, group_ids: vg };
           try {
             if (id) await api("/api/kb/articles/" + id, { method: "PUT", body: JSON.stringify(payload) });
             else { const r = await api("/api/kb/articles", { method: "POST", body: JSON.stringify(payload) }); id = r.id; }
@@ -1302,9 +1643,9 @@ async function kbEditorPage(id) {
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("label", { class: "field" }, h("span", { class: "muted" }, t("kb_title")), title),
       h("div", { class: "grid-2" },
-        h("label", { class: "field" }, h("span", { class: "muted" }, t("visibility")), visSel),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("visibility")), vis.el),
         h("label", { class: "field" }, h("span", { class: "muted" }, t("module")), modSel)),
-      h("label", { class: "field" }, h("span", { class: "muted" }, t("kb_body")), bodyTa))));
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("kb_body")), mdEditor(bodyTa)))));
   setTimeout(autoGrow, 0);
   return { title: "", body };
 }
@@ -1647,13 +1988,69 @@ async function partnersView() {
   return { title: "", body };
 }
 
-/** Create / edit one partner. Name + domains are mandatory, exactly like a customer. */
+/** Create / edit one partner. Name + domains are mandatory, exactly like a customer.
+
+ *  "Customers served" is editable: the link lives on the customer row
+ *  (customers.partner_id), so ticking a customer here points it at this partner
+ *  and unticking releases it. The picker is a multi-select with fuzzy matching
+ *  over the customer book.
+ */
 function openPartnerEditor(p, onDone) {
   const isNew = !p;
   const name = h("input", { value: p ? (p.name || "") : "", placeholder: t("partner_name") });
   const domains = h("input", { value: p ? (p.domains || "") : "", placeholder: t("domains") });
   const contact = h("input", { type: "email", value: p ? (p.contact_email || "") : "", placeholder: t("contact_email") });
   const desc = h("input", { value: p ? (p.description || "") : "", placeholder: t("group_desc") });
+
+  // may the viewer change the served-customer list? adding a partner needs
+  // partner.create, editing one needs partner.edit -- same door as the rest
+  const canEditCustomers = isNew ? hasPerm("partner.create") : hasPerm("partner.edit");
+  const picked = new Map();                      // customer id -> name
+  if (p) {
+    const ids = p.customer_ids || [];
+    const names = p.customers || [];
+    // a payload from an older build may carry names only -- fold them together
+    ids.forEach((id, i) => picked.set(Number(id), names[i] || String(id)));
+    names.forEach((n, i) => { if (ids[i] == null) picked.set("name:" + n, n); });
+  }
+
+  const chips = h("div", { class: "chips" });
+  const custH3 = h("h3", {}, t("partner_customers"));
+  function renderChips() {
+    custH3.textContent = t("partner_customers") + " (" + picked.size + ")";
+    chips.innerHTML = "";
+    if (!picked.size) {
+      chips.append(h("span", { class: "muted", style: "font-size:13px" }, t("partner_no_customers")));
+      return;
+    }
+    for (const [key, nm] of picked) {
+      chips.append(h("span", { class: "chip" }, nm,
+        canEditCustomers ? h("button", { class: "chip-x", title: t("remove"),
+          onclick: () => { picked.delete(key); renderChips(); } }, "×") : null));
+    }
+  }
+  renderChips();
+
+  let custPicker = null;
+  if (canEditCustomers) {
+    const inp = h("input", { placeholder: t("partner_add_customer_ph"), style: "width:100%" });
+    const wrap = attachSuggest(inp, async val => {
+      const r = await api("/api/customers?q=" + encodeURIComponent(val));
+      return (r.items || []).map(c => ({ ...c, label: c.name + (c.domains ? "  <" + c.domains + ">" : "") }));
+    }, c => {
+      if (!c || c.id == null) return;
+      picked.set(Number(c.id), c.name);
+      inp.value = ""; renderChips();
+    });
+    custPicker = h("div", { class: "mb-2" }, wrap,
+      h("div", { class: "muted", style: "font-size:12px" }, t("partner_customers_hint")));
+  }
+
+  const custCard = h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+    custH3,
+    custPicker,
+    chips,
+    h("p", { class: "muted", style: "font-size:13px" }, t("auto_by_partner"))));
 
   const body = h("div", { class: "page" },
     h("div", { class: "grid-2" },
@@ -1663,18 +2060,17 @@ function openPartnerEditor(p, onDone) {
       h("label", { class: "field" }, h("span", { class: "muted" }, t("contact_email")), contact),
       h("label", { class: "field" }, h("span", { class: "muted" }, t("group_desc")), desc)),
     h("p", { class: "muted", style: "font-size:13px" }, t("partner_hint")),
-    p ? h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
-      h("h3", {}, t("partner_customers") + " (" + (p.customer_count || 0) + ")"),
-      (p.customers || []).length
-        ? h("p", { class: "muted" }, p.customers.join(", "))
-        : h("p", { class: "muted" }, t("no_results")),
-      h("p", { class: "muted", style: "font-size:13px" }, t("auto_by_partner")))) : null,
+    custCard,
     h("div", { class: "flex-between mt-2" },
       h("button", { class: "btn btn-blue", onclick: async () => {
         if (!name.value.trim()) { toast(t("name") + " *", false); return; }
         if (!domains.value.trim()) { toast(t("name") + " / " + t("domains") + " *", false); return; }
         const payload = { name: name.value.trim(), domains: domains.value.trim(),
                           contact_email: contact.value, description: desc.value };
+        if (canEditCustomers) {
+          // numeric ids only -- a name-fallback chip resolves server-side by name
+          payload.customers = [...picked.keys()].map(k => String(k).startsWith("name:") ? k.slice(5) : k);
+        }
         try {
           if (isNew) await api("/api/partners", { method: "POST", body: JSON.stringify(payload) });
           else await api("/api/partners/" + p.id, { method: "PUT", body: JSON.stringify(payload) });
@@ -2226,6 +2622,11 @@ async function adminSite() {
   const themeSel = h("select", {},
     [["light", t("theme_light")], ["dark", t("theme_dark")], ["system", t("theme_system")]]
       .map(([v, label]) => h("option", { value: v, selected: (s.theme || "light") === v ? "selected" : null }, label)));
+  // Where the portal lives on the internet. The links inside notification mails
+  // are built from Settings > Mail > Public URL, or from this one, or from this
+  // host's IP -- so a site with no public host name yet still gets a link.
+  const urlInp = h("input", { value: s.site_url || "", placeholder: "https://support.example.com",
+    style: "width:100%;box-sizing:border-box" });
 
   const body = h("div", { class: "page-narrow" },
     settingsTabs("site"),
@@ -2254,6 +2655,10 @@ async function adminSite() {
     // Internal domains now live on their own settings page; this page keeps a
     // pointer so the old entry point is not a dead end.
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("portal_address")),
+      h("p", { class: "muted" }, t("portal_address_hint")),
+      urlInp)),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
       h("h3", {}, t("internal_domains")),
       h("p", { class: "muted" }, t("internal_domains_hint")),
       h("a", { class: "btn btn-ghost btn-sm", href: "#/admin/internal_domains" },
@@ -2263,6 +2668,7 @@ async function adminSite() {
         try {
           await api("/api/admin/site", { method: "POST", body: JSON.stringify({
             modules,
+            site_url: urlInp.value,
             session_timeout: Number(timeoutInp.value || 0),
             session_max_lifetime: Number(maxLifeInp.value || 0),
             theme: themeSel.value }) });
@@ -2287,6 +2693,8 @@ function settingsTabs(active) {
     ["internal_domains", "internal_domains"],
     ["domains", "bind_domains"],
     ["settings", "mail_settings"],
+    ["templates", "mail_templates"],
+    ["backup", "backup"],
   ];
   return h("div", { class: "tabs" },
     tabs.map(([key, label]) => h("a", {
@@ -2325,7 +2733,7 @@ async function adminWelcome() {
           } catch (e) { toast(e.message, false); }
         } }, t("save")))),
     h("p", { class: "muted" }, t("welcome_page_hint")),
-    h("div", { class: "card mb-2" }, h("div", { class: "card-body" }, ta)),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" }, mdEditor(ta))),
     h("h3", {}, t("welcome_preview")),
     preview);
   return { title: "", body };
@@ -2607,6 +3015,197 @@ async function adminSettings() {
   setTimeout(syncProv, 0);
   return { title: "", body };
 }
+/** Settings > Mail templates: replace the two built-in notification mails.
+ *
+ *  Until a template is filled in the portal sends its own wording, so an empty
+ *  page changes nothing. Once a subject or a body is saved it is used instead,
+ *  which is what lets an operator put the wording in his own language (or add
+ *  the internal ticket queue, the SLA line, ...) without a code change.
+ */
+async function adminTemplates() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  const s = await loadSiteSettings();
+  if (!s) return noAccess();
+  const vars = s.tpl_vars || ["company", "code", "title", "url", "portal", "customer", "email", "password"];
+  const parse = raw => {
+    try {
+      const d = JSON.parse(raw || "");
+      return (d && typeof d === "object") ? d : { subject: "", body: String(raw || "") };
+    } catch (e) { return { subject: "", body: String(raw || "") }; }
+  };
+  const varHint = h("div", { class: "tpl-vars" }, vars.map(v => h("code", {}, "{{" + v + "}}")));
+
+  function card(key, titleKey, descKey) {
+    const cur = parse(s[key]);
+    const subj = h("input", { value: cur.subject || "", placeholder: t("tpl_subject_ph"),
+      class: "full", style: "width:100%;box-sizing:border-box" });
+    const bodyTa = h("textarea", { rows: 10, class: "kb-editor-body", placeholder: t("tpl_body_ph") });
+    bodyTa.value = cur.body || "";
+    const save = async payload => {
+      try {
+        await api("/api/admin/site", { method: "POST", body: JSON.stringify({ [key]: payload }) });
+        toast(t("saved"));
+        render();
+      } catch (e) { toast(e.message, false); }
+    };
+    return h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t(titleKey)),
+      h("p", { class: "muted" }, t(descKey)),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("tpl_subject")), subj),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("tpl_body")), mdEditor(bodyTa)),
+      h("div", { style: "margin-top:8px" }, varHint),
+      h("div", { style: "display:flex;gap:8px;margin-top:12px" },
+        h("button", { class: "btn btn-blue", onclick: () => save({ subject: subj.value, body: bodyTa.value }) }, t("save")),
+        h("button", { class: "btn btn-ghost", onclick: () => {
+          if (!confirm(t("tpl_reset_confirm"))) return;
+          save({ subject: "", body: "" });
+        } }, t("tpl_reset")))));
+  }
+
+  const body = h("div", { class: "page" },
+    settingsTabs("templates"),
+    h("h1", {}, t("mail_templates")),
+    h("p", { class: "muted" }, t("mail_templates_hint")),
+    card("tpl_new_ticket", "tpl_new_ticket", "tpl_new_ticket_hint"),
+    card("tpl_new_user", "tpl_new_user", "tpl_new_user_hint"),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("h3", {}, t("tpl_vars_title")),
+      h("p", { class: "muted" }, t("tpl_vars_hint")),
+      varHint.cloneNode(true))));
+  return { title: "", body };
+}
+/** Settings > Backup: when to snapshot, where to keep it, and how to come back.
+ *
+ *  One archive holds the whole portal (database + uploads), so restoring it on
+ *  a freshly deployed instance brings every account, ticket and article back.
+ */
+async function adminBackup() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  let s;
+  try { s = await api("/api/admin/backup"); } catch (e) { return noAccess(); }
+  const cfg = s.config || {};
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  const enChk = h("input", { type: "checkbox", checked: cfg.enabled ? "checked" : null });
+  const dirInp = h("input", { value: cfg.dir || "", style: "width:100%;box-sizing:border-box" });
+  const freqSel = h("select", {}, ["daily", "weekly", "monthly"].map(v =>
+    h("option", { value: v, selected: cfg.freq === v ? "selected" : null },
+      t("freq_" + v) + " · " + t("freq_" + v + "_hint"))));
+  const timeInp = h("input", { type: "time", value: cfg.time || "02:30", style: "width:140px" });
+  const keepInp = h("input", { type: "number", min: 1, max: 365, value: String(cfg.keep || 14), style: "width:110px" });
+
+  const save = async () => {
+    try {
+      await api("/api/admin/backup", { method: "POST", body: JSON.stringify({
+        backup_enabled: enChk.checked, backup_dir: dirInp.value,
+        backup_freq: freqSel.value, backup_time: timeInp.value,
+        backup_keep: Number(keepInp.value || 14) }) });
+      toast(t("saved"));
+      render();
+    } catch (e) { toast(e.message, false); }
+  };
+  const runNow = async ev => {
+    ev.target.disabled = true;
+    try {
+      const r = await api("/api/admin/backup/run", { method: "POST" });
+      if (!r.ok) { toast(r.error || t("backup_failed"), false); }
+      else { toast(t("backup_done") + " · " + r.file + " · " + fmtSize(r.size)); }
+      render();
+    } catch (e) { toast(e.message, false); ev.target.disabled = false; }
+  };
+
+  // ---- restore: the destination of an archive, whether it sits on the server
+  // or is uploaded from the operator's own machine
+  const restoreFile = h("input", { type: "file", accept: ".gz,.tgz,application/gzip" });
+  async function restore(fd) {
+    if (String(prompt(t("backup_restore_confirm")) || "").trim().toUpperCase() !== "RESTORE") return;
+    try {
+      const r = await apiForm("/api/admin/backup/restore", fd);
+      toast(t("backup_restoring") + " · " + (r.counts ? JSON.stringify(r.counts) : ""));
+      // the service swaps the files, then exits so systemd restarts it: wait
+      // for it to go down and come back before reloading onto the new data
+      let down = false;
+      for (let i = 0; i < 45; i++) {
+        await sleep(1000);
+        let up = false;
+        try { const r2 = await fetch("/health", { cache: "no-store" }); up = r2.ok; } catch (e) { up = false; }
+        if (!up) down = true;
+        if (down && up) { window.location.reload(); return; }
+      }
+      window.location.reload();
+    } catch (e) { toast(e.message, false); }
+  }
+  const restoreBtn = h("button", { class: "btn btn-blue", onclick: () => {
+    if (!restoreFile.files.length) { toast(t("backup_restore_pick"), false); return; }
+    const fd = new FormData();
+    fd.set("confirm", "RESTORE");
+    fd.append("file", restoreFile.files[0]);
+    restore(fd);
+  } }, t("backup_restore"));
+
+  const rows = (s.items || []).map(it => h("tr", {},
+    h("td", {}, it.name, it.legacy ? h("span", { class: "tag medium", style: "margin-left:6px" }, t("legacy")) : null),
+    h("td", {}, fmtSize(it.size)),
+    h("td", {}, it.mtime),
+    h("td", {},
+      h("a", { class: "btn btn-ghost btn-sm",
+        href: "/api/admin/backup/download?name=" + encodeURIComponent(it.name) }, t("backup_download")),
+      h("button", { class: "btn btn-ghost btn-sm", style: "margin-left:6px", onclick: () => {
+        if (!confirm(t("backup_restore_confirm"))) return;
+        const fd = new FormData();
+        fd.set("confirm", "RESTORE");
+        fd.set("name", it.name);
+        restore(fd);
+      } }, t("backup_restore")),
+      h("button", { class: "btn btn-ghost btn-sm", style: "margin-left:6px;color:#dc2626",
+        onclick: async () => {
+          if (!confirm(t("confirm_delete"))) return;
+          try { await api("/api/admin/backup/delete", { method: "POST", body: JSON.stringify({ name: it.name }) }); render(); }
+          catch (e) { toast(e.message, false); }
+        } }, t("delete")))));
+
+  const body = h("div", { class: "page" },
+    settingsTabs("backup"),
+    h("h1", {}, t("backup")),
+    h("p", { class: "muted" }, t("backup_hint")),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("backup_settings")),
+      h("label", { class: "muted" }, enChk, " " + t("backup_enabled")),
+      h("label", { class: "field", style: "margin-top:10px" },
+        h("span", { class: "muted" }, t("backup_dir")), dirInp,
+        h("div", { class: "muted", style: "font-size:12px" }, t("backup_dir_hint"))),
+      h("div", { class: "grid-3" },
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("backup_freq")), freqSel),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("backup_time")), timeInp),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("backup_keep")), keepInp)),
+      h("p", { class: "muted" },
+        t("backup_last") + ": " + (cfg.last_run || t("backup_never"))
+        + (cfg.last_file ? " · " + cfg.last_file : "")
+        + " · " + t("backup_next") + ": " + (cfg.next_run || t("backup_never"))),
+      cfg.last_error ? h("p", { class: "muted", style: "color:#dc2626" }, "⚠ " + cfg.last_error) : null,
+      h("p", { class: "muted" }, t("backup_dir_state") + ": "
+        + (s.dir_exists ? (s.dir_writable ? t("backup_dir_ok") : t("backup_dir_ro")) : t("backup_dir_missing"))
+        + (s.free ? " · " + t("backup_free") + " " + fmtSize(s.free) : "")),
+      s.legacy_timer
+        ? h("p", { class: "muted" }, "⚠ " + t("backup_legacy_timer") + " ",
+            h("code", {}, "sudo systemctl disable --now rankez-backup.timer"))
+        : null,
+      h("div", { style: "display:flex;gap:8px;margin-top:12px" },
+        h("button", { class: "btn btn-blue", onclick: save }, t("save")),
+        h("button", { class: "btn btn-ghost", onclick: runNow }, t("backup_now"))))),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("backup_records")),
+      h("p", { class: "muted" }, s.dir || ""),
+      h("table", {},
+        h("thead", {}, h("tr", {}, [t("name"), t("size"), t("created"), t("actions")].map(x => h("th", {}, x)))),
+        h("tbody", {}, rows.length ? rows
+          : h("tr", {}, h("td", { colspan: 4 }, t("no_results"))))))),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("h3", {}, t("backup_restore_upload")),
+      h("p", { class: "muted" }, t("backup_restore_hint")),
+      h("div", { class: "inline-field" }, restoreFile, restoreBtn))));
+  return { title: "", body };
+}
 // ----------------------------------------------------------------- boot
 state.lang = localStorage.getItem("rz_lang") || "en";
 document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh" ? "zh-CN" : "zh-TW");
@@ -2624,8 +3223,10 @@ document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh
     state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
     applyTheme(state.meta.theme);
     startIdleWatchdog();
+    startTicketBell();
   } catch (e) {
     state.user = null; state.token = null; state.me_perms = new Set();
+    stopTicketBell();
   }
   render();
 })();

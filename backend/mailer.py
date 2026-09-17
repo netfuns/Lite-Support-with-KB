@@ -6,6 +6,7 @@ import re
 import smtplib
 import ssl
 import time
+import uuid
 from email import policy
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
@@ -17,6 +18,7 @@ from imaplib import IMAP4_SSL
 from urllib import request as urlreq
 
 from db import UPLOAD_DIR, get_setting
+import md
 import rbac
 
 
@@ -65,11 +67,21 @@ def xoauth2(user, token):
 def _dec(s):
     if not s:
         return ""
+    # An 8-bit header (raw GBK in From/Subject, very common on Chinese webmail)
+    # reaches us as a surrogate-escaped str; put the bytes back and decode them
+    # with the charset they actually are.
+    if any("\udc80" <= ch <= "\udcff" for ch in s):
+        try:
+            s = _decode_bytes(s.encode("utf-8", "surrogateescape"), "")
+        except Exception:  # noqa: BLE001 - a header must never break a mail
+            pass
+        else:
+            return s
     parts = decode_header(s)
     out = []
     for text, enc in parts:
         if isinstance(text, bytes):
-            out.append(text.decode(enc or "utf-8", "replace"))
+            out.append(_decode_bytes(text, (enc or "").lower()))
         else:
             out.append(text)
     return "".join(out)
@@ -83,7 +95,110 @@ def _html_to_text(html_src):
     return re.sub(r"\n{3,}", "\n\n", txt).strip()
 
 
-def extract_body(msg):
+#: charsets to try when the declared one is missing or wrong. gb18030 is a
+#: superset of gbk/gb2312, so one entry covers every simplified-Chinese label
+#: that Chinese webmail clients actually put in the header.
+CHARSET_CHAIN = ("utf-8", "gb18030", "big5", "shift_jis", "euc-kr", "cp1252", "latin-1")
+
+#: labels that lie: 163/QQ label GBK text as "gb2312", Outlook as "ansi"
+_CHARSET_ALIAS = {
+    "gb2312": "gb18030", "gbk": "gb18030", "gb_2312-80": "gb18030",
+    "ansi": "gb18030", "cp936": "gb18030", "ms936": "gb18030",
+    "gb18030": "gb18030", "cht": "big5", "ms950": "big5", "cp950": "big5",
+}
+
+_CJK_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _decode_bytes(raw, declared):
+    """Best-effort decode of one MIME part, honouring a lying charset header.
+
+    The order matters, and each step is here because it was observed in the wild:
+
+    1. **strict UTF-8 first.** Bytes that decode as UTF-8 *as a whole* are UTF-8:
+       a GBK body cannot fake that, because GBK lead bytes live in 0x81-0xFE and
+       its trail bytes reach down to 0x40, which breaks UTF-8's continuation
+       pattern. This is what catches a webmail client that labels a UTF-8 body
+       ``charset="gb2312"`` -- and it is deterministic, unlike the old
+       "first decode that yields any CJK" rule, which could accept the gb18030
+       reading of a UTF-8 body and silently return plausible-looking garbage.
+    2. **the declared charset** (via :data:`_CHARSET_ALIAS`, since 163/QQ label
+       GBK text as "gb2312" and Outlook calls it "ansi").
+    3. **the usual suspects** in :data:`CHARSET_CHAIN`.
+
+    The very last resort is latin-1, which is deliberately *lossless*: it maps
+    every one of the 256 byte values, so this function can never emit U+FFFD.
+    That matters because a replacement character in the database is
+    unrecoverable -- it has already thrown the original bytes away. (A ticket
+    that arrived as ``please 帮看看`` was stored as ``please \\ufffd\\ufff4\\ufffd\\ufffd``
+    by exactly that mistake; the bytes ``b0 ef bf b4 bf b4`` were decoded as
+    UTF-8 with ``errors="replace"``.)
+    """
+    def try_enc(enc):
+        try:
+            return raw.decode(enc), None
+        except (UnicodeDecodeError, LookupError):
+            return None, enc
+
+    utf8_text, _ = try_enc("utf-8")
+    if utf8_text is not None and _CJK_RE.search(utf8_text):
+        return utf8_text
+
+    chain = []
+    if declared:
+        chain.append(_CHARSET_ALIAS.get(declared, declared))
+    chain.extend(CHARSET_CHAIN)
+    seen = set()
+    first = None
+    for enc in chain:
+        if not enc or enc in seen:
+            continue
+        seen.add(enc)
+        text, _ = try_enc(enc)
+        if text is None:
+            continue
+        if first is None:
+            first = text
+        # a decode that produced no CJK at all is suspect when another one did
+        if _CJK_RE.search(text):
+            return text
+    if first is not None:
+        return first
+    if utf8_text is not None:      # pure ASCII: nothing CJK to prefer
+        return utf8_text
+    return raw.decode("latin-1")   # never lossy -- see the docstring
+
+
+def _part_text(part):
+    """Decode one body part to ``str``.
+
+    ``part.get_content()`` cannot be used here: it takes no arguments, so the
+    old ``part.get_content(policy.policy)`` raised every single time and the
+    surrounding ``except`` fell back to ``str(payload, "utf-8", "replace")``.
+    That is why Chinese mail arrived as mojibake while English mail was fine.
+    """
+    try:
+        raw = part.get_payload(decode=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    if raw is None:
+        val = part.get_payload()
+        return val if isinstance(val, str) else ""
+    return _decode_bytes(raw, (part.get_content_charset() or "").strip().lower())
+
+
+
+def extract_body(msg, images=None):
+    """The mail body as Markdown.
+
+    A customer writes his problem in a webmail or in Outlook, so the part that
+    carries the formatting is text/html -- and the part that loses it is
+    text/plain. Reading only the plain part (what this used to do) turned a
+    screenshot into a bare "图片" placeholder and flattened every list and table
+    into one paragraph. The HTML part is converted instead; ``images`` maps the
+    Content-IDs of the inline pictures to their saved /files/ URL so they are
+    rendered in the ticket rather than dropped.
+    """
     text = ""
     htmlb = ""
     if msg.is_multipart():
@@ -92,27 +207,72 @@ def extract_body(msg):
             if "attachment" in str(part.get("Content-Disposition") or ""):
                 continue
             if ct == "text/plain" and not text:
-                try:
-                    text = part.get_content(policy.policy).strip()
-                except Exception:
-                    text = str(part.get_payload(decode=True), "utf-8", "replace")
+                text = _part_text(part).strip()
             elif ct == "text/html" and not htmlb:
-                try:
-                    htmlb = part.get_content(policy.policy)
-                except Exception:
-                    htmlb = str(part.get_payload(decode=True), "utf-8", "replace")
+                htmlb = _part_text(part)
     else:
-        try:
-            content = msg.get_content(policy.policy)
-        except Exception:
-            content = str(msg.get_payload(decode=True) or "", "utf-8", "replace")
+        content = _part_text(msg)
         if msg.get_content_type() == "text/html":
             htmlb = content
         else:
             text = content
-    if not text and htmlb:
-        text = _html_to_text(htmlb)
+    if htmlb:
+        converted = md.html_to_md(htmlb, images)
+        # a mail whose HTML part is a bare wrapper around the same sentence
+        # converts to the same thing -- but if the conversion ate everything
+        # (an image-only mail with unmapped pictures), the plain part still
+        # tells the reader more than an empty ticket.
+        if converted:
+            return converted
     return text or ""
+
+
+def save_inline_images(msg):
+    """Write the pictures embedded *in* the body (``cid:``) to the uploads dir.
+
+    Returns ``({cid: "/files/<stored>"}, [attachment dicts])``. The map is handed
+    to :func:`extract_body` so the image renders inside the ticket body; the
+    files are registered as attachments later, when the body is saved
+    (``tickets.bind_body_files``), which is what puts them behind the ticket's
+    permissions instead of being world-readable orphans.
+    """
+    mapping = {}
+    saved = []
+    if not msg.is_multipart():
+        return mapping, saved
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        ct = (part.get_content_type() or "").lower()
+        if not ct.startswith("image/"):
+            continue
+        cid = str(part.get("Content-ID") or "").strip().strip("<>")
+        disp = (part.get_content_disposition() or "").lower()
+        # an inline picture is a screenshot the sender pasted; a named one is a
+        # signature logo. Only the former has a Content-ID to point at.
+        if not cid:
+            continue
+        try:
+            data = part.get_payload(decode=True) or b""
+        except Exception:  # noqa: BLE001
+            continue
+        if not (0 < len(data) <= 5 * 1024 * 1024):
+            continue
+        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+               "image/webp": ".webp", "image/bmp": ".bmp"}.get(ct, ".png")
+        stored = uuid.uuid4().hex + ext
+        try:
+            with open(os.path.join(UPLOAD_DIR, stored), "wb") as fh:
+                fh.write(data)
+        except Exception:  # noqa: BLE001 - a broken picture must not lose the mail
+            continue
+        mapping[cid] = "/files/" + stored
+        mapping[cid.lower()] = "/files/" + stored
+        if disp == "attachment":
+            # the sender also listed it as a file: keep it on the attachment bar
+            saved.append({"filename": _dec(part.get_filename() or "image" + ext),
+                          "data": data, "content_type": ct})
+    return mapping, saved
 
 
 def _quoted_split(s, seps=",;"):
@@ -154,6 +314,12 @@ def send_email(conn, to_list, subject, text_body, html_body=None):
     msg["From"] = formataddr(("RankEZ Support", cfg["smtp_from"] or cfg["smtp_user"]))
     msg["To"] = ", ".join(to_list)
     msg["Subject"] = subject
+    # Marks the mail as ours. Every notification is addressed to the ticket's
+    # participants -- which includes the mailbox we poll -- so without this the
+    # app reads its own answer back in and answers that too, one ticket turning
+    # into an endless chain of reply notifications.
+    msg["Auto-Submitted"] = "auto-generated"
+    msg["X-Rankez-Auto"] = "1"
     msg.attach(MIMEText(text_body or _html_to_text(html_body or ""), "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -210,6 +376,12 @@ def send_email_only(cfg, to_list, subject, text_body, html_body=None):
     msg["From"] = formataddr(("RankEZ Support", cfg["smtp_from"] or cfg["smtp_user"]))
     msg["To"] = ", ".join(to_list)
     msg["Subject"] = subject
+    # Marks the mail as ours. Every notification is addressed to the ticket's
+    # participants -- which includes the mailbox we poll -- so without this the
+    # app reads its own answer back in and answers that too, one ticket turning
+    # into an endless chain of reply notifications.
+    msg["Auto-Submitted"] = "auto-generated"
+    msg["X-Rankez-Auto"] = "1"
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -343,6 +515,65 @@ def receive_once(conn):
     return handled
 
 
+def _is_own_mail(cfg, header):
+    """True when this message was sent by the app itself.
+
+    Two independent marks, because either alone leaks: the header survives a
+    forward, the address does not -- and the address catches mail sent before
+    this version, the header does not.
+    """
+    try:
+        if (header.get("X-Rankez-Auto") or "").strip():
+            return True
+        if (header.get("Auto-Submitted") or "").strip().lower().startswith("auto-"):
+            return True
+        own = {(cfg.get("imap_user") or "").lower(), (cfg.get("smtp_from") or "").lower(),
+               (cfg.get("smtp_user") or "").lower()}
+        own.discard("")
+        if not own:
+            return False
+        return _addr(str(header.get("From") or "")).lower() in own
+    except Exception:  # noqa: BLE001
+        return False
+
+
+BOUNCE_RE = re.compile(
+    r"(?i)(退信|投递失败|邮件投递失败|无法投递|"
+    r"undeliver|delivery\s+(status|failure)|delivery\s+has\s+failed|"
+    r"mail\s+delivery\s+failed|returned\s+to\s+sender|failure\s+notice|"
+    r"delivery\s+notification|auto-?reply|automatic\s+reply|out\s+of\s+office)")
+
+
+def _is_bounce(header):
+    """A bounce, a delivery failure or an out-of-office auto-reply is not a ticket.
+
+    Left alone, these are the worst kind of inbound mail: a failed delivery
+    comes back from MAILER-DAEMON@ (an address no customer owns), so it either
+    opens a nonsense ticket or bounces again -- which bounces back, and the two
+    mailboxes ping-pong until somebody notices. Auto-replies are the same loop
+    with a friendlier face, and replying to an out-of-office notice just
+    triggers another one.
+    """
+    try:
+        frm = _addr(str(header.get("From") or "")).lower()
+        if "mailer-daemon" in frm or frm.startswith("postmaster@") or "<>" == frm.strip():
+            return True
+        if BOUNCE_RE.search(_dec(header.get("Subject") or "") or ""):
+            return True
+        auto = (header.get("Auto-Submitted") or "").strip().lower()
+        if auto in ("auto-replied", "auto-notified", "auto-generated"):
+            return True
+        if header.get("X-Autoreply") or header.get("X-Autorespond"):
+            return True
+        # RFC 3462 / 8098: a delivery status notification is a machine report
+        ct = (header.get("Content-Type") or "").lower()
+        if "multipart/report" in ct or "message/delivery-status" in ct:
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def _handle_msg(conn, mbox, num, cfg):
     typ, d = mbox.fetch(num, "(BODY.PEEK[HEADER])")
     raw = b""
@@ -351,6 +582,18 @@ def _handle_msg(conn, mbox, num, cfg):
             raw = part[1]
             break
     header = email.message_from_bytes(raw, policy=policy.default) if raw else None
+    # Two kinds of mail must never become a ticket. Our own notifications land
+    # back in the box we poll (the mailbox is one of the ticket's participants),
+    # and feeding them in again makes the app answer its own answer. Bounces and
+    # out-of-office replies come from addresses no customer owns and answer
+    # themselves, so both turn one ticket into an endless mail loop.
+    if header and (_is_own_mail(cfg, header) or _is_bounce(header)):
+        try:
+            mbox.store(num, "+FLAGS", "\\Seen")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "ignored",
+                "reason": "bounce or own notification" if header else "no header"}
     subject = _dec(header["Subject"]) if header and header["Subject"] else ""
     frm = _addr(header["From"] if header and header["From"] else "")
     to_list = [_addr(x) for x in _quoted_split(str(header["To"] or ""))] + \
@@ -372,31 +615,67 @@ def _handle_msg(conn, mbox, num, cfg):
             body_raw = part[1]
             break
     msg = email.message_from_bytes(body_raw or b"", policy=policy.default)
-    body = extract_body(msg)
+    # pictures pasted into the body: saved first, so the Markdown conversion can
+    # point at them and the ticket shows the image instead of an empty gap
+    cid_map, inline_atts = save_inline_images(msg)
+    body = extract_body(msg, cid_map)
 
-    # attachments: images only (for KB-safe), store up to 5MB
-    atts = []
+    # attachments: store up to 5MB each
+    atts = list(inline_atts)
     if msg.is_multipart():
         for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
             fn = part.get_filename()
-            if fn and part.get_content_disposition() == "attachment":
-                fn = _dec(fn)
-                try:
-                    data = part.get_payload(decode=True) or b""
-                except Exception:
-                    continue
-                if 0 < len(data) <= 5 * 1024 * 1024:
-                    atts.append({"filename": fn, "data": data,
-                                 "content_type": part.get_content_type()})
-    mbox.store(num, "+FLAGS", "\\Seen")
-
-    return process_incoming_email(conn, subject=subject, frm=frm, frm_name=frm_name,
-                                  to_list=to_list, body=body, atts=atts, cfg=cfg)
+            if not fn:
+                continue
+            disp = (part.get_content_disposition() or "").lower()
+            # Requiring Content-Disposition: attachment lost every file sent by
+            # clients that omit it (common with Chinese webmails and with mail
+            # forwarded from a mobile client). Take anything that carries a name,
+            # except an inline image -- those are signature logos and stationery,
+            # they would only bury the real files.
+            if disp == "inline" and (part.get_content_type() or "").startswith("image/"):
+                continue
+            fn = _dec(fn)
+            try:
+                data = part.get_payload(decode=True) or b""
+            except Exception:
+                continue
+            if 0 < len(data) <= 5 * 1024 * 1024:
+                atts.append({"filename": fn, "data": data,
+                             "content_type": part.get_content_type()})
+    # one picture can be both inlined and listed as a file (Outlook does this);
+    # it must not appear twice on the attachment bar
+    seen = set()
+    uniq = []
+    for a in atts:
+        key = (a.get("filename"), len(a.get("data") or b""))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
+    res = process_incoming_email(conn, subject=subject, frm=frm, frm_name=frm_name,
+                                 to_list=to_list, body=body, atts=uniq, cfg=cfg)
+    # Mark read only once the mail actually landed in a ticket. Doing it first
+    # (as it used to) is what silently swallowed mail: a message the code could
+    # not place was flagged \Seen anyway, so the next poll skipped it and the
+    # sender never found out why nothing happened. A rejected sender is told
+    # once, so that one is retired too.
+    try:
+        if (res or {}).get("status") in ("created", "replied", "rejected"):
+            mbox.store(num, "+FLAGS", "\\Seen")
+    except Exception:  # noqa: BLE001 - a flag is bookkeeping, never lose the mail for it
+        pass
+    return res
 
 
 # ---------- incoming logic (also used by tests / webhook) ----------
 
-REF_RE = re.compile(r"\bTK-\d{5}\b", re.I)
+# RANKEZ-SUPPORT-YYYYMMxxx is the format since the monthly-counter change; the
+# older TK-##### must still thread, or every answer to a ticket opened before
+# the change would silently open a new one.
+REF_RE = re.compile(r"\b(?:RANKEZ-SUPPORT-\d{9}|TK-\d{5})\b", re.I)
 
 
 def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=None, cfg=None):
@@ -406,6 +685,10 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
         return {"status": "ignored"}
     frm = frm.lower()
     cust = T.match_customer(conn, frm)
+    # A partner (代理商) writes in on his own domain, which is registered under
+    # Settings > Partners and not under any customer -- without this his mail was
+    # treated as a stranger's and bounced.
+    part = None if cust else T.match_partner(conn, frm)
     # The internal desk may answer by e-mail too: their address belongs to no
     # customer domain, so without this they were bounced as "unauthorized" and
     # their answer never reached the customer.
@@ -419,20 +702,27 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
     # first-time customer's mail into a login-capable account instead of a
     # "rejected: unauthorized" bounce. (Staff senders are handled below.)
     sender_info = {"id": None, "created": False, "mailed": False}
-    if cust and frm and not staff_sender:
+    if (cust or part) and frm and not staff_sender:
         sender_info = T.find_or_create_user(conn, frm, frm_name, send_credentials=True)
     if not cust and staff_sender:
         t = conn.execute("SELECT * FROM tickets WHERE code=?", (m.group(0).upper(),)).fetchone() if m else None
         if not t:
-            # nothing to attach: never auto-create a ticket with no customer behind it
-            return {"status": "ignored", "reason": "staff mail without a known ticket"}
+            # Desk staff writing in with no reference is *opening* a ticket, not
+            # answering one. Bouncing it (the old behaviour) lost the mail: the
+            # sender got nothing and never knew why. File it instead -- it just
+            # has no customer behind it, so it lands as an internal ticket.
+            return _open_ticket(conn, subject=subject, body=body, frm=frm, frm_name=frm_name,
+                                to_list=to_list, atts=atts, cfg=cfg, cust=None,
+                                sender_info=sender_info, internal=1)
         T.add_message(conn, t["id"], body=body, author_email=frm, author_name=frm_name,
                       source="email", attachments=atts)
         conn.execute("UPDATE tickets SET status='support_replied' WHERE id=?", (t["id"],))
         conn.commit()
         _notify_customer_reply(conn, t, frm)
         return {"status": "replied", "ticket": t["code"], "created_user": bool(sender_info["created"])}
-    if not cust:
+    # Only a registered domain may open a ticket: a customer's, a partner's or
+    # the desk's own. Anything else is a stranger and gets told so (once).
+    if not cust and not part:
         cfg = cfg or mail_cfg(conn)
         reject_reply(cfg, frm, "unauthorized")
         return {"status": "rejected", "reason": "unauthorized domain"}
@@ -440,7 +730,12 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
         code = m.group(0).upper()
         t = conn.execute("SELECT * FROM tickets WHERE code=?", (code,)).fetchone()
         if t:
-            same_customer = (cust["id"] == t["customer_id"])
+            if cust:
+                same_customer = (cust["id"] == t["customer_id"])
+            else:
+                # a partner's ticket carries no customer id, his name is the link
+                same_customer = (not t["customer_id"]) and \
+                    (t["customer_name"] or "") == (part["name"] if part else "")
             if same_customer:
                 # make sure the replying sender has a user row (auto-provisioned
                 # above when they were new) so the reply is attributed correctly
@@ -459,26 +754,90 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
                 if staff_sender:
                     _notify_customer_reply(conn, t, frm)
                 else:
+                    # a customer (or his partner) answered -- the desk has to hear
+                    # about it in the app, not only in their mailbox
+                    T.alert_customer_reply(conn, t)
                     _notify_reply(conn, t, frm)
                 return {"status": "replied", "ticket": code, "created_user": bool(sender_info["created"])}
     # new ticket
+    return _open_ticket(conn, subject=subject, body=body, frm=frm, frm_name=frm_name,
+                        to_list=to_list, atts=atts, cfg=cfg, cust=cust, part=part,
+                        sender_info=sender_info, internal=0)
+
+
+def _open_ticket(conn, *, subject, body, frm, frm_name, to_list, atts, cfg,
+                 cust, part=None, sender_info=None, internal=0):
+    """File a new ticket from an inbound mail, then tell everybody its code.
+
+    `cust` is the customer whose domain the sender is on, `part` the partner
+    (代理商) when the domain is registered under Settings > Partners instead.
+    Both may be None -- then the sender is desk staff and the ticket is internal
+    (no customer behind it, nothing for a client to see).
+    """
+    sender_info = sender_info or {"id": None, "created": False, "mailed": False}
+    import tickets as T
+    base_url = (cfg or {}).get("base_url", "")
     clean_sub = REF_RE.sub("", subject or "").strip()
     clean_sub = re.sub(r"(?i)^(re|fw|fwd)\s*:\s*", "", clean_sub).strip() or "(email ticket)"
     # the user row was auto-provisioned above when the sender was new; hand
     # the id to create_ticket so it does not have to redo the work
     t = T.create_ticket(
-        conn, title=clean_sub[:200], description=body, customer_id=cust["id"],
+        conn, title=clean_sub[:200], description=body,
+        customer_id=(cust["id"] if cust else None),
         source="email", creator_id=sender_info["id"] or None, creator_email=frm,
         participant_emails=to_list + [frm],
-        version=cust["version"] or "", attachments=atts)
-    staff = T.support_recipients(conn)
-    all_replies = sorted(set(staff + to_list + [frm]))
-    htmlb = _render_email(conn, t, conn.execute(
-        "SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (t["id"],)).fetchall(), base_url)
-    send_email(conn, all_replies, "[#%s] %s" % (t["code"], t["title"]),
-               "Ticket %s created from email.\n\n%s" % (t["code"], body), htmlb)
+        version=(cust["version"] if cust else "") or "", internal=1 if internal else 0,
+        attachments=atts, bracketed_title=True)
+    if part and not cust:
+        # Named on the ticket, but NOT turned into a customer: create_ticket()
+        # auto-creates a customer from any unknown customer_name, and a partner
+        # is not one -- that would put him in the customer list twice.
+        conn.execute("UPDATE tickets SET customer_name=? WHERE id=?", (part["name"], t["id"]))
+        conn.commit()
+        t = conn.execute("SELECT * FROM tickets WHERE id=?", (t["id"],)).fetchone()
+    # Two mails, two audiences. The opener gets a receipt whose subject is the
+    # bare code and title and which carries his link back into the portal; the
+    # desk gets told separately. It used to be one mail to everybody including
+    # every Cc, which meant a customer received the staff wording and the
+    # participants got a copy of their own mail back.
+    # The code in the subject is also the threading contract: an answer that
+    # keeps it is matched back onto this ticket, one that drops it opens a new
+    # one -- so the receipt itself has to carry it.
+    T.notify_ticket_opened(conn, t)
+    T.notify_new_ticket(conn, t)
+    T.alert_new_ticket(conn, t)
+    _nag_unregistered(conn, t, list(to_list or []) + [frm])
     return {"status": "created", "ticket": t["code"], "created_user": bool(sender_info["created"]),
             "user_mailed": bool(sender_info.get("mailed", False))}
+
+
+def _nag_unregistered(conn, t, emails):
+    """Invite the addresses copied on a ticket that have no account yet.
+
+    Every non-internal address in the mail is recorded on the ticket, so these
+    people will be mailed about it -- but with no account they cannot open the
+    link or see the thread. They get one invitation, and only when the domain is
+    actually registered as a customer or a partner: a stranger's address was
+    probably just a typo or a forwarding hop and must not be mailed at all.
+    """
+    import tickets as T
+    seen = set()
+    for raw in emails or []:
+        e = (raw or "").strip().lower()
+        if not e or "@" not in e or e in seen:
+            continue
+        seen.add(e)
+        # the desk is staff, they have accounts (and are not customers anyway)
+        if rbac.is_internal_email(conn, e):
+            continue
+        if conn.execute("SELECT id FROM users WHERE lower(email)=?", (e,)).fetchone():
+            continue
+        if not (T.match_customer(conn, e) or T.match_partner(conn, e)):
+            continue
+        try:
+            T.registration_nag_email(conn, e, t)
+        except Exception:  # noqa: BLE001 - an invitation is a nicety
+            pass
 
 
 def _notify_reply(conn, t, frm):

@@ -35,9 +35,12 @@ PARTNER_GROUP_PREFIX = "Partner-"
 CUSTOMER_GROUP_PERMS = [
     "ticket.create", "ticket.view_own", "ticket.reply",
 ]
-# A partner sees the tickets of its customers, and nothing more.
+# A partner sees the tickets of its customers, and nothing more -- but it *is*
+# allowed to file and answer tickets: an agent opens a ticket on behalf of one
+# of the customers it serves, or for its own agency. The ticket form pins the
+# choice (see ticket_create), so "may file" never means "may invent a customer".
 PARTNER_GROUP_PERMS = [
-    "ticket.view_own", "ticket.view_partner",
+    "ticket.create", "ticket.view_own", "ticket.view_partner", "ticket.reply",
 ]
 INTERNAL_GROUP_PERMS = [
     "ticket.view_all", "ticket.create", "ticket.edit", "ticket.reply",
@@ -190,8 +193,11 @@ def seed(conn):
         "kb.view_public", "kb.view_registered",
     ])
     role("代理商", [
-        # a partner reads the tickets of the customers assigned to it -- read only
-        "ticket.view_own", "ticket.view_partner",
+        # A partner reads the tickets of the customers assigned to it, and may
+        # file / answer tickets of its own (the ticket form decides *for whom*).
+        # Kept in step with PARTNER_GROUP_PERMS so the role editor and the
+        # actual rights never disagree.
+        "ticket.create", "ticket.view_own", "ticket.view_partner", "ticket.reply",
         "kb.view_public", "kb.view_registered",
         "kb.export_pdf",
     ])
@@ -325,6 +331,34 @@ def managed_group_ids(conn):
     if gi:
         ids.add(gi)
     return ids
+
+
+def login_domain_ok(conn, u):
+    """May this account still sign in? Only while its domain is one we know.
+
+    Registration is restricted to customer, partner and internal domains, but
+    that check happened once, at creation time. A customer whose contract ended
+    and whose domain was then removed used to keep a working account -- the
+    address was gone from the lists while the key still turned. Re-checking at
+    every sign-in makes removing a domain actually revoke access.
+
+    One exception, and it is deliberate: whoever can manage users is never
+    locked out. If the domain lists are emptied by mistake, he is the only one
+    who can put them back -- a rule that can brick the administrator is a rule
+    that will.
+    """
+    email = (u["email"] or "").strip().lower()
+    if "@" not in email:
+        return False
+    try:
+        perms = user_permissions(conn, u["id"], email)
+    except Exception:  # noqa: BLE001
+        perms = set()
+    if "user.manage" in perms:
+        return True
+    if is_internal_email(conn, email):
+        return True
+    return domain_matches(email.split("@", 1)[1], known_domains(conn))
 
 
 def domain_matches(domain, patterns):
@@ -700,3 +734,112 @@ def partner_customer_ids(conn, uid):
     marks = ",".join("?" * len(pids))
     return {r["id"] for r in
             conn.execute("SELECT id FROM customers WHERE partner_id IN (%s)" % marks, list(pids))}
+
+
+# ---------------------------------------------------------------------------
+# The partner <-> customer link
+#
+# The link lives on the *customer* row (customers.partner_id), so "which
+# customers does this partner serve" is a question about customers, not about a
+# list stored on the partner. Both the partner editor and the customer editor
+# go through the helpers below so the two directions can never disagree.
+# ---------------------------------------------------------------------------
+def clean_partner_selection(conn, raw):
+    """Turn a picker selection into real customer ids.
+
+    Accepts ids, numeric strings, or the labels the suggest list shows
+    ("Name", "Name <domain>"). Unknown values are dropped rather than guessed
+    at, so a stale chip can never silently re-point a customer that was deleted.
+    """
+    out, seen = [], set()
+    for x in (raw or []):
+        if isinstance(x, dict):
+            x = x.get("id", x.get("name", ""))
+        key = str(x).strip()
+        if not key:
+            continue
+        cid = None
+        if key.isdigit():
+            row = conn.execute("SELECT id FROM customers WHERE id=?", (int(key),)).fetchone()
+            cid = row["id"] if row else None
+        else:
+            nm = key.split("  <", 1)[0].split(" <", 1)[0].strip()
+            if nm:
+                row = conn.execute("SELECT id FROM customers WHERE lower(name)=?", (nm.lower(),)).fetchone()
+                cid = row["id"] if row else None
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def apply_partner_customers(conn, pid, ids):
+    """Sync customers.partner_id to what the partner editor currently shows.
+
+    Customers dropped from the list are released; a customer picked here is
+    moved over even if another partner had it. Called with an empty list it
+    unlinks every customer of that partner -- the caller decides whether the
+    picker was actually shown, which is why the "was it sent at all" check
+    belongs in the endpoint, not here.
+    """
+    if ids:
+        marks = ",".join("?" * len(ids))
+        conn.execute("UPDATE customers SET partner_id=NULL WHERE partner_id=? AND id NOT IN (%s)" % marks,
+                     [pid] + list(ids))
+        conn.execute("UPDATE customers SET partner_id=? WHERE id IN (%s)" % marks, [pid] + list(ids))
+    else:
+        conn.execute("UPDATE customers SET partner_id=NULL WHERE partner_id=?", (pid,))
+    return len(ids)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-base audience
+# ---------------------------------------------------------------------------
+# public = anybody, registered = any signed-in user, internal = the desk,
+# usergroup = only the groups the article is bound to.
+KB_LEVEL = {"public": 0, "registered": 1, "internal": 2, "usergroup": 3}
+
+
+def kb_bound_groups(conn, article_id):
+    """Group ids an article is bound to (only meaningful when usergroup)."""
+    return {r["group_id"] for r in
+            conn.execute("SELECT group_id FROM kb_article_groups WHERE article_id=?", (article_id,))}
+
+
+def _as_uid(u):
+    """A user id from either a user row (what the routes pass) or a bare id."""
+    if u is None or isinstance(u, int):
+        return u
+    try:
+        return u["id"]
+    except (TypeError, IndexError, KeyError):
+        return None
+
+
+def kb_article_readable(conn, u, article, group_ids, perms=None):
+    """May this caller read this article?
+
+    ``group_ids`` is the caller's own group set (cached by the route). The desk
+    always reads the knowledge base; a "usergroup" article is otherwise limited
+    to the groups it was bound to when it was published.
+    """
+    if not article:
+        return False
+    vis = article["visibility"] or "registered"
+    uid = _as_uid(u)
+    if uid is None:
+        return vis == "public"
+    if perms is None:
+        perms = user_permissions(conn, uid)
+    if vis == "internal" and "kb.view_internal" not in perms:
+        return False
+    if vis == "registered" and "kb.view_registered" not in perms:
+        return False
+    if vis == "usergroup":
+        # The desk always reads the knowledge base -- otherwise the person who
+        # just shared a solution could lose sight of it. Membership of the
+        # internal group (not a KB permission) decides who counts as the desk.
+        if is_internal_user(conn, uid):
+            return True
+        return bool(set(group_ids or ()) & kb_bound_groups(conn, article["id"]))
+    return True
