@@ -418,6 +418,7 @@ function sidebar() {
       items.push(navLink("#/admin/site", t("site_settings")));
       items.push(navLink("#/admin/welcome", t("welcome_page")));
       items.push(navLink("#/admin/company", t("company_info")));
+      items.push(navLink("#/admin/internal_domains", t("internal_domains")));
       items.push(navLink("#/admin/domains", t("bind_domains")));
       items.push(navLink("#/admin/settings", t("mail_settings")));
     }
@@ -464,7 +465,8 @@ async function render() {
     const sub = arg || "users";
     const map = { users: adminUsers, roles: adminRoles, groups: adminGroups,
                   settings: adminSettings, site: adminSite, welcome: adminWelcome,
-                  company: adminCompany, domains: adminDomains };
+                  company: adminCompany, domains: adminDomains,
+                  internal_domains: adminInternalDomains };
     view = (map[sub] || adminUsers)();
   } else view = state.user ? dashboardView() : homeView();
   view = await view;
@@ -723,20 +725,25 @@ async function ticketDetail(id) {
   // ever see "关闭工单". `internal_user` comes from the ticket payload, with the
   // cached /api/me flag as a fallback.
   const internal = !!(data.internal_user || (state.user && state.user.is_internal));
+  // Reassigning a ticket is permission-driven: L2 / the administrator role / the
+  // internal group all carry ticket.change_owner. The candidate list is internal
+  // users only, and the API refuses anybody else.
   const can = {
     claim: internal && hasPerm("ticket.claim"),
-    owner: internal && hasPerm("ticket.change_owner"),
+    owner: hasPerm("ticket.change_owner"),
     status: internal && hasPerm("ticket.change_status"),
     reply: hasPerm("ticket.reply"),
     export: hasPerm("ticket.export"),
   };
-  const ownerSel = h("select", {}, h("option", { value: "" }, t("owner") + "…"));
-  // load users for owner select (admin-only API: the desk has it, nobody else needs it)
+  const ownerSel = h("select", { id: "owner-sel" }, h("option", { value: "" }, t("owner") + "…"));
+  // Candidates come from /api/tickets/assignees: internal users only, so the
+  // list no longer needs the admin-only /api/admin/users (which used to 403 for
+  // L2 and leave the picker empty).
   if (can.owner) (async () => {
     try {
-      const r = await api("/api/admin/users");
+      const r = await api("/api/tickets/assignees");
       ownerSel.innerHTML = "";
-      ownerSel.append(h("option", { value: "" }, "- " + t("owner") + " -"));
+      ownerSel.append(h("option", { value: "" }, "- " + t("unassigned") + " -"));
       for (const u of (r.items || [])) {
         ownerSel.append(h("option", { value: u.id, selected: String(u.id) === String(T.owner_id) ? "selected" : null },
           u.display_name || u.email));
@@ -744,10 +751,15 @@ async function ticketDetail(id) {
     } catch (e) {}
   })();
   ownerSel.onchange = async () => {
-    if (!ownerSel.value) return;
-    await api("/api/tickets/" + id + "/owner", { method: "PUT", body: JSON.stringify({ owner_id: Number(ownerSel.value) }) });
-    toast("OK");
-    setTimeout(() => render(), 300);
+    // an empty choice takes the ticket back to the pool ("未指派")
+    try {
+      await api("/api/tickets/" + id + "/owner", { method: "PUT",
+        body: JSON.stringify({ owner_id: ownerSel.value ? Number(ownerSel.value) : null }) });
+      toast("OK");
+      setTimeout(() => render(), 300);
+    } catch (e) {
+      toast(e.message === "assignee_not_internal" ? t("assignee_not_internal") : e.message, false);
+    }
   };
 
   const closeSel = h("select", {},
@@ -836,6 +848,7 @@ async function ticketDetail(id) {
       h("div", { class: "muted mb-2" },
         [t("customer") + " " + (T.customer_name || "-"), t("module") + " " + (T.product || "-"),
           t("version") + " " + (T.version || "-"), t("source") + " " + T.source,
+          t("owner") + " " + (T.owner_name || t("unassigned")),
           t("created") + " " + T.created_at].join(" · ")),
       h("div", { class: "ticket-actions" },
         can.claim ? claimBtn : null,
@@ -1957,7 +1970,7 @@ async function adminSite() {
   let s;
   try { s = await api("/api/admin/site"); } catch (e) { return { title: "", body: h("div", {}, t("no_results")) }; }
   const modules = (s.modules || []).slice();
-  const domains = (s.internal_domains || []).slice();
+  // Internal domains moved to their own settings page (#/admin/internal_domains).
 
   // --- modules CRUD ---
   const modList = h("div", {});
@@ -1974,22 +1987,6 @@ async function adminSite() {
     });
   }
   renderMods();
-
-  // --- internal domains ---
-  const domList = h("div", {});
-  const domInput = h("input", { placeholder: "rankez.local" });
-  function renderDoms() {
-    domList.innerHTML = "";
-    if (!domains.length) domList.append(h("div", { class: "muted" }, t("no_results")));
-    domains.forEach((d, i) => {
-      domList.append(h("div", { class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
-        h("span", {}, d),
-        h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: () => {
-          domains.splice(i, 1); renderDoms();
-        } }, t("delete"))));
-    });
-  }
-  renderDoms();
 
   const timeoutInp = h("input", { type: "number", min: 0, value: String(s.session_timeout || 0), style: "width:120px" });
   const maxLifeInp = h("input", { type: "number", min: 0,
@@ -2022,21 +2019,18 @@ async function adminSite() {
           if (!modules.includes(v)) modules.push(v);
           modInput.value = ""; renderMods();
         } }, "+" + t("add"))))),
+    // Internal domains now live on their own settings page; this page keeps a
+    // pointer so the old entry point is not a dead end.
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
       h("h3", {}, t("internal_domains")),
       h("p", { class: "muted" }, t("internal_domains_hint")),
-      domList,
-      h("div", { class: "inline-field", style: "margin-top:8px" }, domInput,
-        h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
-          const v = domInput.value.trim().toLowerCase(); if (!v) return;
-          if (!domains.includes(v)) domains.push(v);
-          domInput.value = ""; renderDoms();
-        } }, "+" + t("add"))))),
+      h("a", { class: "btn btn-ghost btn-sm", href: "#/admin/internal_domains" },
+        t("internal_domains") + " ↗"))),
     h("div", { style: "display:flex;gap:8px" },
       h("button", { class: "btn btn-blue", onclick: async () => {
         try {
           await api("/api/admin/site", { method: "POST", body: JSON.stringify({
-            modules, internal_domains: domains,
+            modules,
             session_timeout: Number(timeoutInp.value || 0),
             session_max_lifetime: Number(maxLifeInp.value || 0),
             theme: themeSel.value }) });
@@ -2058,6 +2052,7 @@ function settingsTabs(active) {
     ["site", "site_settings"],
     ["welcome", "welcome_page"],
     ["company", "company_info"],
+    ["internal_domains", "internal_domains"],
     ["domains", "bind_domains"],
     ["settings", "mail_settings"],
   ];
@@ -2142,6 +2137,73 @@ async function adminCompany() {
       h("div", { class: "inline-field", style: "margin-top:2px" },
         h("label", { class: "btn btn-ghost btn-sm" }, t("upload_logo"), fileInp),
         h("span", { class: "muted", style: "font-size:13px" }, t("logo_hint"))))));
+  return { title: "", body };
+}
+
+/** Settings > Internal domains: the suffixes that make an account staff.
+ *
+ * They are the rule behind the internal group (membership) and behind the
+ * assignee picker on a ticket: only an internal user may be handed a ticket.
+ */
+async function adminInternalDomains() {
+  if (!hasPerm("settings.mail")) return noAccess();
+  let s;
+  try { s = await api("/api/admin/internal_domains"); } catch (e) { return noAccess(); }
+  const domains = (s.domains || []).slice();
+
+  const list = h("div", {});
+  const inp = h("input", { placeholder: "rankez.local", style: "flex:1" });
+  const paint = () => {
+    list.innerHTML = "";
+    if (!domains.length) list.append(h("div", { class: "muted" }, "\u2014"));
+    domains.forEach((d, i) => list.append(h("div", {
+      class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
+      h("span", {}, d),
+      h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626",
+        onclick: () => { domains.splice(i, 1); paint(); } }, t("delete")))));
+  };
+  paint();
+
+  // Who the current rule already covers -- the assignee candidates.
+  const usersTitle = h("h3", {});
+  const userBox = h("div", {});
+  const paintUsers = (users) => {
+    usersTitle.textContent = t("internal_domains_users") + " (" + users.length + ")";
+    userBox.innerHTML = "";
+    if (!users.length) { userBox.append(h("div", { class: "muted" }, t("internal_domains_none"))); return; }
+    users.forEach(u => userBox.append(h("div", {
+      class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
+      h("span", {}, u.display_name || u.email),
+      h("span", { class: "muted" }, u.email))));
+  };
+  paintUsers(s.users || []);
+
+  const body = h("div", { class: "page-narrow" },
+    settingsTabs("internal_domains"),
+    h("h1", {}, t("internal_domains")),
+    h("p", { class: "muted" }, t("internal_domains_hint")),
+    h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      list,
+      h("div", { class: "inline-field", style: "margin-top:12px" }, inp,
+        h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
+          const v = inp.value.trim().toLowerCase()
+            .replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/^[@.]+/, "").split(":")[0];
+          if (!v) return;
+          if (!domains.includes(v)) domains.push(v);
+          inp.value = ""; paint();
+        } }, "+" + t("add"))),
+      h("button", { class: "btn btn-blue", style: "margin-top:12px", onclick: async () => {
+        try {
+          const r = await api("/api/admin/internal_domains", { method: "POST",
+            body: JSON.stringify({ domains }) });
+          paintUsers(r.users || []);
+          toast(t("saved"));
+        } catch (e) { toast(e.message, false); }
+      } }, t("save")))),
+    h("div", { class: "card" }, h("div", { class: "card-body" },
+      usersTitle,
+      h("p", { class: "muted" }, t("internal_domains_users_hint")),
+      userBox)));
   return { title: "", body };
 }
 

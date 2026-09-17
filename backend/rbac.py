@@ -390,19 +390,56 @@ def has_perm(conn, uid, key):
     return key in user_permissions(conn, uid)
 
 
+def is_admin_user(conn, uid):
+    """True for a site administrator (the built-in "管理员" role).
+
+    A safety net for the ticket desk: desk rights are driven by internal-group
+    membership, and an empty / wrong `internal_domains` list must never lock the
+    site owner out of his own desk.
+    """
+    if uid is None:
+        return False
+    return has_perm(conn, uid, "role.manage") and has_perm(conn, uid, "user.manage")
+
+
 def is_internal_user(conn, uid):
-    """True when the user is a member of the built-in internal group.
+    """True when the user counts as desk staff (内部用户) -- and may be assigned.
+
+    Three ways in:
+      * membership of the built-in internal group (the materialised form, kept
+        in step by sync_email_groups)
+      * an address whose domain matches the configured internal domains -- the
+        rule itself, so a freshly saved domain takes effect at once instead of
+        waiting for the next membership sync
+      * an administrator account, so a mis-configured domain list can never lock
+        the site owner out of the ticket desk
 
     The ticket desk buttons (claim / reassign / edit status / internal note) and
     the "answer the customer" status transition hang off this, so it must be
-    membership -- not a permission -- that decides.
+    membership / domain -- not a ticket permission -- that decides.
     """
     if uid is None:
         return False
     gi = internal_group_id(conn)
-    if not gi:
-        return False
-    return gi in groups_for_user(conn, uid)
+    if gi and gi in groups_for_user(conn, uid):
+        return True
+    row = conn.execute("SELECT email FROM users WHERE id=?", (uid,)).fetchone()
+    if row and is_internal_email(conn, row["email"]):
+        return True
+    return is_admin_user(conn, uid)
+
+
+def internal_users(conn):
+    """Every user the desk may hand a ticket to (内部用户), active ones only."""
+    out = []
+    for r in conn.execute("SELECT id,email,display_name,status FROM users ORDER BY id"):
+        if (r["status"] or "active") != "active":
+            continue
+        if is_internal_user(conn, r["id"]):
+            out.append({"id": r["id"], "email": r["email"],
+                        "display_name": r["display_name"] or r["email"]})
+    out.sort(key=lambda x: (x["display_name"] or "").lower())
+    return out
 
 
 def is_internal_email(conn, email):

@@ -915,6 +915,21 @@ def _ticket_visible(conn, t, u):
     return False
 
 
+@app.get("/api/tickets/assignees")
+def ticket_assignees(request: Request):
+    """The people a ticket may be handed to -- internal users only.
+
+    Registered BEFORE /api/tickets/{tid} on purpose: Starlette matches routes in
+    registration order, and the int path param would swallow "assignees" into a
+    failed cast (422) instead of letting this route answer.
+    """
+    require_perm(request, "ticket.change_owner")
+    c = conn_()
+    items = rbac.internal_users(c)
+    c.close()
+    return ok(items=items, total=len(items))
+
+
 @app.get("/api/tickets")
 def tickets_list(request: Request, status: str = "", owner: str = "", customer: str = "",
                  priority: str = "", product: str = "", q: str = "",
@@ -999,8 +1014,16 @@ def ticket_get(tid: int, request: Request):
         msgs = [m for m in msgs if not m["internal"]]
     for m in msgs:
         m["attachments"] = [a for a in atts if a["message_id"] == m["id"]]
+    # The detail page names the assignee, so resolve it here exactly like the
+    # list endpoint does (the raw row only carries owner_id).
+    td = dict(t)
+    td["owner_name"] = ""
+    if td.get("owner_id"):
+        orow = c.execute("SELECT display_name,email FROM users WHERE id=?", (td["owner_id"],)).fetchone()
+        if orow:
+            td["owner_name"] = orow["display_name"] or orow["email"]
     c.close()
-    return ok(ticket=dict(t), messages=msgs, participants=parts, internal_user=internal_user)
+    return ok(ticket=td, messages=msgs, participants=parts, internal_user=internal_user)
 
 
 @app.post("/api/tickets")
@@ -1060,13 +1083,39 @@ def ticket_claim(tid: int, request: Request):
 
 @app.put("/api/tickets/{tid}/owner")
 async def ticket_owner(tid: int, request: Request):
+    """Hand a ticket to a colleague, or take it back with owner_id=null.
+
+    Only desk staff may be picked -- internal users, i.e. an account whose
+    e-mail suffix matches a configured internal domain (or that an administrator
+    put in the internal group). Assigning a customer or a partner is refused.
+    """
     require_perm(request, "ticket.change_owner")
     b = await request.json()
+    new_owner = b.get("owner_id")
     c = conn_()
-    c.execute("UPDATE tickets SET owner_id=?, updated_at=datetime('now') WHERE id=?", (b.get("owner_id"), tid))
+    t = c.execute("SELECT id FROM tickets WHERE id=?", (tid,)).fetchone()
+    if not t:
+        c.close()
+        fail(404, "not_found")
+    if new_owner in (None, "", 0):
+        new_owner = None
+    else:
+        try:
+            new_owner = int(new_owner)
+        except (TypeError, ValueError):
+            c.close()
+            fail(400, "bad_owner")
+        row = c.execute("SELECT id FROM users WHERE id=?", (new_owner,)).fetchone()
+        if not row:
+            c.close()
+            fail(404, "user_not_found")
+        if not rbac.is_internal_user(c, new_owner):
+            c.close()
+            fail(403, "assignee_not_internal")
+    c.execute("UPDATE tickets SET owner_id=?, updated_at=datetime('now') WHERE id=?", (new_owner, tid))
     c.commit()
     c.close()
-    return ok(ok=True)
+    return ok(ok=True, owner_id=new_owner)
 
 
 ALLOWED_STATUS_EDIT = {"new", "closed", "customer_replied", "support_replied"}
@@ -2038,6 +2087,57 @@ def admin_group_member_remove(gid: int, uid: int, request: Request):
     c.commit()
     c.close()
     return ok(ok=True)
+
+
+# =============================== ADMIN: INTERNAL DOMAINS ===============================
+def _internal_domains_payload(c):
+    """The configured suffixes + everyone they currently make desk staff."""
+    return {"domains": site_internal_domains(), "users": rbac.internal_users(c)}
+
+
+def _normalize_domain(x):
+    d = str(x or "").strip().lower()
+    d = d.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+    return d.lstrip("@").lstrip(".").strip()
+
+
+@app.get("/api/admin/internal_domains")
+def admin_internal_domains(request: Request):
+    """Settings > Internal domains -- its own page, no longer part of site settings.
+
+    These suffixes define who is staff: a user whose address matches one of them
+    joins the internal group automatically and becomes assignable as an owner.
+    """
+    require_perm(request, "settings.mail")
+    c = conn_()
+    payload = _internal_domains_payload(c)
+    c.close()
+    return ok(**payload)
+
+
+@app.post("/api/admin/internal_domains")
+async def admin_internal_domains_save(request: Request):
+    require_perm(request, "settings.mail")
+    b = await request.json()
+    raw = b.get("domains")
+    if raw is None:
+        raw = b.get("internal_domains") or []
+    doms = []
+    for x in raw:
+        d = _normalize_domain(x)
+        if d and d not in doms:
+            doms.append(d)
+    c = conn_()
+    set_setting(c, "internal_domains", json.dumps(doms, ensure_ascii=False))
+    c.commit()
+    # Re-evaluate internal membership: a domain that was dropped must evict the
+    # users it used to make staff (scoped to the internal group only).
+    for r in c.execute("SELECT id,email FROM users"):
+        rbac.sync_email_groups(c, r["id"], r["email"], remove_stale=True, only="internal")
+    c.commit()
+    payload = _internal_domains_payload(c)
+    c.close()
+    return ok(**payload)
 
 
 # =============================== ADMIN: SITE SETTINGS ===============================
