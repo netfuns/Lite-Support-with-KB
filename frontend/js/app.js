@@ -29,8 +29,10 @@ function authHeaders(extra) {
 }
 
 async function api(path, opts = {}) {
-  opts.headers = { "Content-Type": "application/json" };
+  opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
   if (state.token) opts.headers["X-Token"] = state.token;
+  const cp = captchaPass();
+  if (cp) opts.headers["X-Captcha-Pass"] = cp;
   const res = await fetch(path, opts);
   const ct = res.headers.get("content-type") || "";
   let data = null;
@@ -40,7 +42,9 @@ async function api(path, opts = {}) {
     document.cookie = "rz_token=; Max-Age=0; path=/";
     state.user = null; state.token = null;
     stopIdleWatchdog();
-    if (window.location.hash !== "#/login") window.location.hash = "#/login";
+    // the boot probe sends noRedirect: an anonymous visitor asking for the
+    // public landing page must land on it, not be bounced to the login form
+    if (!opts.noRedirect && window.location.hash !== "#/login") window.location.hash = "#/login";
     throw new Error("unauthorized");
   }
   if (!res.ok) {
@@ -95,6 +99,106 @@ function toast(msg, ok = true) {
   const item = h("div", { class: "item " + (ok ? "ok" : "err") }, msg);
   _toasts.append(item);
   setTimeout(() => item.remove(), 4000);
+}
+
+// ----------------------------------------------------------------- captcha
+// A solved slider buys 30 quiet minutes (server-issued pass bound to the IP).
+// Nothing here is required on the intranet: the server decides -- when an
+// endpoint answers 403 captcha_required, the caller funnels through
+// ensureCaptcha() and retries. That keeps the desk friction-free in the
+// office and hostile to scripts on the open internet.
+const CAP_KEY = "rz_cpass", CAP_EXP = "rz_cpass_exp";
+let _captchaInFlight = null;
+
+function captchaPass() {
+  const tok = sessionStorage.getItem(CAP_KEY) || "";
+  return tok && Number(sessionStorage.getItem(CAP_EXP) || 0) > Date.now() ? tok : "";
+}
+function captchaSave(tok, secs) {
+  sessionStorage.setItem(CAP_KEY, tok || "");
+  sessionStorage.setItem(CAP_EXP, String(Date.now() + (secs || 1800) * 1000));
+}
+
+/** Resolve once a pass exists (cached, or earned through the slider). */
+function ensureCaptcha() {
+  if (captchaPass()) return Promise.resolve();
+  if (!_captchaInFlight) {
+    _captchaInFlight = sliderCaptcha().then(r => captchaSave(r.pass_token, r.expires_in))
+      .finally(() => { _captchaInFlight = null; });
+  }
+  return _captchaInFlight;
+}
+
+/** One slider puzzle: drag the piece into the darkened hole, release. */
+function sliderCaptcha() {
+  return new Promise((resolve, reject) => {
+    let pieceX = 0, startT = 0, points = 0, data = null, done = false, dragging = false;
+    const piece = h("img", { class: "cap-piece", draggable: "false" });
+    const bgImg = h("img", { class: "cap-bg", draggable: "false" });
+    const handle = h("div", { class: "cap-handle" }, "\u00bb");
+    const hint = h("div", { class: "muted", style: "text-align:center;margin-top:8px" }, t("captcha_hint"));
+    const panel = h("div", { class: "panel", style: "max-width:360px" },
+      h("div", { class: "head" }, t("captcha_title")),
+      h("div", { class: "body" },
+        h("div", { class: "cap-stage" }, bgImg, piece),
+        h("div", { class: "cap-track" }, handle),
+        hint));
+    const overlay = h("div", { class: "modal" }, panel);
+    document.body.append(overlay);
+
+    function close() { overlay.remove(); document.removeEventListener("pointermove", onMove); document.removeEventListener("pointerup", onUp); }
+    overlay.addEventListener("mousedown", e => { if (e.target === overlay && !done) { done = true; close(); reject(new Error("captcha_cancelled")); } });
+
+    function place() {
+      piece.style.left = pieceX + "px";
+      handle.style.left = pieceX + "px";
+    }
+    async function fresh() {
+      const r = await fetch("/api/captcha/new", { headers: captchaPass() ? { "X-Captcha-Pass": captchaPass() } : {} });
+      const d = await r.json();
+      if (!d || d.ok === false) throw new Error(d && d.error || "captcha_unavailable");
+      data = d;
+      pieceX = 0; points = 0; startT = 0;
+      bgImg.src = d.bg; piece.src = d.piece;
+      piece.style.top = d.piece_y + "px";
+      const stage = bgImg.parentElement;
+      stage.style.width = d.width + "px"; stage.style.height = d.height + "px";
+      piece.parentElement.classList.add("cap-ready");
+      place();
+    }
+    function onMove(e) {
+      if (!dragging) return;
+      const track = handle.parentElement.getBoundingClientRect();
+      const max = data.width - data.puzzle;
+      const x = Math.max(0, Math.min(max, e.clientX - track.left - handle.offsetWidth / 2));
+      if (Math.round(x) !== pieceX) points++;
+      pieceX = Math.round(x);
+      place();
+    }
+    async function onUp() {
+      if (!dragging) return;
+      dragging = false;
+      const ms = Date.now() - startT;
+      try {
+        const r = await fetch("/api/captcha/verify", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ captcha_id: data.captcha_id, dx: pieceX, ms, points }) });
+        const d = await r.json();
+        if (r.ok && d.pass_token) { done = true; close(); resolve(d); return; }
+        toast(t((d && d.error) || "captcha_failed"), false);
+      } catch (e) { toast(t("captcha_failed"), false); }
+      pieceX = 0; points = 0; place();
+      fresh().catch(() => {});
+    }
+    handle.addEventListener("pointerdown", e => {
+      if (done) return;
+      dragging = true; startT = Date.now(); points = 0;
+      e.preventDefault();
+    });
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    fresh().catch(e => { done = true; close(); reject(e); });
+  });
 }
 
 function statusTag(s) {
@@ -476,16 +580,45 @@ async function render() {
 window.addEventListener("hashchange", () => render());
 
 // ----------------------------------------------------------------- views
-/** Public landing page: company logo + name, Sign in button, admin-editable Markdown. */
+/** Public landing page: company logo + name, Sign in button, admin-editable Markdown.
+ *  Carries a public KB search: anonymous visitors may search the public
+ *  articles, one slider pass per half hour on the open internet. */
 async function homeView() {
   if (!state.brand) await loadBrand();
   const b = state.brand || {};
   const name = b.company_name || "RankEZ";
+  const searchInp = h("input", { class: "filter-grow", placeholder: t("home_search_placeholder") });
+  const results = h("div", { class: "home-search-results" });
+  async function runSearch() {
+    const q = searchInp.value.trim();
+    results.innerHTML = "";
+    if (!q) return;
+    const req = () => api("/api/kb/articles?vis=public&q=" + encodeURIComponent(q));
+    let r;
+    try { r = await req(); }
+    catch (e) {
+      if (e.message !== "captcha_required") { results.append(h("div", { class: "muted" }, e.message)); return; }
+      try { await ensureCaptcha(); } catch (e2) { return; } // user closed the puzzle
+      r = await req();
+    }
+    const items = r.items || [];
+    if (!items.length) { results.append(h("div", { class: "muted" }, t("no_results"))); return; }
+    for (const a of items.slice(0, 8)) {
+      results.append(h("a", { class: "home-search-item", href: "#/kb/" + a.id },
+        h("span", {}, a.title),
+        h("span", { class: "muted" }, (a.module || a.source || ""))));
+    }
+  }
+  searchInp.addEventListener("keydown", e => { if (e.key === "Enter") runSearch(); });
   const body = h("div", { class: "home" },
     h("section", { class: "home-hero" },
       b.company_logo ? h("img", { src: b.company_logo, class: "home-logo", alt: name }) : null,
       h("h1", { class: "home-title" }, name),
       h("p", { class: "muted" }, t("welcome_hero_sub")),
+      h("div", { class: "home-search card" }, h("div", { class: "card-body" },
+        h("div", { class: "filters" }, searchInp,
+          h("button", { class: "btn btn-blue", onclick: runSearch }, t("kb_search")))),
+        results),
       h("div", { class: "home-cta" },
         state.user
           ? h("a", { class: "btn btn-blue", href: "#/dashboard" }, t("go_dashboard"))
@@ -505,22 +638,38 @@ function loginView() {
       h("div", {}, email, pw, totp),
       h("button", { class: "btn btn-blue", style: "width:100%;margin-top:10px", onclick: async (e) => {
         e.preventDefault();
-        const payload = { email: email.value, password: pw.value };
-        if (totp.value) payload.totp = totp.value;
-        const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        const data = await r.json().catch(() => ({ error: "HTTP " + r.status }));
-        if (data.need_totp) { totp.classList.remove("hidden"); totp.focus(); toast(t("totp_prompt") || "Enter your 2FA code"); return; }
-        if (data.error) { toast(data.error, false); return; }
-        state.token = data.token;
-        const me = await api("/api/me");
-        state.user = me; state.me_perms = new Set(me.permissions);
-        state.meta = await api("/api/meta");
-        state.products = state.meta.products;
-        state.modules = state.meta.modules || [];
-        state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
-        applyTheme(state.meta.theme);
-        startIdleWatchdog();
-        window.location.hash = "#/dashboard";
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        try {
+          const payload = { email: email.value, password: pw.value };
+          if (totp.value) payload.totp = totp.value;
+          const post = () => fetch("/api/auth/login", {
+            method: "POST",
+            headers: Object.assign({ "Content-Type": "application/json" },
+              captchaPass() ? { "X-Captcha-Pass": captchaPass() } : {}),
+            body: JSON.stringify(payload) });
+          let r = await post();
+          let data = await r.json().catch(() => ({ error: "HTTP " + r.status }));
+          // the open internet owes a slider first; the intranet walks straight in
+          if (r.status === 403 && data.detail === "captcha_required") {
+            try { await ensureCaptcha(); } catch (e2) { toast(t("captcha_failed"), false); return; }
+            r = await post();
+            data = await r.json().catch(() => ({ error: "HTTP " + r.status }));
+          }
+          if (data.need_totp) { totp.classList.remove("hidden"); totp.focus(); toast(t("totp_prompt") || "Enter your 2FA code"); return; }
+          if (data.error) { toast(data.error, false); return; }
+          state.token = data.token;
+          if (data.captcha_pass) captchaSave(data.captcha_pass, 1800);
+          const me = await api("/api/me");
+          state.user = me; state.me_perms = new Set(me.permissions);
+          state.meta = await api("/api/meta");
+          state.products = state.meta.products;
+          state.modules = state.meta.modules || [];
+          state.deployTypes = state.meta.deploy_types || ["ON-PREM", "SaaS"];
+          applyTheme(state.meta.theme);
+          startIdleWatchdog();
+          window.location.hash = "#/dashboard";
+        } finally { btn.disabled = false; }
       } }, t("sign_in_btn")),
       h("p", { class: "muted", style: "text-align:center;margin-top:10px" },
         h("a", { href: "#/register" }, t("register")),
@@ -2355,7 +2504,7 @@ document.documentElement.lang = state.lang === "en" ? "en" : (state.lang === "zh
   // server instead. A same-origin fetch sends the cookie, so a page refresh keeps
   // the session, and a 401 puts us cleanly back on the login screen.
   try {
-    state.user = await api("/api/me");
+    state.user = await api("/api/me", { noRedirect: true });
     state.me_perms = new Set(state.user.permissions);
     state.meta = await api("/api/meta");
     state.products = state.meta.products;

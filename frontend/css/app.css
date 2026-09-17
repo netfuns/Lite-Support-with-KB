@@ -251,6 +251,27 @@ table td, table th { word-break:break-word; }
   max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .kb-editor-body { min-height:340px; font-family:ui-monospace,Menlo,Consolas,monospace; line-height:1.65; }
 
+/* slider captcha -- drag the piece into the darkened hole; one pass buys
+   30 quiet minutes on the public endpoints (login, anonymous kb search) */
+.cap-stage { position:relative; margin:0 auto; border-radius:8px; overflow:hidden; user-select:none; touch-action:none; }
+.cap-bg { display:block; width:100%; }
+.cap-piece { position:absolute; left:0; top:0; width:44px; height:44px; cursor:grab;
+  filter:drop-shadow(0 2px 5px rgba(0,0,0,.45)); }
+.cap-piece:active { cursor:grabbing; }
+.cap-track { position:relative; height:36px; margin-top:10px; background:var(--bg);
+  border:1px solid var(--line); border-radius:18px; }
+.cap-handle { position:absolute; left:0; top:2px; width:52px; height:30px; background:var(--blue);
+  color:#fff; border-radius:15px; display:flex; align-items:center; justify-content:center;
+  cursor:grab; font-weight:700; touch-action:none; }
+.cap-handle:active { cursor:grabbing; }
+
+/* public kb search on the landing page */
+.home-search { max-width:560px; margin:6px auto 0; text-align:left; width:100%; }
+.home-search-results { margin-top:8px; display:flex; flex-direction:column; gap:4px; }
+.home-search-item { display:flex; justify-content:space-between; gap:12px; padding:6px 10px;
+  border-radius:8px; text-decoration:none; color:inherit; }
+.home-search-item:hover { background:color-mix(in srgb, var(--blue) 8%, transparent); }
+
 @media (max-width:900px) {
   .layout { flex-direction:column; }
   nav.sidebar { width:100%; position:static; }

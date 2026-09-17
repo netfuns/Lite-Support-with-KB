@@ -188,9 +188,29 @@ CREATE TABLE IF NOT EXISTS kb_article_groups (
   PRIMARY KEY (article_id, group_id)
 );
 
+-- slider-captcha passes: a solved puzzle buys 30 quiet minutes per client IP
+CREATE TABLE IF NOT EXISTS captcha_pass (
+  token TEXT PRIMARY KEY,
+  ip TEXT DEFAULT '',
+  user_id INTEGER,
+  created TEXT DEFAULT (datetime('now')),
+  expires REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_msg_ticket ON messages(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ticket_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_article_coll ON kb_articles(collection_id);
+-- three-year-scale hot paths: list filters, owner desk, kb retrieval
+CREATE INDEX IF NOT EXISTS idx_ticket_owner ON tickets(owner_id);
+CREATE INDEX IF NOT EXISTS idx_ticket_customer ON tickets(customer_id);
+CREATE INDEX IF NOT EXISTS idx_ticket_created ON tickets(created_at);
+CREATE INDEX IF NOT EXISTS idx_article_vis ON kb_articles(visibility);
+CREATE INDEX IF NOT EXISTS idx_article_ticket ON kb_articles(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_att_ticket ON attachments(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_att_article ON attachments(article_id);
+CREATE INDEX IF NOT EXISTS idx_att_msg ON attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_token_user ON tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_ugr_user ON user_groups_rel(user_id);
 """
 
 
@@ -198,6 +218,13 @@ def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # public-internet posture: WAL readers never block; NORMAL sync is the
+    # documented pairing with WAL (a crash may lose the last transaction,
+    # never the database); the page cache covers the working set.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-8000")
     return conn
 
 

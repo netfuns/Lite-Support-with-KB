@@ -11,6 +11,7 @@ from datetime import datetime
 
 import auth
 import rbac
+import captcha as CAPTCHA
 import convert
 import desens
 import mailer
@@ -373,12 +374,41 @@ def fail(code, msg):
 
 
 # =============================== AUTH ===============================
+@app.get("/api/captcha/new")
+def captcha_new(request: Request):
+    """Paint a fresh slider puzzle. Rate-limited per client IP."""
+    ip = CAPTCHA.client_ip(request)
+    data = CAPTCHA.issue(ip)
+    if not data.get("ok"):
+        return JSONResponse(data, 429)
+    return ok(**data)
+
+
+@app.post("/api/captcha/verify")
+async def captcha_verify(request: Request):
+    """One shot. On success the client gets a 30-minute pass bound to its IP."""
+    b = await request.json()
+    ip = CAPTCHA.client_ip(request)
+    r = CAPTCHA.verify(ip, b.get("captcha_id"), b.get("dx"), b.get("ms"), b.get("points"))
+    if not r.get("ok"):
+        return JSONResponse(r, 403)
+    c = conn_()
+    try:
+        tok = CAPTCHA.grant_pass(c, ip)
+    finally:
+        c.close()
+    return ok(pass_token=tok, expires_in=CAPTCHA.PASS_TTL)
+
+
 @app.post("/api/auth/login")
 async def login(request: Request):
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
     pw = body.get("password") or ""
     c = conn_()
+    # anti-crawler / anti-brute-force: from the open internet a fresh slider
+    # pass (30 min) must come with the attempt; internal addresses are exempt
+    CAPTCHA.guard(request, c)
     u = c.execute("SELECT * FROM users WHERE lower(email)=?", (email,)).fetchone()
     if not u or not auth.verify_password(pw, u["password_hash"] or ""):
         c.close()
@@ -394,9 +424,12 @@ async def login(request: Request):
                 JSONResponse({"need_totp": True}, 200)
     tok = auth.new_token()
     c.execute("INSERT INTO tokens(token,user_id,pending) VALUES(?,?,0)", (tok, u["id"]))
+    # signing in also mints a fresh captcha pass: the human just proved to be
+    # one, so searching right after the login must not puzzle him again
+    cpass = CAPTCHA.grant_pass(c, CAPTCHA.client_ip(request), u["id"])
     c.commit()
     c.close()
-    resp = ok(token=tok)
+    resp = ok(token=tok, captcha_pass=cpass)
     resp.set_cookie("rz_token", tok, httponly=True, samesite="lax", max_age=60 * 60 * 12)
     return resp
 
@@ -1358,6 +1391,9 @@ def kb_list(request: Request, collection: int = None, q: str = "", vis: str = ""
             module: str = ""):
     u = current_user(request)
     c = conn_()
+    if not u:
+        # anonymous homepage search: a fresh slider pass (30 min) is the toll
+        CAPTCHA.guard(request, c)
     gids = rbac.groups_for_user(c, u["id"], u["email"]) if u else set()
     sql = "SELECT * FROM kb_articles WHERE 1=1"
     args = []
