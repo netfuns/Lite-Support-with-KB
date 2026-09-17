@@ -837,16 +837,19 @@ function loginView() {
                           maxlength: 6, placeholder: t("totp_prompt") });
   // enrollment UI shown when a freshly created account must set up TOTP
   const enrollBox = h("div", { class: "totp hidden", style: "margin-top:8px" });
-  let enrollState = null; // {secret, uri}
-  function renderEnroll(secret, uri) {
+  let enrollState = null; // {secret, uri, qr_svg}
+  // The QR is drawn by the server (auth.qr_svg) and inlined. The old
+  // <img src="api.qrserver.com/v1/code-16x16.php..."> pointed at the wrong
+  // endpoint and needed the public internet, so nothing ever scanned. The text
+  // secret stays below as the fallback that always works.
+  function renderEnroll(secret, uri, qrSvg) {
     enrollBox.innerHTML = "";
     enrollBox.append(
       h("p", { class: "muted" }, t("totp_enroll_prompt")),
+      qrSvg ? h("div", { style: "margin:8px 0", innerHTML: qrSvg }) : null,
       h("p", { style: "word-break:break-all;font-family:monospace;background:#f4f5f7;padding:8px;border-radius:6px" },
         secret || ""),
-      uri ? h("p", { style: "text-align:center" },
-        h("img", { src: "https://api.qrserver.com/v1/code-16x16.php?size=160x160&data=" + encodeURIComponent(uri),
-                   alt: "TOTP QR", style: "max-width:160px" })) : null,
+      uri ? h("div", { class: "muted", style: "font-size:12px;word-break:break-all;margin-top:4px" }, uri) : null,
       h("p", { class: "muted", style: "font-size:12px" }, t("totp_enroll_hint")));
   }
   async function finishLogin(data) {
@@ -890,7 +893,7 @@ function loginView() {
           }
           if (data.need_enroll_totp) {
             enrollState = { secret: data.totp_secret, uri: data.totp_uri };
-            renderEnroll(data.totp_secret, data.totp_uri);
+            renderEnroll(data.totp_secret, data.totp_uri, data.totp_qr_svg);
             enrollBox.classList.remove("hidden");
             totp.classList.remove("hidden"); totp.focus();
             toast(t("totp_enroll_prompt"), true);
@@ -2098,14 +2101,20 @@ function meView() {
   const totpEnableBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
     const r = await fetch("/api/me/totp/enable", { method: "POST", headers: authHeaders() });
     const d = await r.json();
-    totp.textContent = "Secret: " + d.secret + "\nURI: " + d.uri + "\n\nScan with your TOTP app, then save.";
+    // server-rendered QR first, plain secret right under it as the fallback
+    totp.innerHTML = "";
+    if (d.qr_svg) totp.append(h("div", { style: "margin:8px 0", innerHTML: d.qr_svg }));
+    totp.append(
+      h("div", { style: "word-break:break-all;font-family:monospace;font-size:12px" }, "Secret: " + d.secret),
+      h("div", { style: "word-break:break-all;font-size:12px" }, "URI: " + d.uri),
+      h("div", { style: "font-size:12px" }, "Scan the QR, or key the secret into your TOTP app, then save."));
     totp.classList.remove("hidden");
   } }, "Enable TOTP");
   const totpDisableBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
     await fetch("/api/me/totp/disable", { method: "POST", headers: authHeaders() });
     toast("OK"); render();
   } }, "Disable TOTP");
-  totp = h("pre", { class: "muted hidden" }, "");
+  totp = h("div", { class: "muted hidden" }, "");
   const roleText = (state.user.roles || []).join(", ");
   const grpText = (state.user.groups || []).join(", ");
   const perms = (state.user.permissions || []).length;

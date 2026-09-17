@@ -454,13 +454,15 @@ async def login(request: Request):
         if not code:
             c.commit()
             c.close()
+            uri = auth.totp_uri(u["email"], secret)
             return JSONResponse({"need_enroll_totp": True, "totp_secret": secret,
-                                 "totp_uri": auth.totp_uri(u["email"], secret)}, 200)
+                                 "totp_uri": uri, "totp_qr_svg": auth.qr_svg(uri)}, 200)
         if not auth.totp_verify(secret, code):
             c.commit()
             c.close()
+            uri = auth.totp_uri(u["email"], secret)
             return JSONResponse({"need_enroll_totp": True, "totp_secret": secret,
-                                 "totp_uri": auth.totp_uri(u["email"], secret)}, 200)
+                                 "totp_uri": uri, "totp_qr_svg": auth.qr_svg(uri)}, 200)
         # code verified: mark TOTP enrolled, drop the enrollment flag
         c.execute("UPDATE users SET totp_enabled=1, totp_secret=?, require_totp=0 WHERE id=?",
                   (secret, u["id"]))
@@ -586,7 +588,8 @@ async def my_totp_enable(request: Request):
     c.execute("UPDATE users SET totp_secret=?, totp_enabled=1 WHERE id=?", (secret, u["id"]))
     c.commit()
     c.close()
-    return ok(secret=secret, uri=auth.totp_uri(u["email"], secret))
+    uri = auth.totp_uri(u["email"], secret)
+    return ok(secret=secret, uri=uri, qr_svg=auth.qr_svg(uri))
 
 
 @app.post("/api/me/totp/disable")
@@ -665,16 +668,11 @@ async def register(request: Request):
     if partner:
         gid = rbac.ensure_partner_group(c, partner["id"], partner["name"])
         c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
-    # Somebody on one of this installation's own domains is desk staff, not a
-    # customer -- handing them the 客户 role used to contradict the internal group
-    # they belong to and made the users list read "客户" for a colleague.
-    if rbac.is_internal_email(c, email):
-        role_name = "L1售后人员"
-    else:
-        role_name = "代理商" if (partner and not cust) else "客户"
-    role = c.execute("SELECT id FROM roles WHERE name=?", (role_name,)).fetchone()
-    if role:
-        c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
+    # The role follows the groups the address just earned -- an address on one
+    # of this installation's own domains is desk staff, a partner domain is
+    # 代理商, anything else is 客户. Shared with the inbound-mail path
+    # (tickets.find_or_create_user) so the two can never disagree.
+    rbac.align_domain_role(c, uid, email)
     _sync_internal_group(c, uid, email)
     c.commit()
     c.close()

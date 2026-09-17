@@ -186,14 +186,13 @@ def find_or_create_user(conn, email, display_name="", send_credentials=False):
         (email, name, auth.hash_password(pw) if pw else None, 1 if send_credentials else 0))
     uid = cur.lastrowid
     # e-mail-domain rule: join the matching customer / partner group (+ the
-    # internal group when the domain is internal). Add-only — nothing to evict on
+    # internal group when the domain is internal). Add-only -- nothing to evict on
     # a fresh user.
     rbac.sync_email_groups(conn, uid, email, remove_stale=False)
-    role = conn.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
-    if role:
-        conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
-    # an address on one of the site's own domains is staff, not a customer
-    rbac.align_internal_role(conn, uid, email)
+    # The role follows the group the domain just earned. Hard-coding 客户 here
+    # used to mislabel every agent whose first contact was an inbound e-mail
+    # (netfuns@hotmail.com): right group, wrong role in the users list.
+    rbac.align_domain_role(conn, uid, email)
     conn.commit()
     mailed = False
     if send_credentials:

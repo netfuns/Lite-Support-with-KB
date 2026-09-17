@@ -62,6 +62,35 @@ def totp_uri(email: str, secret_b32: str, issuer="RankEZ Support") -> str:
     return "otpauth://totp/%s:%s?secret=%s&issuer=%s" % (quote(issuer), quote(email), secret_b32, quote(issuer))
 
 
+def qr_svg(data: str, box_size=5, border=2) -> str:
+    """An inline SVG QR code for `data`, or "" when no encoder is available.
+
+    Encoded here on purpose. The enrollment screen used to point an <img> at
+    api.qrserver.com -- wrong endpoint (that path is not the QR one) and
+    unreachable from an intranet install anyway -- so the user saw a broken box
+    and had to key the secret in by hand. ``qrcode`` has been in
+    requirements.txt all along, so this needs nothing outside the venv.
+
+    The caller drops the markup into an existing document, hence the pixel
+    size is pinned via a style attribute (the encoder emits millimetres).
+    """
+    try:
+        import io
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage,
+                          box_size=box_size, border=border)
+        buf = io.BytesIO()
+        img.save(buf)
+        svg = buf.getvalue().decode("utf-8").strip()
+    except Exception:
+        return ""
+    if svg.startswith("<?xml"):
+        svg = svg.split("?>", 1)[-1].strip()
+    return svg.replace("<svg",
+                       '<svg style="width:176px;height:176px;display:block;margin:0 auto"', 1)
+
+
 # ---------- tokens ----------
 
 def new_token() -> str:

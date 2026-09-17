@@ -639,6 +639,60 @@ def align_internal_role(conn, uid, email):
     return True
 
 
+def domain_role_name(conn, uid, email):
+    """The role an address implies, read off the groups that address earned.
+
+    Group membership is the single source of truth: sync_email_groups() has
+    already turned the domain into "Partner-<name>" / "Customer-<name>" / the
+    internal group, so the role is derived from that instead of re-matching
+    domains here -- importing tickets.match_partner into rbac would make the
+    two drift apart the moment either side changed.
+
+    A partner wins over the plain customer default, because a partner group
+    grants everything a customer group does plus view_partner.
+    """
+    if is_internal_email(conn, email):
+        return "L1售后人员"
+    rows = conn.execute(
+        "SELECT g.customer_id, g.partner_id FROM user_groups_rel rel "
+        "JOIN user_groups g ON g.id=rel.group_id WHERE rel.user_id=?", (uid,)).fetchall()
+    if any(r["partner_id"] for r in rows):
+        return "代理商"
+    return "客户"
+
+
+def align_domain_role(conn, uid, email):
+    """Give an account the role its e-mail domain implies.
+
+    Replaces the 客户 default that the inbound-mail path used to apply blind:
+    an agent writing in from a partner domain (netfuns@hotmail.com, whose
+    partner record owns hotmail.com) ended up in the right "Partner-<name>"
+    group but labelled 客户 in the users list. Same conservatism as
+    align_internal_role -- only the default 客户 role is ever swapped, a role an
+    administrator picked on purpose (管理员, L1/L2, 代理商) is left alone.
+    """
+    if uid is None or not email:
+        return False
+    want = domain_role_name(conn, uid, email)
+    if not want:
+        return False
+    names = [r["name"] for r in conn.execute(
+        "SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id "
+        "WHERE ur.user_id=?", (uid,)).fetchall()]
+    if want in names:
+        return False                      # already correct -- nothing to do
+    if names and set(names) - {"客户"}:
+        return False                      # deliberate role -- hands off
+    role = conn.execute("SELECT id FROM roles WHERE name=?", (want,)).fetchone()
+    if not role:
+        return False
+    conn.execute("DELETE FROM user_roles WHERE user_id=? AND role_id IN "
+                 "(SELECT id FROM roles WHERE name='客户')", (uid,))
+    conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)",
+                 (uid, role["id"]))
+    return True
+
+
 def customer_groups_for_user(conn, uid):
     """The customer rows this user reaches through managed group membership."""
     out = []
