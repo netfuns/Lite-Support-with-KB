@@ -416,6 +416,14 @@ async def login(request: Request):
     if u["status"] != "active":
         c.close()
         return JSONResponse({"error": "account_disabled"}, 403)
+    # Self-heal: if this address' domain turned internal after the account was
+    # created (a domain saved later, or the site domain only now detectable),
+    # the membership and the default role are re-evaluated here so the user does
+    # not have to wait for an administrator to touch anything.
+    try:
+        rbac.resync_internal(c, email=u["email"])
+    except Exception:  # noqa: BLE001 - bookkeeping must not block a login
+        pass
     # TOTP enforcement:
     #  - totp_enabled: the user already enrolled; require their code now (existing).
     #  - require_totp (mail/auto-created or forgot-reset account, not yet enrolled):
@@ -588,7 +596,13 @@ async def register(request: Request):
     if partner:
         gid = rbac.ensure_partner_group(c, partner["id"], partner["name"])
         c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
-    role_name = "代理商" if (partner and not cust) else "客户"
+    # Somebody on one of this installation's own domains is desk staff, not a
+    # customer -- handing them the 客户 role used to contradict the internal group
+    # they belong to and made the users list read "客户" for a colleague.
+    if rbac.is_internal_email(c, email):
+        role_name = "L1售后人员"
+    else:
+        role_name = "代理商" if (partner and not cust) else "客户"
     role = c.execute("SELECT id FROM roles WHERE name=?", (role_name,)).fetchone()
     if role:
         c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
@@ -2266,13 +2280,16 @@ def _internal_domains_payload(c):
     """The configured suffixes + everyone they currently make desk staff.
 
     `site_domains` are the domains this installation recognised as its own
-    (Settings > Mail + the staff accounts that already exist). They are always
-    allowed to register; listing them here tells the administrator why an
-    address went through even though it is not in the list above.
+    (Settings > Mail + the staff accounts that already exist). They behave as
+    internal domains -- their owners join 内部用户组 -- without anybody having to
+    type them in; `effective` is the union actually in force. Promoting one with
+    "+" only pins it, so it survives a change of mailbox.
     """
     doms = site_internal_domains()
     derived = [d for d in rbac.derived_site_domains(c) if d not in doms]
-    return {"domains": doms, "site_domains": derived, "users": rbac.internal_users(c)}
+    return {"domains": doms, "site_domains": derived,
+            "effective": rbac.effective_internal_domains(c),
+            "users": rbac.internal_users(c)}
 
 
 def _normalize_domain(x):
@@ -2310,12 +2327,14 @@ async def admin_internal_domains_save(request: Request):
     c = conn_()
     set_setting(c, "internal_domains", json.dumps(doms, ensure_ascii=False))
     c.commit()
-    # Re-evaluate internal membership: a domain that was dropped must evict the
-    # users it used to make staff (scoped to the internal group only).
-    for r in c.execute("SELECT id,email FROM users"):
-        rbac.sync_email_groups(c, r["id"], r["email"], remove_stale=True, only="internal")
+    # Re-evaluate internal membership: a domain that was added must pull in the
+    # accounts that already sat on it (they were created as 客户 before the domain
+    # became internal), a domain that was dropped must evict them again, and the
+    # default 客户 role follows the same rule. Scoped to the internal group only.
+    moved = rbac.resync_internal(c)
     c.commit()
     payload = _internal_domains_payload(c)
+    payload["moved"] = moved
     c.close()
     return ok(**payload)
 
@@ -2473,9 +2492,16 @@ async def mail_test(request: Request):
 def mail_poll_now(request: Request):
     require_perm(request, "settings.mail")
     c = conn_()
-    n = mailer.receive_once(c)
-    c.close()
-    return ok(handled=n)
+    try:
+        n = mailer.receive_once(c)
+        return ok(handled=n, error="")
+    except Exception as e:  # noqa: BLE001 - a bad IMAP account is a user error
+        # Used to bubble up as a bare 500 carrying the mail server's own English
+        # text, which the page could not show. Carry it back instead so
+        # "Poll now" can say what actually went wrong.
+        return ok(handled=0, error=str(e))
+    finally:
+        c.close()
 
 
 # =============================== ATTACHMENTS ===============================
@@ -2515,6 +2541,18 @@ def _loop():
         except Exception:
             pass
         time.sleep(60)
+
+
+# Memberships are materialised when an account is created, so a domain that only
+# became internal later (somebody finally saved Settings > Internal domains, or
+# the mailbox that defines the site domain was filled in) used to leave the
+# accounts already sitting on it as 客户 forever. Re-evaluate once at start-up.
+try:
+    _c = conn_()
+    rbac.resync_internal(_c)
+    _c.close()
+except Exception:  # noqa: BLE001 - never let a bookkeeping pass block boot
+    pass
 
 
 threading.Thread(target=_loop, daemon=True).start()

@@ -12,6 +12,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr
 from html import escape
+import imaplib
 from imaplib import IMAP4_SSL
 from urllib import request as urlreq
 
@@ -242,6 +243,55 @@ def send_email_only(cfg, to_list, subject, text_body, html_body=None):
         return False
 
 
+def _imap_bytes(dat):
+    """Human-readable text out of an imaplib response list."""
+    try:
+        parts = []
+        for x in dat or []:
+            if isinstance(x, (tuple, list)):
+                parts += [str(y) for y in x]
+            else:
+                parts.append(x.decode("utf-8", "replace") if isinstance(x, bytes) else str(x))
+        return " ".join(p for p in parts if p).strip()
+    except Exception:  # noqa: BLE001
+        return str(dat)
+
+
+def _imap_select(mbox, folder):
+    """SELECT `folder` and report honestly whether it opened."""
+    try:
+        typ, dat = mbox.select(folder)
+    except Exception as e:  # noqa: BLE001
+        return False, "%s: %s" % (folder, e)
+    if typ == "OK":
+        return True, ""
+    return False, "SELECT %s refused: %s" % (folder, _imap_bytes(dat))
+
+
+def _imap_identify(mbox, user):
+    """Send RFC 2971 ID -- 163/126 will not open a folder without it.
+
+    imaplib ships no ID command: it is missing from its `Commands` table, so
+    `_simple_command("ID", ...)` raises before anything reaches the wire -- which
+    is why an earlier attempt at this silently did nothing. 163 answers every
+    SELECT from an unidentified client with
+    "Unsafe Login. Please contact kefu@188.com for help".
+    """
+    try:
+        if "ID" not in imaplib.Commands:
+            imaplib.Commands["ID"] = ("AUTH", "SELECTED")
+        arg = '("name" "rankez-support" "version" "1.0" "vendor" "rankez" "contact" "%s")' \
+              % (user or "").replace('"', "").replace("\\", "")
+        typ, _dat = mbox._simple_command("ID", arg)
+        try:
+            mbox._untagged_response("OK", [], "ID")
+        except Exception:  # noqa: BLE001
+            pass
+        return typ == "OK"
+    except Exception:  # noqa: BLE001 - a server without ID simply ignores it
+        return False
+
+
 def receive_once(conn):
     """Connect IMAP, process unseen messages, return count handled."""
     cfg = mail_cfg(conn)
@@ -266,7 +316,17 @@ def receive_once(conn):
         mbox.login(cfg["imap_user"], cfg["imap_pass"])
     try:
         folder = cfg["imap_folder"] or "INBOX"
-        mbox.select(folder)
+        # 163/126 answer "Unsafe Login" to any SELECT from a client that has not
+        # identified itself first; the command is cheap, so always send it.
+        _imap_identify(mbox, cfg["imap_user"])
+        # imaplib's select() does *not* raise when the server refuses the folder:
+        # it just drops back to state AUTH. The next command then fails far away
+        # from the real cause with "SEARCH illegal in state AUTH". Check it.
+        opened, err = _imap_select(mbox, folder)
+        if not opened and (folder or "").strip().upper() != "INBOX":
+            opened, err = _imap_select(mbox, "INBOX")
+        if not opened:
+            raise RuntimeError(err or ("cannot open mailbox %s" % folder))
         typ, data = mbox.search(None, "UNSEEN")
         ids = (data[0] or b"").split()
         for num in ids[:50]:

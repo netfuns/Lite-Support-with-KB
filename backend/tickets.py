@@ -107,10 +107,11 @@ def find_or_create_user(conn, email, display_name="", send_credentials=False):
     # internal group when the domain is internal). Add-only — nothing to evict on
     # a fresh user.
     rbac.sync_email_groups(conn, uid, email, remove_stale=False)
-    # default role customer (auto-created users are always customer-facing)
     role = conn.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
     if role:
         conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, role["id"]))
+    # an address on one of the site's own domains is staff, not a customer
+    rbac.align_internal_role(conn, uid, email)
     conn.commit()
     mailed = False
     if send_credentials:

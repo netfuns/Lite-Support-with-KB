@@ -244,10 +244,13 @@ def derived_site_domains(conn):
     `domain_not_allowed` because the registration gate only looked at customer,
     partner and *configured* internal domains -- and nobody had configured them.
 
-    These domains let an address register; they do NOT enrol anybody in the
-    internal group, which stays a decision of Settings > Internal domains
-    (otherwise self-registration on the site's own domain would hand out desk
-    permissions to whoever signs up).
+    They behave exactly like the domains configured under Settings > Internal
+    domains: an address on one of them joins the internal group and counts as
+    desk staff. Keeping them out of it was tried and was simply wrong -- the
+    operator's own domain is the desk's domain, so somebody@the-site-domain was
+    registered as a 客户 and could not see the ticket queue. Public mail
+    providers are excluded, so pointing the mailbox at a 163/Gmail address can
+    never widen this into "everybody is staff".
     """
     out = []
 
@@ -276,6 +279,22 @@ def derived_site_domains(conn):
             add(_domain_of(r["email"]))
     except Exception:  # noqa: BLE001
         pass
+    return out
+
+
+def effective_internal_domains(conn):
+    """Every domain that makes an address desk staff.
+
+    The domains the administrator typed under Settings > Internal domains, plus
+    the domains this installation owns (`derived_site_domains`). Group
+    membership, the "internal user" test and the ticket-desk buttons all read
+    this, so a freshly detected site domain takes effect without anyone having
+    to configure it first.
+    """
+    out = list(_internal_domains(conn))
+    for d in derived_site_domains(conn):
+        if d not in out:
+            out.append(d)
     return out
 
 
@@ -341,7 +360,7 @@ def auto_group_ids(conn, email):
             if g:
                 gids.add(g["id"])
     gi = internal_group_id(conn)
-    if gi and domain_matches(domain, _internal_domains(conn)):
+    if gi and domain_matches(domain, effective_internal_domains(conn)):
         gids.add(gi)
     return gids
 
@@ -519,10 +538,71 @@ def internal_users(conn):
 
 
 def is_internal_email(conn, email):
-    """True when the address belongs to one of the internal domains."""
+    """True when the address belongs to one of the internal domains.
+
+    That includes the domains this installation owns, so the operator's own
+    address is staff rather than a customer.
+    """
     if not email or "@" not in email:
         return False
-    return domain_matches(email.split("@", 1)[1], _internal_domains(conn))
+    return domain_matches(email.split("@", 1)[1], effective_internal_domains(conn))
+
+
+def resync_internal(conn, email=None):
+    """Re-evaluate the internal membership of every user (or just `email`).
+
+    Domain-driven memberships are materialised when a user is created, so a
+    domain that is configured -- or detected -- afterwards used to leave the
+    accounts that already existed untouched: they stayed 客户 even though their
+    domain had become internal. Saving Settings > Internal domains and the
+    start-up both call this, which is what makes the setting retroactive.
+    """
+    if email:
+        rows = conn.execute("SELECT id,email FROM users WHERE lower(email)=?",
+                            (email.strip().lower(),)).fetchall()
+    else:
+        rows = conn.execute("SELECT id,email FROM users").fetchall()
+    changed = 0
+    for r in rows:
+        if not r["email"]:
+            continue
+        before = internal_group_id(conn) in groups_for_user(conn, r["id"])
+        sync_email_groups(conn, r["id"], r["email"], only="internal")
+        align_internal_role(conn, r["id"], r["email"])
+        after = internal_group_id(conn) in groups_for_user(conn, r["id"])
+        if before != after:
+            changed += 1
+    conn.commit()
+    return changed
+
+
+def align_internal_role(conn, uid, email):
+    """Drop the auto-assigned 客户 role from an account that is really staff.
+
+    A user created before its domain turned internal keeps the default 客户
+    role, which is then shown in the users list and contradicts the internal
+    group the account now belongs to. Only the default is swapped -- a role an
+    administrator picked on purpose (管理员, L1/L2, 代理商) is never touched.
+    """
+    if uid is None or not email:
+        return False
+    if not is_internal_email(conn, email):
+        return False
+    rows = conn.execute(
+        "SELECT ur.role_id, r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id "
+        "WHERE ur.user_id=?", (uid,)).fetchall()
+    names = [r["name"] for r in rows]
+    if names and set(names) - {"客户"}:
+        return False          # a deliberate role is in place -- hands off
+    if not names:
+        return False          # nothing to drop
+    staff = conn.execute("SELECT id FROM roles WHERE name=?", ("L1售后人员",)).fetchone()
+    conn.execute("DELETE FROM user_roles WHERE user_id=? AND role_id IN "
+                 "(SELECT id FROM roles WHERE name='客户')", (uid,))
+    if staff:
+        conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)",
+                     (uid, staff["id"]))
+    return True
 
 
 def customer_groups_for_user(conn, uid):
