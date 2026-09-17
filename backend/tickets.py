@@ -37,10 +37,9 @@ def find_or_create_user(conn, email, display_name=""):
     name = display_name or email.split("@", 1)[0]
     cur = conn.execute("INSERT INTO users(email,display_name) VALUES(?,?)", (email, name))
     uid = cur.lastrowid
-    cust = match_customer(conn, email)
-    if cust:
-        gid = rbac.ensure_customer_group(conn, cust["id"], cust["name"])
-        conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+    # e-mail-domain rule: join the matching customer group (+ the internal group
+    # when the domain is internal). Add-only — nothing to evict on a fresh user.
+    rbac.sync_email_groups(conn, uid, email, remove_stale=False)
     # default role customer
     role = conn.execute("SELECT id FROM roles WHERE name='客户'").fetchone()
     if role:

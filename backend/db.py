@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS user_groups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE NOT NULL,
   customer_id INTEGER,
-  builtin INTEGER DEFAULT 0
+  builtin INTEGER DEFAULT 0,
+  description TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -210,6 +211,9 @@ def migrate():
     if "last_seen" not in tk:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_seen TEXT")
         conn.execute("UPDATE tokens SET last_seen=created_at")
+    gc = _columns(conn, "user_groups")
+    if "description" not in gc:
+        conn.execute("ALTER TABLE user_groups ADD COLUMN description TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 

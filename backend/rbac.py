@@ -1,4 +1,32 @@
 """Permission catalogue, roles, groups seeding + access checks."""
+import json
+
+# ---------------------------------------------------------------------------
+# Group-derived permissions
+#
+# Memberships are TWO kinds:
+#   * manual  - an administrator put the user in the group; never touched here
+#   * managed - derived from the user's e-mail domain and re-aligned by
+#               sync_email_groups() on every create / register / e-mail change.
+#               "managed" == every customer-bound group + the internal group.
+#
+# Grants:
+#   * a customer-bound group  -> read + create on that customer's tickets
+#     (which tickets are visible is scoped to the customer by the queries)
+#   * the internal group      -> read + edit on every ticket, NEVER delete
+# ---------------------------------------------------------------------------
+# Stable machine key kept as "internal" (it is referenced in the database by
+# name); the UI shows INTERNAL_GROUP_LABEL instead.
+INTERNAL_GROUP = "internal"
+INTERNAL_GROUP_LABEL = "内部用户组"
+
+CUSTOMER_GROUP_PERMS = [
+    "ticket.create", "ticket.view_own", "ticket.reply", "ticket.change_status",
+]
+INTERNAL_GROUP_PERMS = [
+    "ticket.view_all", "ticket.create", "ticket.edit", "ticket.reply",
+    "ticket.change_status", "ticket.change_owner", "ticket.claim", "ticket.export",
+]
 
 # key -> (group label). Every UI button/action is a permission so roles can be built by ticking boxes.
 PERMISSIONS = [
@@ -144,28 +172,147 @@ def seed(conn):
     conn.commit()
 
 
-def groups_for_user(conn, uid, email):
-    """User's group ids: explicit group memberships + customer-domain group (auto by email domain)."""
+def _internal_domains(conn):
+    """Internal e-mail domains, read straight from settings (no circular import)."""
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key='internal_domains'").fetchone()
+        return [str(x).strip().lower() for x in json.loads(row["value"] or "[]") if str(x).strip()]
+    except Exception:
+        return []
+
+
+def ensure_internal_group(conn):
+    """Create (or return) the built-in staff group that matches internal domains."""
+    g = conn.execute("SELECT id FROM user_groups WHERE name=?", (INTERNAL_GROUP,)).fetchone()
+    if g:
+        return g["id"]
+    cur = conn.execute("INSERT INTO user_groups(name,builtin) VALUES(?,1)", (INTERNAL_GROUP,))
+    return cur.lastrowid
+
+
+def internal_group_id(conn):
+    row = conn.execute("SELECT id FROM user_groups WHERE name=?", (INTERNAL_GROUP,)).fetchone()
+    if row:
+        return row["id"]
+    return ensure_internal_group(conn)
+
+
+def managed_group_ids(conn):
+    """Groups whose membership is owned by the e-mail-domain rule."""
+    ids = {r["id"] for r in conn.execute("SELECT id FROM user_groups WHERE customer_id IS NOT NULL")}
+    gi = internal_group_id(conn)
+    if gi:
+        ids.add(gi)
+    return ids
+
+
+def domain_matches(domain, patterns):
+    """True when `domain` is exactly a pattern or one of its sub-domains."""
+    d = (domain or "").strip().lower()
+    if not d:
+        return False
+    for p in patterns:
+        p = (p or "").strip().lower()
+        if p and (d == p or d.endswith("." + p)):
+            return True
+    return False
+
+
+def auto_group_ids(conn, email):
+    """Group ids implied by an e-mail address (customer domains + internal)."""
     gids = set()
-    for r in conn.execute("SELECT group_id FROM user_groups_rel WHERE user_id=?", (uid,)):
-        gids.add(r["group_id"])
-    if email and "@" in email:
-        domain = email.split("@", 1)[1].lower()
-        for c in conn.execute("SELECT id,domains FROM customers"):
-            ds = [d.strip().lower() for d in (c["domains"] or "").split(",") if d.strip()]
-            if domain in ds or any(domain.endswith("." + d) for d in ds):
-                g = conn.execute("SELECT id FROM user_groups WHERE customer_id=?", (c["id"],)).fetchone()
-                if g:
-                    gids.add(g["id"])
+    if not email or "@" not in email:
+        return gids
+    domain = email.split("@", 1)[1].lower().strip()
+    if not domain:
+        return gids
+    for c in conn.execute("SELECT id,domains FROM customers"):
+        ds = [d.strip().lower() for d in (c["domains"] or "").split(",") if d.strip()]
+        if domain_matches(domain, ds):
+            g = conn.execute("SELECT id FROM user_groups WHERE customer_id=?", (c["id"],)).fetchone()
+            if g:
+                gids.add(g["id"])
+    gi = internal_group_id(conn)
+    if gi and domain_matches(domain, _internal_domains(conn)):
+        gids.add(gi)
     return gids
 
 
-def user_permissions(conn, uid):
+def sync_email_groups(conn, uid, email, remove_stale=True, only=None):
+    """Re-align domain-driven memberships.
+
+      * always joins the group of every customer whose domain the address matches,
+        plus the internal group when the domain is an internal domain
+      * with remove_stale, also leaves any managed group that no longer matches
+        (so changing to an unrelated address drops the old customer group)
+      * `only="internal"` limits the whole pass to the internal group, which is
+        what a change of internal domains should touch
+
+    remove_stale is opt-in because "an administrator put this user in the group"
+    and "the domain rule put this user in the group" are indistinguishable in the
+    table; only an e-mail change (or an internal-domain edit) may evict a member.
+    """
+    if uid is None:
+        return set()
+    want = auto_group_ids(conn, email)
+    if only == "internal":
+        gi = internal_group_id(conn)
+        managed = {gi} if gi else set()
+    else:
+        managed = managed_group_ids(conn)
+    want &= managed
+    have = {r["group_id"] for r in
+            conn.execute("SELECT group_id FROM user_groups_rel WHERE user_id=?", (uid,))}
+    if remove_stale:
+        for gid in (have & managed) - want:
+            conn.execute("DELETE FROM user_groups_rel WHERE user_id=? AND group_id=?", (uid, gid))
+    for gid in want - have:
+        conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+    return want
+
+
+def groups_for_user(conn, uid, email=None):
+    """Persisted group memberships.
+
+    Domain-driven membership is materialised by sync_email_groups(), which runs
+    on every create / register / e-mail change. Reading only the table keeps this
+    query cheap and makes "remove from group" actually take effect.
+    """
+    if uid is None:
+        return set()
+    return {r["group_id"] for r in
+            conn.execute("SELECT group_id FROM user_groups_rel WHERE user_id=?", (uid,))}
+
+
+def group_derived_perms(conn, uid):
+    """Permissions granted purely by group membership."""
+    perms = set()
+    if uid is None:
+        return perms
+    gids = groups_for_user(conn, uid)
+    if not gids:
+        return perms
+    marks = ",".join("?" * len(gids))
+    for r in conn.execute(
+            "SELECT id,name,customer_id FROM user_groups WHERE id IN (%s)" % marks, list(gids)):
+        if r["name"] == INTERNAL_GROUP:
+            perms.update(INTERNAL_GROUP_PERMS)
+        elif r["customer_id"]:
+            perms.update(CUSTOMER_GROUP_PERMS)
+    return perms
+
+
+def user_permissions(conn, uid, email=None):
+    """Role permissions plus everything granted by group membership."""
+    if uid is None:
+        return set()
     rows = conn.execute(
         "SELECT DISTINCT p.key FROM role_permissions rp "
         "JOIN permissions p ON p.id=rp.perm_id "
         "JOIN user_roles ur ON ur.role_id=rp.role_id WHERE ur.user_id=?", (uid,))
-    return set(r["key"] for r in rows)
+    perms = set(r["key"] for r in rows)
+    perms |= group_derived_perms(conn, uid)
+    return perms
 
 
 def has_perm(conn, uid, key):
@@ -174,12 +321,25 @@ def has_perm(conn, uid, key):
     return key in user_permissions(conn, uid)
 
 
+def customer_groups_for_user(conn, uid):
+    """The customer rows this user reaches through managed group membership."""
+    out = []
+    for g in conn.execute(
+            "SELECT gr.group_id FROM user_groups_rel gr WHERE gr.user_id=?", (uid,)):
+        row = conn.execute("SELECT customer_id FROM user_groups WHERE id=?", (g["group_id"],)).fetchone()
+        if row and row["customer_id"]:
+            c = conn.execute("SELECT * FROM customers WHERE id=?", (row["customer_id"],)).fetchone()
+            if c:
+                out.append(c)
+    return out
+
+
 def ensure_customer_group(conn, customer_id, customer_name):
     """Create (or return) the built-in user group bound to a customer."""
     g = conn.execute("SELECT id FROM user_groups WHERE customer_id=?", (customer_id,)).fetchone()
     if g:
         return g["id"]
-    name = "客户:" + customer_name
+    name = "客户组:" + customer_name
     cur = conn.execute(
         "INSERT INTO user_groups(name,customer_id,builtin) VALUES(?,?,1)", (name, customer_id))
     return cur.lastrowid

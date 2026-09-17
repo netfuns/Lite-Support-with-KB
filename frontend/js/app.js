@@ -155,7 +155,7 @@ function layout(title, content) {
             h("span", { class: "icon-search", onclick: doSearch }, "🔎"))
         : h("div", { class: "search-wrap" }),
       h("div", { class: "actions" },
-        h("select", { class: "lang", onchange: e => { setLang(e.target.value); render(current().route); } },
+        h("select", { class: "lang", onchange: e => { setLang(e.target.value); render(); } },
           LANGS.map(l => h("option", { value: l.id, selected: state.lang === l.id ? "selected" : null }, l.label))),
         state.user
           ? h("span", { class: "user", onclick: toggleUserMenu }, "👤 " + (state.user.display_name || state.user.email))
@@ -367,14 +367,16 @@ function sidebar() {
 // ----------------------------------------------------------------- router
 function current() {
   const raw = (window.location.hash || "#/").replace(/^#/, "");
-  const [path, id] = raw.split("/");
-  return { route: path.slice(1) || "dashboard", raw };
+  // "/ticket/12" -> ["", "ticket", "12"]; drop the empty leading segment so
+  // parts[0] is the route and parts[1..] are its arguments.
+  const parts = raw.split("/").filter(Boolean);
+  return { route: parts[0] || "dashboard", parts, raw };
 }
 
 async function render() {
   const c = current();
-  // handle sub-routes
-  let route = c.raw.replace(/^\/?/, "").split("/")[0];
+  const route = c.route;   // "/ticket/12" -> "ticket"
+  const arg = c.parts[1];  // "/ticket/12" -> "12"
   // these views dereference state.user, so an anonymous visitor must not reach them
   if (!state.user && (route === "dashboard" || route === "me" || route === "admin")) {
     if (window.location.hash !== "#/login") window.location.hash = "#/login";
@@ -384,21 +386,20 @@ async function render() {
   if (route === "" || route === "home" || route === "welcome") view = homeView();
   else if (route === "dashboard") view = dashboardView();
   else if (route === "tickets") view = ticketsView();
-  else if (route === "ticket") view = ticketDetail(c.raw.split("/")[1]);
+  else if (route === "ticket") view = ticketDetail(arg);
   else if (route === "new-ticket") view = newTicketView();
   else if (route === "kb") {
-    const seg = c.raw.split("/")[2];
-    if (seg === "new") view = kbEditorPage(null);
-    else if (seg === "edit") view = kbEditorPage(c.raw.split("/")[3]);
-    else if (seg) view = kbDetail(seg);
+    if (arg === "new") view = kbEditorPage(null);
+    else if (arg === "edit") view = kbEditorPage(c.parts[2]);
+    else if (arg === "collections") view = kbCollections();
+    else if (arg) view = kbDetail(arg);
     else view = kbView();
   } else if (route === "customers") view = customersView();
   else if (route === "login") view = loginView();
   else if (route === "register") view = registerView();
   else if (route === "me") view = meView();
   else if (route === "admin") {
-    // raw is "/admin/users" -> split("/") = ["", "admin", "users"]
-    const sub = c.raw.split("/")[2] || "users";
+    const sub = arg || "users";
     const map = { users: adminUsers, roles: adminRoles, groups: adminGroups,
                   settings: adminSettings, site: adminSite, welcome: adminWelcome,
                   company: adminCompany, domains: adminDomains };
@@ -569,7 +570,7 @@ async function ticketsView() {
     h("div", { class: "flex-between" }, h("h1", {}, t("tickets")),
       hasPerm("ticket.create") ? h("button", { class: "btn btn-blue", onclick: () => window.location.hash = "#/new-ticket" }, "+" + t("new_ticket")) : null),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
-      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, statusSel, prioSel, prodSel, ownerInp, custInp, verInp, dFrom, dTo,
+      h("div", { class: "filters" }, statusSel, prioSel, prodSel, ownerInp, custInp, verInp, dFrom, dTo,
         h("button", { class: "btn btn-ghost btn-sm", onclick: doLoad }, t("filter"))))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
@@ -587,9 +588,16 @@ async function ticketsView() {
 
 async function ticketDetail(id) {
   if (!state.user) return loginView();
+  if (!id) { window.location.hash = "#/tickets"; return { title: "", body: h("div", {}) }; }
   let data;
   try { data = await api("/api/tickets/" + id); } catch (e) {
-    return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, t("no_results"))) };
+    // surface the real reason instead of a bare "no results"
+    const msg = e.message === "not_found" ? t("ticket_not_found")
+              : e.message === "no_permission" ? t("no_permission")
+              : e.message;
+    return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("p", {}, msg),
+      h("a", { class: "btn btn-ghost btn-sm", href: "#/tickets" }, "← " + t("tickets")))) };
   }
   const T = data.ticket;
   const can = {
@@ -700,6 +708,17 @@ async function newTicketView() {
     return (r.items || []).map(c => ({ ...c, label: c.name + (c.domains ? "  <" + c.domains + ">" : "") }));
   }, c => { custInp.value = c.name; });
 
+  // A customer user only reaches their own customer's tickets, and the API pins
+  // the ticket to that customer — so don't offer them a free-text picker.
+  const isStaff = hasPerm("ticket.view_all");
+  const ownCustomers = (state.user.groups || [])
+    .filter(g => /^客户组[:：]/.test(g)).map(g => g.replace(/^客户组[:：]/, ""));
+  const custField = isStaff
+    ? h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")), custWrap)
+    : h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")),
+        h("input", { value: ownCustomers.join(", ") || "-", disabled: true }),
+        h("div", { class: "muted", style: "font-size:12px" }, t("customer_locked_hint")));
+
   const modules = (state.modules && state.modules.length) ? state.modules : (state.products || []);
   const prodSel = h("select", { style: "width:100%" },
     h("option", { value: "" }, t("select_product")),
@@ -718,15 +737,16 @@ async function newTicketView() {
     h("h1", {}, t("new_ticket")),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("div", {},
-        h("label", { class: "muted", style: "display:block;margin:6px 0 3px" }, t("title")), title,
-        h("label", { class: "muted", style: "display:block;margin:8px 0 3px" }, t("customer")), custWrap,
-        h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-top:8px" },
-          h("label", { style: "display:block" }, h("span", { class: "muted" }, t("module")), prodSel),
-          h("label", { style: "display:block" }, h("span", { class: "muted" }, t("deploy_type")), depSel),
-          h("label", { style: "display:block" }, h("span", { class: "muted" }, t("version")), verInp),
-          h("label", { style: "display:block" }, h("span", { class: "muted" }, t("select_priority")), prioSel)),
-        h("label", { class: "muted", style: "display:block;margin:8px 0 3px" }, t("desc")), desc,
-        h("div", { style: "margin:8px 0" }, h("label", { class: "muted" }, intChk, " " + t("internal")), fileInp),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("title")), title),
+        custField,
+        h("div", { class: "grid-4" },
+          h("label", { class: "field" }, h("span", { class: "muted" }, t("module")), prodSel),
+          h("label", { class: "field" }, h("span", { class: "muted" }, t("deploy_type")), depSel),
+          h("label", { class: "field" }, h("span", { class: "muted" }, t("version")), verInp),
+          h("label", { class: "field" }, h("span", { class: "muted" }, t("select_priority")), prioSel)),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("desc")), desc),
+        h("div", { style: "margin:8px 0" },
+          isStaff ? h("label", { class: "muted" }, intChk, " " + t("internal")) : null, fileInp),
         h("div", { style: "margin-top:10px" },
           h("button", { class: "btn btn-blue", onclick: async () => {
             if (!title.value) { toast(t("title") + " *", false); return; }
@@ -742,7 +762,11 @@ async function newTicketView() {
             for (const f of fileInp.files) fd.append("files", f);
             try {
               const r = await apiForm("/api/tickets", fd);
-              toast("OK: " + r.code); window.location.hash = "#/ticket/" + r.id;
+              if (!r || r.id == null) { toast("ticket_create_failed", false); return; }
+              toast("OK: " + (r.code || r.id));
+              window.location.hash = "#/ticket/" + r.id;
+              // the hash may already be the same string on a re-submit
+              if (current().parts[1] === String(r.id)) render();
             } catch (e) { toast(e.message, false); }
           } }, t("submit")),
           h("button", { class: "btn btn-ghost", style: "margin-left:8px", onclick: () => window.location.hash = "#/tickets" }, t("cancel")))))));
@@ -751,7 +775,7 @@ async function newTicketView() {
 
 async function kbView() {
   if (!state.user) return loginView();
-  const q = h("input", { placeholder: t("kb_search"), style: "flex:1;min-width:220px" });
+  const q = h("input", { placeholder: t("kb_search"), class: "filter-grow" });
   const modules = (state.modules && state.modules.length) ? state.modules : [];
   const modSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("module")),
     modules.map(m => h("option", { value: m }, m))]);
@@ -797,9 +821,10 @@ async function kbView() {
     h("div", { class: "flex-between" }, h("h1", {}, t("kb")),
       h("div", {},
         hasPerm("kb.import") ? h("button", { class: "btn btn-ghost", onclick: () => openImportModal(colSel.value) }, t("import")) : null,
+        hasPerm("kb.manage_collections") ? h("a", { class: "btn btn-ghost", href: "#/kb/collections", style: "margin-left:8px" }, t("kb_collections")) : null,
         canEdit ? h("a", { class: "btn btn-blue", href: "#/kb/new", style: "margin-left:8px" }, "+" + t("new_article")) : null)),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
-      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, q, modSel, colSel))),
+      h("div", { class: "filters" }, q, modSel, colSel))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
         h("thead", {}, h("tr", {}, [t("title"), t("module"), t("visibility"), "Source", t("created")].map(c => h("th", {}, c)))),
@@ -840,11 +865,10 @@ async function kbEditorPage(id) {
 
   const title = h("input", { value: art ? art.title : "", placeholder: t("kb_title"),
     style: "width:100%;box-sizing:border-box;font-size:18px;padding:8px" });
-  const bodyTa = h("textarea", { rows: 14, placeholder: t("kb_body"),
-    style: "width:100%;box-sizing:border-box;font-family:ui-monospace,Menlo,Consolas,monospace;line-height:1.6" });
+  const bodyTa = h("textarea", { rows: 14, placeholder: t("kb_body"), class: "kb-editor-body" });
   bodyTa.value = art ? (art.body || "") : "";
   // auto-grow with content
-  const autoGrow = () => { bodyTa.style.height = "auto"; bodyTa.style.height = Math.max(320, bodyTa.scrollHeight + 24) + "px"; };
+  const autoGrow = () => { bodyTa.style.height = "auto"; bodyTa.style.height = Math.max(340, bodyTa.scrollHeight + 24) + "px"; };
   bodyTa.addEventListener("input", autoGrow);
 
   const visSel = h("select", { style: "width:100%" },
@@ -869,11 +893,11 @@ async function kbEditorPage(id) {
           } catch (e) { toast(e.message, false); }
         } }, t("save")))),
     h("div", { class: "card" }, h("div", { class: "card-body" },
-      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("kb_title")), title),
-      h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" },
-        h("label", {}, h("span", { class: "muted" }, t("visibility")), visSel),
-        h("label", {}, h("span", { class: "muted" }, t("module")), modSel)),
-      h("label", { style: "display:block;margin:12px 0 6px" }, h("span", { class: "muted" }, t("kb_body")), bodyTa))));
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("kb_title")), title),
+      h("div", { class: "grid-2" },
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("visibility")), visSel),
+        h("label", { class: "field" }, h("span", { class: "muted" }, t("module")), modSel)),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("kb_body")), bodyTa))));
   setTimeout(autoGrow, 0);
   return { title: "", body };
 }
@@ -924,8 +948,8 @@ async function kbDetail(id) {
   const canExport = hasPerm("kb.export_pdf");
   const canShare = hasPerm("kb.share_email");
   const canDelete = hasPerm("kb.delete") && canEdit;
-  const body = h("div", { style: "max-width:1100px" },
-    h("div", { class: "flex-between mb-2" },
+  const body = h("div", { class: "kb-doc" },
+    h("div", { class: "kb-head mb-2" },
       h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
         // go back to the filtered list; fall back to #/kb
         if (history.length > 1) history.back(); else window.location.hash = "#/kb";
@@ -965,14 +989,14 @@ function openCustomerEditor(cust, onDone) {
     type: type || "text", placeholder: t(key), style: "width:100%" });
   const name = f("name"), domains = f("domains"), version = f("version");
   const start = f("service_start", "date"), end = f("service_end", "date"), contact = f("contact_email", "email");
-  const body = h("div", { style: "min-width:460px" },
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("name")), name),
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("domains")), domains),
-    h("div", { style: "display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px" },
-      h("label", {}, h("span", { class: "muted" }, t("version")), version),
-      h("label", {}, h("span", { class: "muted" }, t("service_start")), start),
-      h("label", {}, h("span", { class: "muted" }, t("service_end")), end)),
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("contact_email")), contact),
+  const body = h("div", { class: "page" },
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("name")), name),
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("domains")), domains),
+    h("div", { class: "grid-3" },
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("version")), version),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("service_start")), start),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("service_end")), end)),
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("contact_email")), contact),
     h("div", { class: "flex-between mt-2" },
       h("button", { class: "btn btn-blue", onclick: async () => {
         // Only the name is universally required. Email domains are mandatory when
@@ -999,7 +1023,7 @@ async function customersView() {
   const selected = new Set();
   let rows = [];
 
-  const q = h("input", { placeholder: t("search_customer"), style: "width:280px" });
+  const q = h("input", { placeholder: t("search_customer"), style: "width:100%" });
   const qWrap = attachSuggest(q, async val => {
     const r = await api("/api/customers?q=" + encodeURIComponent(val));
     return (r.items || []).map(c => ({ ...c, label: c.name + (c.domains ? "  <" + c.domains + ">" : "") }));
@@ -1106,7 +1130,7 @@ function meView() {
   const roleText = (state.user.roles || []).join(", ");
   const grpText = (state.user.groups || []).join(", ");
   const perms = (state.user.permissions || []).length;
-  const body = h("div", { style: "max-width:760px" },
+  const body = h("div", { class: "page-narrow" },
     h("h1", {}, t("my_account")),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("div", { class: "flex-between mb-2" },
@@ -1114,14 +1138,14 @@ function meView() {
         h("div", {}, h("div", { class: "muted" }, t("role")), h("div", {}, roleText),
           h("div", { class: "muted", style: "margin-top:6px" }, t("groups") + ": " + grpText),
           h("div", { class: "muted", style: "margin-top:6px" }, "Permissions: " + perms))),
-      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("display_name")), name),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("display_name")), name),
       h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
         await fetch("/api/me/name", { method: "POST", headers: { "Content-Type": "application/json", "X-Token": state.token }, body: JSON.stringify({ display_name: name.value }) });
         state.user.display_name = name.value; toast("OK");
       } }, t("save")),
-      h("div", { style: "display:flex;gap:8px;align-items:center;margin-top:12px" },
+      h("div", { class: "inline-field", style: "margin-top:12px" },
         h("span", { class: "muted" }, t("password")), pw1, pw2, savePw),
-      h("div", { style: "display:flex;gap:8px;margin-top:12px" },
+      h("div", { class: "inline-field", style: "margin-top:12px" },
         state.user.totp_enabled ? totpDisableBtn : totpEnableBtn, totp,
     ))));
   return { title: "", body };
@@ -1191,13 +1215,14 @@ function openUserEditor(user, onDone) {
     h("option", { value: "disabled", selected: user && user.status === "disabled" ? "selected" : null }, t("disabled")));
   loadRoleOptions(roleSel, true, user ? (user.roles || []) : []);
 
-  const body = h("div", { style: "min-width:420px" },
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("email")), email),
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("display_name")), name),
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, isNew ? t("password") : t("new_password")), pw),
-    h("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" },
-      h("label", {}, h("span", { class: "muted" }, t("role")), roleSel),
-      h("label", {}, h("span", { class: "muted" }, t("status")), statusSel)),
+  const body = h("div", { class: "page" },
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("email")), email),
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("display_name")), name),
+    h("label", { class: "field" }, h("span", { class: "muted" }, isNew ? t("password") : t("new_password")), pw),
+    h("div", { class: "grid-2" },
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("role")), roleSel),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("status")), statusSel)),
+    h("p", { class: "muted", style: "font-size:13px" }, t("auto_group_hint")),
     h("div", { class: "flex-between mt-2" },
       h("button", { class: "btn btn-blue", onclick: async () => {
         if (!email.value) { toast(t("email") + " *", false); return; }
@@ -1220,7 +1245,7 @@ async function adminUsers() {
   const selected = new Set();
   let rows = [];
 
-  const q = h("input", { placeholder: t("search_user"), style: "width:280px" });
+  const q = h("input", { placeholder: t("search_user"), style: "width:100%" });
   const qWrap = attachSuggest(q, async val => {
     const r = await api("/api/admin/users?q=" + encodeURIComponent(val));
     return (r.items || []).map(u => ({ ...u, label: (u.display_name || "") + "  <" + u.email + ">" }));
@@ -1293,10 +1318,10 @@ async function adminUsers() {
       h("option", { value: "active" }, t("active")),
       h("option", { value: "disabled" }, t("disabled")));
     loadRoleOptions(roleSel, true, []);
-    const body = h("div", { style: "min-width:380px" },
+    const body = h("div", { class: "page" },
       h("p", { class: "muted" }, t("bulk_update_hint") + " (" + selected.size + ")"),
-      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("role")), roleSel),
-      h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("status")), statusSel),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("role")), roleSel),
+      h("label", { class: "field" }, h("span", { class: "muted" }, t("status")), statusSel),
       h("div", { class: "flex-between mt-2" },
         h("button", { class: "btn btn-blue", onclick: async () => {
           const extra = {};
@@ -1404,7 +1429,7 @@ function openRoleEditor(role, menu) {
       return h("tr", {}, h("td", {}, t("menu_" + item.key)),
         h("td", { class: "muted" }, t("dashboard_always")));
     }
-    const sel = h("select", { style: "width:170px", disabled: ro },
+    const sel = h("select", { style: "max-width:240px", disabled: ro },
       [["none", t("level_none")], ["read", t("level_read")], ["edit", t("level_edit")]]
         .map(([v, label]) => h("option", {
           value: v, selected: (levels[item.key] || "none") === v ? "selected" : null }, label)));
@@ -1412,9 +1437,9 @@ function openRoleEditor(role, menu) {
     return h("tr", {}, h("td", {}, t("menu_" + item.key)), h("td", {}, sel));
   });
 
-  const body = h("div", { style: "min-width:540px;max-height:70vh;overflow:auto" },
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("role_name")), name),
-    h("label", { style: "display:block;margin:8px 0" }, h("span", { class: "muted" }, t("description")), desc),
+  const body = h("div", { class: "page", style: "max-height:70vh;overflow:auto" },
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("role_name")), name),
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("description")), desc),
     h("h3", { style: "margin-top:12px" }, t("level")),
     h("p", { class: "muted" }, t("menu_perm_hint")),
     h("table", {},
@@ -1440,29 +1465,146 @@ function openRoleEditor(role, menu) {
   showModal(isNew ? t("new_role") : t("edit_role"), body);
 }
 
+/** Type chip for a user group. */
+function groupKindTag(g) {
+  const kind = g.kind || (g.customer_id ? "customer" : "manual");
+  const cls = kind === "internal" ? "internal" : kind === "customer" ? "registered" : "usergroup";
+  const label = kind === "internal" ? t("kind_internal")
+              : kind === "customer" ? t("kind_customer") : t("kind_manual");
+  return h("span", { class: "tag " + cls }, label);
+}
+
+/** A group is system-owned when it is bound to a customer or is the internal group. */
+function isBuiltinGroup(g) {
+  return !!(g && (g.builtin || g.customer_id || g.kind === "internal"));
+}
+
+/** User groups: every group is listed, click a name to open the editor. */
 async function adminGroups() {
-  if (!hasPerm("group.manage")) return { title: "", body: h("div", { class: "card" }, h("div", { class: "card-body" }, "No access")) };
-  const r = await api("/api/admin/groups");
-  const rows = (r.items || []).map(g => h("tr", {},
-    h("td", {}, g.id), h("td", {}, g.name), h("td", {}, g.builtin ? t("builtin") : "user"),
-    h("td", {}, String(g.member_count)),
-    !g.builtin ? h("td", {}, h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
-      await api("/api/admin/groups/" + g.id, { method: "DELETE" }); toast("OK"); render();
-    } }, t("delete"))) : h("td", {}, null)));
-  const inName = h("input", { placeholder: t("add_group") });
-  const body = h("div", {},
-    h("h1", {}, t("groups")),
-    h("div", { style: "display:flex;gap:8px;margin:10px 0" }, inName,
-      hasPerm("group.manage") ? h("button", { class: "btn btn-blue btn-sm", onclick: async () => {
-        if (!inName.value) return;
-        await api("/api/admin/groups", { method: "POST", body: JSON.stringify({ name: inName.value }) });
-        inName.value = ""; toast("OK"); render();
-      } }, "+") : null),
+  if (!hasPerm("group.manage")) return noAccess();
+  let items = [];
+  try { const r = await api("/api/admin/groups"); items = r.items || []; }
+  catch (e) { toast(e.message, false); }
+
+  const tbody = h("tbody", {});
+  for (const g of items) {
+    tbody.append(h("tr", {},
+      h("td", {}, h("a", { href: "javascript:void(0)", onclick: () => openGroupEditor(g, render) },
+          g.display_name || g.name),
+        g.description ? h("div", { class: "muted", style: "font-size:12px" }, g.description) : null),
+      h("td", {}, groupKindTag(g)),
+      h("td", { class: "muted" }, g.kind === "customer" ? (g.domains || "-")
+                          : g.kind === "internal" ? t("auto_members") : "\u2014"),
+      h("td", {}, String(g.member_count)),
+      h("td", { class: "muted", style: "font-size:12px" },
+        (g.grants || []).length ? g.grants.join(", ") : t("no_grants")),
+      h("td", {}, isBuiltinGroup(g)
+        ? h("span", { class: "muted" }, "\u2014")
+        : h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
+            if (!confirm(t("confirm_delete") + " " + g.name)) return;
+            try { await api("/api/admin/groups/" + g.id, { method: "DELETE" }); toast(t("saved")); render(); }
+            catch (e) { toast(e.message, false); }
+          } }, t("delete")))));
+  }
+  if (!items.length) tbody.append(h("tr", {}, h("td", { colspan: 6, class: "muted" }, t("no_results"))));
+
+  const body = h("div", { class: "page" },
+    h("div", { class: "toolbar" },
+      h("div", { class: "toolbar-left" }, h("h1", { style: "margin:0" }, t("groups"))),
+      h("div", { class: "toolbar-right" },
+        h("button", { class: "btn btn-blue btn-sm", onclick: () => openGroupEditor(null, render) },
+          "+" + t("add_group")))),
+    h("p", { class: "muted" }, t("groups_hint")),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       h("table", {},
-        h("thead", {}, h("tr", {}, [t("code"), t("name"), t("status"), t("members"), t("actions")].map(c => h("th", {}, c)))),
-        h("tbody", {}, rows)))));
+        h("thead", {}, h("tr", {},
+          [t("name"), t("group_kind"), t("auto_members"), t("members"), t("grants"), t("actions")]
+            .map(x => h("th", {}, x)))),
+        tbody))));
   return { title: "", body };
+}
+
+/** Create / edit one group: name, description and its member list. */
+function openGroupEditor(g, onDone) {
+  const isNew = !g;
+  const builtin = isBuiltinGroup(g);
+  const name = h("input", { value: g ? g.name : "", placeholder: t("group_name"),
+    disabled: builtin ? true : null });
+  const desc = h("input", { value: g ? (g.description || "") : "", placeholder: t("group_desc") });
+
+  const memBox = h("div", {});
+  async function loadMembers() {
+    memBox.innerHTML = "";
+    try {
+      const r = await api("/api/admin/groups/" + g.id + "/members");
+      const list = r.items || [];
+      if (!list.length) { memBox.append(h("p", { class: "muted" }, t("no_results"))); return; }
+      memBox.append(h("table", {},
+        h("thead", {}, h("tr", {}, [t("name"), t("role"), t("auto_members"), t("actions")]
+          .map(x => h("th", {}, x)))),
+        h("tbody", {}, list.map(u => h("tr", {},
+          h("td", {}, h("b", {}, u.display_name || u.email),
+            h("div", { class: "muted", style: "font-size:12px" }, u.email)),
+          h("td", {}, (u.roles || []).join(", ") || "-"),
+          h("td", {}, h("span", { class: "tag " + (u.auto ? "internal" : "usergroup") },
+            u.auto ? t("auto_member") : t("manual_member"))),
+          h("td", {}, h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: async () => {
+            if (!confirm(t("remove") + " " + u.email + "?")) return;
+            try {
+              await api("/api/admin/groups/" + g.id + "/members/" + u.id, { method: "DELETE" });
+              toast(t("saved")); loadMembers(); onDone && onDone();
+            } catch (e) { toast(e.message, false); }
+          } }, t("remove"))))))));
+    } catch (e) { memBox.append(h("p", { class: "muted" }, e.message)); }
+  }
+
+  const emailInp = h("input", { type: "email", placeholder: t("member_email") });
+  const addBtn = h("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
+    const email = emailInp.value.trim();
+    if (!email) return;
+    try {
+      await api("/api/admin/groups/" + g.id + "/members", { method: "POST", body: JSON.stringify({ email }) });
+      emailInp.value = ""; toast(t("saved")); loadMembers(); onDone && onDone();
+    } catch (e) {
+      toast(e.message === "user_not_found" ? t("user_not_found") : e.message, false);
+    }
+  } }, "+" + t("add_member"));
+
+  const body = h("div", { class: "page" },
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("group_name")), name),
+    h("label", { class: "field" }, h("span", { class: "muted" }, t("group_desc")), desc),
+    builtin ? h("p", { class: "muted", style: "font-size:13px" }, t("builtin_group_hint")) : null,
+    g ? h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
+      h("h3", {}, t("auto_members")),
+      h("p", { class: "muted" },
+        g.kind === "internal" ? t("auto_by_internal")
+        : g.kind === "customer" ? t("auto_by_customer") : t("auto_manual_hint")),
+      g.kind === "customer" ? h("p", { class: "muted" }, t("linked_customer") + ": " + (g.customer_name || "-")
+        + " · " + t("linked_domains") + ": " + (g.domains || "-")) : null,
+      h("h3", { style: "margin-top:12px" }, t("grants")),
+      h("p", { class: "muted" }, (g.grants || []).length ? g.grants.join(", ") : t("no_grants")))) : null,
+    g ? h("div", { class: "card" }, h("div", { class: "card-body" },
+      h("h3", {}, t("members") + " (" + (g.member_count || 0) + ")"),
+      memBox,
+      h("div", { class: "inline-field", style: "margin-top:10px" },
+        h("div", { class: "suggest-wrap" }, emailInp), addBtn))) : null,
+    h("div", { class: "flex-between mt-2" },
+      h("button", { class: "btn btn-blue", onclick: async () => {
+        if (!name.value.trim()) { toast(t("name_required"), false); return; }
+        const payload = { description: desc.value };
+        if (!builtin) payload.name = name.value.trim();
+        try {
+          if (isNew) await api("/api/admin/groups", { method: "POST", body: JSON.stringify(payload) });
+          else await api("/api/admin/groups/" + g.id, { method: "PUT", body: JSON.stringify(payload) });
+          toast(t("saved")); closeModal(); onDone && onDone();
+        } catch (e) {
+          toast(e.message === "group_name_taken" ? t("group_name_taken") : e.message, false);
+        }
+      } }, t("save")),
+      h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel"))));
+
+  showModal(isNew ? t("add_group") : t("edit_group"), body);
+  if (g) loadMembers();
 }
 
 async function adminSite() {
@@ -1511,25 +1653,25 @@ async function adminSite() {
     [["light", t("theme_light")], ["dark", t("theme_dark")], ["system", t("theme_system")]]
       .map(([v, label]) => h("option", { value: v, selected: (s.theme || "light") === v ? "selected" : null }, label)));
 
-  const body = h("div", { style: "max-width:860px" },
+  const body = h("div", { class: "page-narrow" },
     settingsTabs("site"),
     h("h1", {}, t("site_settings")),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
       h("h3", {}, t("session_timeout")),
       h("p", { class: "muted" }, t("session_timeout_hint")),
-      h("div", { style: "display:flex;gap:8px;align-items:center" }, timeoutInp,
+      h("div", { class: "inline-field" }, timeoutInp,
         h("span", { class: "muted" }, t("minutes"))),
       h("h3", { style: "margin-top:14px" }, t("session_max_lifetime")),
       h("p", { class: "muted" }, t("session_max_lifetime_hint")),
-      h("div", { style: "display:flex;gap:8px;align-items:center" }, maxLifeInp,
+      h("div", { class: "inline-field" }, maxLifeInp,
         h("span", { class: "muted" }, t("minutes"))),
       h("h3", { style: "margin-top:14px" }, t("page_theme")),
-      h("div", { style: "display:flex;gap:8px;align-items:center" }, themeSel))),
+      h("div", { class: "inline-field" }, themeSel))),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
       h("h3", {}, t("modules")),
       h("p", { class: "muted" }, t("modules_hint")),
       modList,
-      h("div", { style: "display:flex;gap:8px;margin-top:8px" }, modInput,
+      h("div", { class: "inline-field", style: "margin-top:8px" }, modInput,
         h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
           const v = modInput.value.trim(); if (!v) return;
           if (!modules.includes(v)) modules.push(v);
@@ -1539,7 +1681,7 @@ async function adminSite() {
       h("h3", {}, t("internal_domains")),
       h("p", { class: "muted" }, t("internal_domains_hint")),
       domList,
-      h("div", { style: "display:flex;gap:8px;margin-top:8px" }, domInput,
+      h("div", { class: "inline-field", style: "margin-top:8px" }, domInput,
         h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
           const v = domInput.value.trim().toLowerCase(); if (!v) return;
           if (!domains.includes(v)) domains.push(v);
@@ -1589,8 +1731,7 @@ async function adminWelcome() {
   if (!hasPerm("settings.mail")) return noAccess();
   const s = await loadSiteSettings();
   if (!s) return noAccess();
-  const ta = h("textarea", { rows: 16,
-    style: "width:100%;box-sizing:border-box;font-family:ui-monospace,Menlo,Consolas,monospace;line-height:1.6" });
+  const ta = h("textarea", { rows: 16, class: "kb-editor-body" });
   ta.value = s.welcome_md || "";
   const previewBody = h("div", { class: "card-body markdown" });
   const preview = h("div", { class: "card" }, previewBody);
@@ -1598,7 +1739,7 @@ async function adminWelcome() {
   ta.addEventListener("input", paint);
   setTimeout(paint, 0);
 
-  const body = h("div", { style: "max-width:1000px" },
+  const body = h("div", { class: "page" },
     settingsTabs("welcome"),
     h("div", { class: "toolbar" },
       h("div", { class: "toolbar-left" }, h("h1", { style: "margin:0" }, t("welcome_page"))),
@@ -1636,7 +1777,7 @@ async function adminCompany() {
     e.target.value = "";
   } });
 
-  const body = h("div", { style: "max-width:760px" },
+  const body = h("div", { class: "page-narrow" },
     settingsTabs("company"),
     h("h1", {}, t("company_info")),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
@@ -1652,7 +1793,7 @@ async function adminCompany() {
       h("h3", { style: "margin-top:18px" }, t("company_logo")),
       s.company_logo ? h("div", { style: "margin-bottom:10px" },
         h("div", { class: "muted" }, t("logo_current")), logoImg) : null,
-      h("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" },
+      h("div", { class: "inline-field", style: "margin-top:2px" },
         h("label", { class: "btn btn-ghost btn-sm" }, t("upload_logo"), fileInp),
         h("span", { class: "muted", style: "font-size:13px" }, t("logo_hint"))))));
   return { title: "", body };
@@ -1677,13 +1818,13 @@ async function adminDomains() {
   };
   paint();
 
-  const body = h("div", { style: "max-width:760px" },
+  const body = h("div", { class: "page-narrow" },
     settingsTabs("domains"),
     h("h1", {}, t("bind_domains")),
     h("p", { class: "muted" }, t("bind_domains_hint")),
     h("div", { class: "card" }, h("div", { class: "card-body" },
       list,
-      h("div", { style: "display:flex;gap:8px;margin-top:12px" }, inp,
+      h("div", { class: "inline-field", style: "margin-top:12px" }, inp,
         h("button", { class: "btn btn-ghost btn-sm", onclick: () => {
           const v = inp.value.trim().toLowerCase()
             .replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/^\.+/, "").split(":")[0];
@@ -1763,7 +1904,7 @@ async function adminSettings() {
       toast("Sent: " + (r.sent ? "yes" : "no"));
     } catch (e) { toast(e.message, false); }
   } }, t("test"));
-  const body = h("div", { style: "max-width:860px" },
+  const body = h("div", { class: "page" },
     settingsTabs("settings"),
     h("h1", {}, t("mail_settings")),
     h("div", { class: "card mb-2" }, h("div", { class: "card-body" },

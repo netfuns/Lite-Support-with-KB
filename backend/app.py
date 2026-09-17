@@ -76,9 +76,14 @@ def _seed_setting(conn, key, value):
 def _seed():
     conn = get_db()
     rbac.seed(conn)
-    # default groups (internal = staff group that may edit the knowledge base)
-    for g in ("管理员", "售后人员", "internal"):
+    # default groups ("内部用户组" = staff: reads + edits every ticket, never deletes)
+    for g in ("管理员", "售后人员"):
         conn.execute("INSERT OR IGNORE INTO user_groups(name,builtin) VALUES(?,1)", (g,))
+    # one-off, idempotent tidy-up of the customer-group names from the first
+    # release ("客户:X" -> "客户组:X"; the pattern cannot re-match afterwards)
+    conn.execute("UPDATE user_groups SET name='客户组:'||substr(name,4) WHERE name LIKE '客户:%'")
+    rbac.ensure_internal_group(conn)
+    conn.commit()
     # site settings
     _seed_setting(conn, "modules", json.dumps(DEFAULT_MODULES, ensure_ascii=False))
     _seed_setting(conn, "internal_domains", "[]")
@@ -106,7 +111,7 @@ def _seed():
         aid = cur.lastrowid
         role = conn.execute("SELECT id FROM roles WHERE name='管理员'").fetchone()
         conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (aid, role["id"]))
-        for gname in ("管理员", "internal"):
+        for gname in ("管理员", rbac.INTERNAL_GROUP):
             g = conn.execute("SELECT id FROM user_groups WHERE name=?", (gname,)).fetchone()
             if g:
                 conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (aid, g["id"]))
@@ -114,9 +119,13 @@ def _seed():
     # make sure the existing admin also belongs to the internal group (KB edit rights)
     arow = conn.execute("SELECT id FROM users WHERE email=?", ("admin@rankez.local",)).fetchone()
     if arow:
-        gi = conn.execute("SELECT id FROM user_groups WHERE name='internal'").fetchone()
+        gi = rbac.internal_group_id(conn)
         if gi:
-            conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (arow["id"], gi["id"]))
+            conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (arow["id"], gi))
+    # top up domain-driven memberships for every user (covers data written by
+    # older builds). Add-only: a restart must not evict anyone.
+    for r in conn.execute("SELECT id,email FROM users"):
+        rbac.sync_email_groups(conn, r["id"], r["email"], remove_stale=False)
     conn.commit()
     conn.close()
 
@@ -223,14 +232,15 @@ def site_theme():
     return v or "light"
 
 
-def _sync_internal_group(c, uid, email):
-    """Users whose email domain is an internal domain join the 'internal' group."""
-    dom = (email or "").split("@")[-1].lower()
-    g = c.execute("SELECT id FROM user_groups WHERE name=?", ("internal",)).fetchone()
-    if not g or not dom:
-        return
-    if dom in site_internal_domains():
-        c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, g["id"]))
+def _sync_internal_group(c, uid, email, remove_stale=False):
+    """Apply the e-mail-domain rule: customer-domain groups + the internal group.
+
+    Named for history — it now also keeps *customer* group membership in step
+    with the address. `remove_stale` is only passed when the address itself
+    changed, so an administrator's manual group assignment is never undone by a
+    routine sync.
+    """
+    return rbac.sync_email_groups(c, uid, email, remove_stale=remove_stale)
 
 
 def _kb_can_edit(conn, u):
@@ -242,10 +252,10 @@ def _kb_can_edit(conn, u):
         return False
     if "user.manage" in perms:
         return True
-    g = conn.execute("SELECT id FROM user_groups WHERE name=?", ("internal",)).fetchone()
-    if not g:
+    gi = rbac.internal_group_id(conn)
+    if not gi:
         return False
-    return g["id"] in rbac.groups_for_user(conn, u["id"], u["email"])
+    return gi in rbac.groups_for_user(conn, u["id"])
 
 
 # ------------------------------------------------------------------ auth ctx
@@ -366,7 +376,8 @@ def _me_payload(u):
     perms = sorted(rbac.user_permissions(c, u["id"]))
     roles = [r["name"] for r in c.execute(
         "SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=?", (u["id"],))]
-    groups = [r["name"] for r in c.execute(
+    groups = [(rbac.INTERNAL_GROUP_LABEL if r["name"] == rbac.INTERNAL_GROUP else r["name"])
+              for r in c.execute(
         "SELECT g.name FROM user_groups g JOIN user_groups_rel gr ON gr.group_id=g.id WHERE gr.user_id=?", (u["id"],))]
     c.close()
     return {"id": u["id"], "email": u["email"], "display_name": u["display_name"],
@@ -743,10 +754,22 @@ async def ticket_create(request: Request):
         except Exception:
             pass
     c = conn_()
+    perms = rbac.user_permissions(c, u["id"])
+    cust_name = (form.get("customer_name") or "").strip()
     internal = 1 if str(form.get("internal", "")) in ("1", "true", "on") else 0
+    if "ticket.view_all" not in perms:
+        # A customer user reaches tickets through their customer group only, so a
+        # ticket they file must belong to that customer -- never to a name they
+        # typed (which used to auto-create a customer they then could not see).
+        internal = 0
+        own = rbac.customer_groups_for_user(c, u["id"])
+        if own:
+            names = [x["name"] for x in own]
+            if cust_name.lower() not in [n.lower() for n in names]:
+                cust_name = names[0]
     t = T.create_ticket(
         c, title=title, description=form.get("description") or "",
-        customer_name=form.get("customer_name") or "", version=form.get("version") or "",
+        customer_name=cust_name, version=form.get("version") or "",
         product=form.get("product") or "", priority=form.get("priority") or "medium",
         creator_id=u["id"], creator_email=u["email"], internal=internal, attachments=attachments)
     dep = form.get("deploy_type") or ""
@@ -1203,7 +1226,11 @@ async def admin_users_bulk(request: Request):
     c = conn_()
     changed = 0
     if action == "delete":
-        c.execute("DELETE FROM users WHERE id IN (%s)" % marks, ids)
+        for sql in ("DELETE FROM user_groups_rel WHERE user_id IN (%s)",
+                    "DELETE FROM user_roles WHERE user_id IN (%s)",
+                    "DELETE FROM tokens WHERE user_id IN (%s)",
+                    "DELETE FROM users WHERE id IN (%s)"):
+            c.execute(sql % marks, ids)
         changed = len(ids)
     elif action in ("disable", "enable"):
         st = "disabled" if action == "disable" else "active"
@@ -1280,9 +1307,18 @@ def _set_roles_groups(c, uid, roles, group_ids):
             if r:
                 c.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (uid, r["id"]))
     if group_ids is not None:
-        c.execute("DELETE FROM user_groups_rel WHERE user_id=?", (uid,))
+        # Only manual memberships are replaced: the domain-driven ones are owned
+        # by _sync_internal_group() and would be re-added straight away.
+        managed = rbac.managed_group_ids(c)
+        if managed:
+            marks = ",".join("?" * len(managed))
+            c.execute("DELETE FROM user_groups_rel WHERE user_id=? AND group_id NOT IN (%s)" % marks,
+                      [uid] + list(managed))
+        else:
+            c.execute("DELETE FROM user_groups_rel WHERE user_id=?", (uid,))
         for gid in group_ids:
-            c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+            if gid not in managed:
+                c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
 
 
 @app.put("/api/admin/users/{uid}")
@@ -1299,8 +1335,12 @@ async def admin_user_update(uid: int, request: Request):
     if b.get("password"):
         c.execute("UPDATE users SET password_hash=? WHERE id=?", (auth.hash_password(b["password"]), uid))
     _set_roles_groups(c, uid, b.get("roles"), b.get("group_ids"))
-    if "email" in b:
-        _sync_internal_group(c, uid, (b["email"] or "").lower())
+    # Always re-align. An address change must also EVICT: a user moved to a
+    # domain that no longer matches their customer leaves that customer group
+    # (and joins the one it now matches, if any).
+    row = c.execute("SELECT email FROM users WHERE id=?", (uid,)).fetchone()
+    email = (row["email"] if row else "") or ""
+    _sync_internal_group(c, uid, email, remove_stale=("email" in b))
     c.commit()
     c.close()
     return ok(ok=True)
@@ -1310,7 +1350,13 @@ async def admin_user_update(uid: int, request: Request):
 def admin_user_delete(uid: int, request: Request):
     require_perm(request, "user.manage")
     c = conn_()
-    c.execute("DELETE FROM users WHERE id=?", (uid,))
+    # deleting the user also drops every group membership, so "removed from the
+    # customer group" holds and the member counts stay honest
+    for sql in ("DELETE FROM user_groups_rel WHERE user_id=?",
+                "DELETE FROM user_roles WHERE user_id=?",
+                "DELETE FROM tokens WHERE user_id=?",
+                "DELETE FROM users WHERE id=?"):
+        c.execute(sql, (uid,))
     c.commit()
     c.close()
     return ok(ok=True)
@@ -1425,16 +1471,38 @@ def admin_role_delete(rid: int, request: Request):
     return ok(ok=True)
 
 
+def _group_row(c, r):
+    """Serialise a user_groups row + what it grants, for the admin UI."""
+    d = dict(r)
+    d["member_count"] = c.execute(
+        "SELECT COUNT(*) n FROM user_groups_rel WHERE group_id=?", (r["id"],)).fetchone()["n"]
+    # "key" always keeps the machine name; "name" is what the UI must display
+    d["key"] = r["name"]
+    if r["name"] == rbac.INTERNAL_GROUP:
+        d["name"] = rbac.INTERNAL_GROUP_LABEL
+        d["kind"] = "internal"
+        d["grants"] = list(rbac.INTERNAL_GROUP_PERMS)
+        d["auto_hint"] = "internal_domains"
+    elif r["customer_id"]:
+        cust = c.execute("SELECT name,domains FROM customers WHERE id=?", (r["customer_id"],)).fetchone()
+        d["kind"] = "customer"
+        d["customer_name"] = cust["name"] if cust else ""
+        d["domains"] = (cust["domains"] if cust else "") or ""
+        d["grants"] = list(rbac.CUSTOMER_GROUP_PERMS)
+        d["auto_hint"] = "customer_domains"
+    else:
+        d["kind"] = "manual"
+        d["grants"] = []
+        d["auto_hint"] = ""
+    d["display_name"] = d["name"]
+    return d
+
+
 @app.get("/api/admin/groups")
 def admin_groups(request: Request):
-    require(request)
+    require_perm(request, "group.manage")
     c = conn_()
-    out = []
-    for r in c.execute("SELECT * FROM user_groups ORDER BY id"):
-        cnt = c.execute("SELECT COUNT(*) c FROM user_groups_rel WHERE group_id=?", (r["id"],)).fetchone()["c"]
-        d = dict(r)
-        d["member_count"] = cnt
-        out.append(d)
+    out = [_group_row(c, r) for r in c.execute("SELECT * FROM user_groups ORDER BY id")]
     c.close()
     return ok(items=out)
 
@@ -1443,18 +1511,125 @@ def admin_groups(request: Request):
 async def admin_group_create(request: Request):
     require_perm(request, "group.manage")
     b = await request.json()
+    name = (b.get("name") or "").strip()
+    if not name:
+        fail(400, "name_required")
     c = conn_()
-    cur = c.execute("INSERT INTO user_groups(name) VALUES(?)", ((b.get("name") or "").strip(),))
+    if c.execute("SELECT id FROM user_groups WHERE lower(name)=lower(?)", (name,)).fetchone():
+        c.close()
+        fail(400, "group_name_taken")
+    cur = c.execute("INSERT INTO user_groups(name,description) VALUES(?,?)",
+                    (name, (b.get("description") or "").strip()))
     c.commit()
     c.close()
     return ok(id=cur.lastrowid)
+
+
+@app.put("/api/admin/groups/{gid}")
+async def admin_group_update(gid: int, request: Request):
+    require_perm(request, "group.manage")
+    b = await request.json()
+    c = conn_()
+    row = c.execute("SELECT * FROM user_groups WHERE id=?", (gid,)).fetchone()
+    if not row:
+        c.close()
+        fail(404, "not_found")
+    # built-in groups are bound to a customer / internal domains, so their name is
+    # system-owned; the description stays editable.
+    if "name" in b and not row["builtin"]:
+        name = (b.get("name") or "").strip()
+        if not name:
+            c.close()
+            fail(400, "name_required")
+        dup = c.execute("SELECT id FROM user_groups WHERE lower(name)=lower(?) AND id<>?",
+                        (name, gid)).fetchone()
+        if dup:
+            c.close()
+            fail(400, "group_name_taken")
+        c.execute("UPDATE user_groups SET name=? WHERE id=?", (name, gid))
+    if "description" in b:
+        c.execute("UPDATE user_groups SET description=? WHERE id=?",
+                  ((b.get("description") or "").strip(), gid))
+    c.commit()
+    c.close()
+    return ok(ok=True)
 
 
 @app.delete("/api/admin/groups/{gid}")
 def admin_group_delete(gid: int, request: Request):
     require_perm(request, "group.manage")
     c = conn_()
-    c.execute("DELETE FROM user_groups WHERE id=? AND builtin=0", (gid,))
+    row = c.execute("SELECT * FROM user_groups WHERE id=?", (gid,)).fetchone()
+    if not row:
+        c.close()
+        fail(404, "not_found")
+    if row["builtin"] or row["customer_id"] or row["name"] == rbac.INTERNAL_GROUP:
+        c.close()
+        fail(400, "builtin_group")
+    c.execute("DELETE FROM user_groups_rel WHERE group_id=?", (gid,))
+    c.execute("DELETE FROM kb_collections_groups WHERE group_id=?", (gid,))
+    c.execute("DELETE FROM kb_article_groups WHERE group_id=?", (gid,))
+    c.execute("DELETE FROM user_groups WHERE id=?", (gid,))
+    c.commit()
+    c.close()
+    return ok(ok=True)
+
+
+@app.get("/api/admin/groups/{gid}/members")
+def admin_group_members(gid: int, request: Request):
+    require_perm(request, "group.manage")
+    c = conn_()
+    g = c.execute("SELECT * FROM user_groups WHERE id=?", (gid,)).fetchone()
+    if not g:
+        c.close()
+        fail(404, "not_found")
+    out = []
+    for r in c.execute(
+            "SELECT u.id,u.email,u.display_name,u.status FROM users u "
+            "JOIN user_groups_rel gr ON gr.user_id=u.id WHERE gr.group_id=? ORDER BY u.email", (gid,)):
+        d = dict(r)
+        d["roles"] = [x["name"] for x in c.execute(
+            "SELECT ro.name FROM roles ro JOIN user_roles ur ON ur.role_id=ro.id WHERE ur.user_id=?", (r["id"],))]
+        # "auto" = this membership is derived from the e-mail domain, so removing
+        # it by hand would only be undone by the next sync
+        d["auto"] = gid in rbac.auto_group_ids(c, r["email"])
+        out.append(d)
+    info = _group_row(c, g)
+    c.close()
+    return ok(items=out, group=info)
+
+
+@app.post("/api/admin/groups/{gid}/members")
+async def admin_group_member_add(gid: int, request: Request):
+    require_perm(request, "group.manage")
+    b = await request.json()
+    c = conn_()
+    g = c.execute("SELECT * FROM user_groups WHERE id=?", (gid,)).fetchone()
+    if not g:
+        c.close()
+        fail(404, "not_found")
+    added = 0
+    ids = [int(x) for x in (b.get("user_ids") or []) if str(x).isdigit()]
+    email = (b.get("email") or "").strip().lower()
+    if email:
+        u = c.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone()
+        if not u:
+            c.close()
+            fail(404, "user_not_found")
+        ids.append(u["id"])
+    for uid in ids:
+        cur = c.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (uid, gid))
+        added += cur.rowcount
+    c.commit()
+    c.close()
+    return ok(added=added)
+
+
+@app.delete("/api/admin/groups/{gid}/members/{uid}")
+def admin_group_member_remove(gid: int, uid: int, request: Request):
+    require_perm(request, "group.manage")
+    c = conn_()
+    c.execute("DELETE FROM user_groups_rel WHERE group_id=? AND user_id=?", (gid, uid))
     c.commit()
     c.close()
     return ok(ok=True)
@@ -1506,9 +1681,11 @@ async def admin_site_save(request: Request):
     if "mail_provider" in b:
         set_setting(c, "mail_provider", "o365" if str(b.get("mail_provider") or "").lower() == "o365" else "smtp")
     c.commit()
-    # re-evaluate internal group membership for every user
+    # Re-evaluate internal-group membership for every user: dropping an internal
+    # domain must evict its users. Scoped to the internal group so customer-group
+    # memberships are untouched.
     for r in c.execute("SELECT id,email FROM users"):
-        _sync_internal_group(c, r["id"], r["email"])
+        rbac.sync_email_groups(c, r["id"], r["email"], remove_stale=True, only="internal")
     c.commit()
     c.close()
     return ok(ok=True)
