@@ -16,6 +16,7 @@ from imaplib import IMAP4_SSL
 from urllib import request as urlreq
 
 from db import UPLOAD_DIR, get_setting
+import rbac
 
 
 # ---------- settings helpers ----------
@@ -343,13 +344,30 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
     import tickets as T
     if not frm:
         return {"status": "ignored"}
+    frm = frm.lower()
     cust = T.match_customer(conn, frm)
+    # The internal desk may answer by e-mail too: their address belongs to no
+    # customer domain, so without this they were bounced as "unauthorized" and
+    # their answer never reached the customer.
+    staff_sender = frm in [e.lower() for e in _support_emails(conn)] \
+        or rbac.is_internal_email(conn, frm)
+    base_url = (cfg or {}).get("base_url", "")
+    m = REF_RE.search(subject or "")
+    if not cust and staff_sender:
+        t = conn.execute("SELECT * FROM tickets WHERE code=?", (m.group(0).upper(),)).fetchone() if m else None
+        if not t:
+            # nothing to attach: never auto-create a ticket with no customer behind it
+            return {"status": "ignored", "reason": "staff mail without a known ticket"}
+        T.add_message(conn, t["id"], body=body, author_email=frm, author_name=frm_name,
+                      source="email", attachments=atts)
+        conn.execute("UPDATE tickets SET status='support_replied' WHERE id=?", (t["id"],))
+        conn.commit()
+        _notify_customer_reply(conn, t, frm)
+        return {"status": "replied", "ticket": t["code"]}
     if not cust:
         cfg = cfg or mail_cfg(conn)
         reject_reply(cfg, frm, "unauthorized")
         return {"status": "rejected", "reason": "unauthorized domain"}
-    base_url = (cfg or {}).get("base_url", "")
-    m = REF_RE.search(subject or "")
     if m:
         code = m.group(0).upper()
         t = conn.execute("SELECT * FROM tickets WHERE code=?", (code,)).fetchone()
@@ -358,9 +376,16 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
             if same_customer:
                 T.add_message(conn, t["id"], body=body, author_email=frm, author_name=frm_name,
                               source="email", attachments=atts)
-                conn.execute("UPDATE tickets SET status='customer_replied' WHERE id=?", (t["id"],))
+                # the reply drives the status: a desk answer -> 售后已答复 (and the
+                # customer is told), a customer answer -> 客户已答复 (and the desk
+                # is told).
+                conn.execute("UPDATE tickets SET status=? WHERE id=?",
+                             ("support_replied" if staff_sender else "customer_replied", t["id"]))
                 conn.commit()
-                _notify_reply(conn, t, frm)
+                if staff_sender:
+                    _notify_customer_reply(conn, t, frm)
+                else:
+                    _notify_reply(conn, t, frm)
                 return {"status": "replied", "ticket": code}
     # new ticket
     clean_sub = REF_RE.sub("", subject or "").strip()
@@ -379,11 +404,30 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
 
 
 def _notify_reply(conn, t, frm):
+    """A customer answered by e-mail -> tell the desk."""
     staff = [e for e in _support_emails(conn) if e != (frm or "").lower()]
     htmlb = _render_email(conn, t, conn.execute(
         "SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (t["id"],)).fetchall())
     send_email(conn, staff, "Re:[#%s] %s" % (t["code"], t["title"]),
                "Customer replied on ticket %s: %s" % (t["code"], t["title"]), htmlb)
+
+
+def _notify_customer_reply(conn, t, frm):
+    """The desk answered by e-mail -> tell the customer side."""
+    parts = [r["email"] for r in conn.execute(
+        "SELECT email FROM ticket_participants WHERE ticket_id=?", (t["id"],))]
+    if t["customer_id"]:
+        cust = conn.execute("SELECT contact_email FROM customers WHERE id=?",
+                            (t["customer_id"],)).fetchone()
+        if cust and cust["contact_email"]:
+            parts.append(cust["contact_email"])
+    parts = sorted({e.lower() for e in parts if e and e.lower() != (frm or "").lower()})
+    if not parts:
+        return
+    htmlb = _render_email(conn, t, conn.execute(
+        "SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (t["id"],)).fetchall())
+    send_email(conn, parts, "Re:[#%s] %s" % (t["code"], t["title"]),
+               "Support replied on ticket %s." % t["code"], htmlb)
 
 
 def _support_emails(conn):

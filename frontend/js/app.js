@@ -611,16 +611,21 @@ async function ticketDetail(id) {
       h("a", { class: "btn btn-ghost btn-sm", href: "#/tickets" }, "← " + t("tickets")))) };
   }
   const T = data.ticket;
+  // The internal desk owns the workflow. Claim / reassign / pick a status /
+  // write an internal note are hidden from customers and partners -- they only
+  // ever see "关闭工单". `internal_user` comes from the ticket payload, with the
+  // cached /api/me flag as a fallback.
+  const internal = !!(data.internal_user || (state.user && state.user.is_internal));
   const can = {
-    claim: hasPerm("ticket.claim"),
-    owner: hasPerm("ticket.change_owner"),
-    status: hasPerm("ticket.change_status"),
+    claim: internal && hasPerm("ticket.claim"),
+    owner: internal && hasPerm("ticket.change_owner"),
+    status: internal && hasPerm("ticket.change_status"),
     reply: hasPerm("ticket.reply"),
     export: hasPerm("ticket.export"),
   };
   const ownerSel = h("select", {}, h("option", { value: "" }, t("owner") + "…"));
-  // load users for owner select
-  (async () => {
+  // load users for owner select (admin-only API: the desk has it, nobody else needs it)
+  if (can.owner) (async () => {
     try {
       const r = await api("/api/admin/users");
       ownerSel.innerHTML = "";
@@ -650,9 +655,25 @@ async function ticketDetail(id) {
     if (!closeSel.value) return;
     const body = { status: closeSel.value };
     if (closeSel.value === "closed") { body.archive = archChk.checked ? "1" : "0"; body.kb_desensitize = desChk.checked ? "1" : "0"; body.kb_visibility = visSel.value; }
-    await api("/api/tickets/" + id + "/status", { method: "PUT", body: JSON.stringify(body) });
-    toast("OK"); setTimeout(() => render(), 400);
+    try {
+      await api("/api/tickets/" + id + "/status", { method: "PUT", body: JSON.stringify(body) });
+      toast("OK"); setTimeout(() => render(), 400);
+    } catch (e) { toast(e.message, false); }
   } }, "Update " + t("status"));
+
+  // Everyone may close a ticket; only the desk may also archive it meanwhile.
+  const closeBtn = T.status === "closed" ? null : h("button", { class: "btn btn-ghost", onclick: async () => {
+    const body = {};
+    if (internal) {
+      body.archive = archChk.checked ? "1" : "0";
+      body.kb_desensitize = desChk.checked ? "1" : "0";
+      body.kb_visibility = visSel.value;
+    }
+    try {
+      await api("/api/tickets/" + id + "/close", { method: "POST", body: JSON.stringify(body) });
+      toast("OK"); setTimeout(() => render(), 400);
+    } catch (e) { toast(e.message, false); }
+  } }, t("close_ticket"));
 
   // reply box
   const msgInp = h("textarea", { rows: 3, placeholder: t("reply") + "…" });
@@ -692,20 +713,22 @@ async function ticketDetail(id) {
           t("version") + " " + (T.version || "-"), t("source") + " " + T.source,
           t("created") + " " + T.created_at].join(" · ")),
       h("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px" },
-        claimBtn,
-        can.owner ? h("label", {}, ownerSel, statusBtn) : statusBtn,
-        T.status === "closed" ? h("label", {}, archChk, t("archive"), " · ", visSel) : null,
-        T.status === "closed" ? h("label", {}, desChk, t("desensitize")) : null,
+        can.claim ? claimBtn : null,
+        can.owner ? h("label", {}, ownerSel) : null,
+        can.status ? h("label", {}, closeSel, statusBtn) : null,
+        closeBtn,
+        internal ? h("label", {}, archChk, t("archive"), " · ", visSel) : null,
+        internal ? h("label", {}, desChk, t("desensitize")) : null,
         can.export ? h("a", { class: "btn btn-ghost", href: "/api/kb/export/" + (T.kb_article_id || id), target: "_blank" }, t("export_pdf")) : null,
       ),
       h("div", { class: "card-body", style: "background:var(--bg)" },
         h("div", { class: "flex-between mb-2" }, h("h3", {}, t("messages") + " (" + (data.messages || []).length + ")"),
-          can.reply ? h("label", { class: "muted" }, intChk, t("internal")) : null),
+          (can.reply && internal) ? h("label", { class: "muted" }, intChk, t("internal")) : null),
         msgs2,
         can.reply ? h("div", { class: "card-body", style: "background:var(--card)" },
           h("div", {}, msgInp, fileInp),
           h("div", { class: "flex-between", style: "margin-top:8px" },
-            h("span", { class: "muted" }, t("reply") + " · " + t("internal")),
+            h("span", { class: "muted" }, internal ? (t("reply") + " · " + t("internal")) : t("reply")),
             replyBtn)) : null))));
   return { title: "", body };
 }
@@ -722,8 +745,11 @@ async function newTicketView() {
   // A customer user only reaches their own customer's tickets, and the API pins
   // the ticket to that customer — so don't offer them a free-text picker.
   const isStaff = hasPerm("ticket.view_all");
+  // Group names became "Customer-<name>" in the partner round; the old
+  // "客户组:" prefix is kept as a fallback so a stale payload still resolves.
+  const CUST_GROUP_RE = /^(?:Customer-|客户组[:：]|客户[:：])/;
   const ownCustomers = (state.user.groups || [])
-    .filter(g => /^客户组[:：]/.test(g)).map(g => g.replace(/^客户组[:：]/, ""));
+    .filter(g => CUST_GROUP_RE.test(g)).map(g => g.replace(CUST_GROUP_RE, ""));
   const custField = isStaff
     ? h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")), custWrap)
     : h("label", { class: "field" }, h("span", { class: "muted" }, t("customer")),

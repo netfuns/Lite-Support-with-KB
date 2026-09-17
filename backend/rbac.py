@@ -11,11 +11,13 @@ import json
 #               "managed" == every customer-bound group + the internal group.
 #
 # Grants:
-#   * a customer-bound group  -> read + create on that customer's tickets
-#     (which tickets are visible is scoped to the customer by the queries)
+#   * a customer-bound group  -> read + create + reply on that customer's
+#     tickets (which tickets are visible is scoped to the customer by the
+#     queries); closing a ticket is open to any member, see app.ticket_close
 #   * a partner-bound group   -> READ on every ticket of the customers that were
 #     assigned to that partner (nothing else: no create, no edit, no delete)
 #   * the internal group      -> read + edit on every ticket, NEVER delete
+#     (claim / reassign / edit status / internal notes are internal-only)
 # ---------------------------------------------------------------------------
 # Stable machine key kept as "internal" (it is referenced in the database by
 # name); the UI shows INTERNAL_GROUP_LABEL instead.
@@ -27,8 +29,11 @@ INTERNAL_GROUP_LABEL = "内部用户组"
 CUSTOMER_GROUP_PREFIX = "Customer-"
 PARTNER_GROUP_PREFIX = "Partner-"
 
+# A customer files tickets, reads its own, replies and closes -- but never picks
+# a workflow status: "support_replied" / "customer_replied" are driven by the
+# reply itself, and the status editor belongs to the internal desk.
 CUSTOMER_GROUP_PERMS = [
-    "ticket.create", "ticket.view_own", "ticket.reply", "ticket.change_status",
+    "ticket.create", "ticket.view_own", "ticket.reply",
 ]
 # A partner sees the tickets of its customers, and nothing more.
 PARTNER_GROUP_PERMS = [
@@ -181,7 +186,7 @@ def seed(conn):
         "customer.view", "partner.view",
     ])
     role("客户", [
-        "ticket.create", "ticket.view_own", "ticket.reply", "ticket.change_status",
+        "ticket.create", "ticket.view_own", "ticket.reply",
         "kb.view_public", "kb.view_registered",
     ])
     role("代理商", [
@@ -383,6 +388,28 @@ def has_perm(conn, uid, key):
     if uid is None:
         return False
     return key in user_permissions(conn, uid)
+
+
+def is_internal_user(conn, uid):
+    """True when the user is a member of the built-in internal group.
+
+    The ticket desk buttons (claim / reassign / edit status / internal note) and
+    the "answer the customer" status transition hang off this, so it must be
+    membership -- not a permission -- that decides.
+    """
+    if uid is None:
+        return False
+    gi = internal_group_id(conn)
+    if not gi:
+        return False
+    return gi in groups_for_user(conn, uid)
+
+
+def is_internal_email(conn, email):
+    """True when the address belongs to one of the internal domains."""
+    if not email or "@" not in email:
+        return False
+    return domain_matches(email.split("@", 1)[1], _internal_domains(conn))
 
 
 def customer_groups_for_user(conn, uid):

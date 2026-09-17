@@ -417,6 +417,7 @@ async def logout(request: Request):
 def _me_payload(u):
     c = conn_()
     perms = sorted(rbac.user_permissions(c, u["id"]))
+    is_internal = rbac.is_internal_user(c, u["id"])
     roles = [r["name"] for r in c.execute(
         "SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=?", (u["id"],))]
     groups = [(rbac.INTERNAL_GROUP_LABEL if r["name"] == rbac.INTERNAL_GROUP else r["name"])
@@ -425,7 +426,7 @@ def _me_payload(u):
     c.close()
     return {"id": u["id"], "email": u["email"], "display_name": u["display_name"],
             "totp_enabled": bool(u["totp_enabled"]), "permissions": perms,
-            "roles": roles, "groups": groups}
+            "roles": roles, "groups": groups, "is_internal": is_internal}
 
 
 @app.get("/api/me")
@@ -997,8 +998,9 @@ def ticket_get(tid: int, request: Request):
         atts = [a for a in atts if True]
     for m in msgs:
         m["attachments"] = [a for a in atts if a["message_id"] == m["id"]]
+    internal_user = rbac.is_internal_user(c, u["id"])
     c.close()
-    return ok(ticket=dict(t), messages=msgs, participants=parts)
+    return ok(ticket=dict(t), messages=msgs, participants=parts, internal_user=internal_user)
 
 
 @app.post("/api/tickets")
@@ -1072,6 +1074,12 @@ ALLOWED_STATUS_EDIT = {"new", "closed", "customer_replied", "support_replied"}
 
 @app.put("/api/tickets/{tid}/status")
 async def ticket_status(tid: int, request: Request):
+    """Workflow status editor -- internal desk only.
+
+    A customer never picks "售后已答复" by hand: the reply itself drives the
+    status (see ticket_reply and mailer.process_incoming_email). Customers and
+    partners only ever *close* a ticket, through ticket_close below.
+    """
     u = require(request)
     b = await request.json()
     new_status = b.get("status")
@@ -1082,21 +1090,9 @@ async def ticket_status(tid: int, request: Request):
     if not t:
         c.close()
         fail(404, "not_found")
-    perms = rbac.user_permissions(c, u["id"])
-    allowed = "ticket.change_status" in perms or t["creator_id"] == u["id"]
-    # email-opened: participants with same customer domain may change status
-    if not allowed and t["source"] == "email" and t["customer_id"]:
-        gids = rbac.groups_for_user(c, u["id"], u["email"])
-        g = c.execute("SELECT id FROM user_groups WHERE customer_id=?", (t["customer_id"],)).fetchone()
-        if g and g["id"] in gids:
-            allowed = True
-    if not allowed:
+    if not rbac.is_internal_user(c, u["id"]):
         c.close()
-        fail(403, "no_permission")
-    archive = None
-    if new_status == "closed":
-        # handled separately via archive flag in body
-        pass
+        fail(403, "internal_only")
     c.execute("UPDATE tickets SET status=?, updated_at=datetime('now') WHERE id=?", (new_status, tid))
     c.commit()
     # archive on close
@@ -1110,8 +1106,47 @@ async def ticket_status(tid: int, request: Request):
     return ok(ok=True)
 
 
+@app.post("/api/tickets/{tid}/close")
+async def ticket_close(tid: int, request: Request):
+    """Close a ticket -- the one action every user may perform.
+
+    Anyone who can *see* the ticket may close it: the customer who filed it, the
+    partner watching over it, the internal desk. Archiving the thread to the
+    knowledge base remains a staff-only side effect.
+    """
+    u = require(request)
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    c = conn_()
+    t = c.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+    if not t:
+        c.close()
+        fail(404, "not_found")
+    if not _ticket_visible(c, t, u):
+        c.close()
+        fail(403, "no_permission")
+    if rbac.is_internal_user(c, u["id"]) and str(b.get("archive", "")) in ("1", "true", "on"):
+        vis = b.get("kb_visibility") or "registered"
+        des = str(b.get("kb_desensitize", "1")) in ("1", "true", "on")
+        aid = T.archive_to_kb(c, tid, visibility=vis, desensitize=des)
+        c.close()
+        return ok(ok=True, archived=aid)
+    c.execute("UPDATE tickets SET status='closed', updated_at=datetime('now') WHERE id=?", (tid,))
+    c.commit()
+    c.close()
+    return ok(ok=True)
+
+
 @app.post("/api/tickets/{tid}/reply")
 async def ticket_reply(tid: int, request: Request):
+    """Add a message and let the reply itself drive the workflow status.
+
+    * an internal (staff) answer      -> status 售后已答复, the customer is told
+    * a customer / partner answer     -> status 客户已答复, the desk is told
+    * an internal note (never public) -> status untouched, nobody is emailed
+    """
     require_perm(request, "ticket.reply")
     u = require(request)
     form = await request.form()
@@ -1129,36 +1164,68 @@ async def ticket_reply(tid: int, request: Request):
     if not t:
         c.close()
         fail(404, "not_found")
+    if not _ticket_visible(c, t, u):
+        c.close()
+        fail(403, "no_permission")
+    is_internal = rbac.is_internal_user(c, u["id"])
+    # only the desk may write a note the customer is not supposed to see
+    if internal and not is_internal:
+        internal = 0
     T.add_message(c, tid, body=body, user_id=u["id"], author_email=u["email"],
                   author_name=u["display_name"], internal=internal, source="web",
                   attachments=attachments)
-    # update status to support_replied for support replies
-    if not internal and "ticket.view_all" in rbac.user_permissions(c, u["id"]):
-        c.execute("UPDATE tickets SET status='support_replied' WHERE id=? AND status!='closed'", (tid,))
+    new_status = None
+    if not internal:
+        new_status = "support_replied" if is_internal else "customer_replied"
+        c.execute("UPDATE tickets SET status=?, updated_at=datetime('now') "
+                  "WHERE id=? AND status!='closed'", (new_status, tid))
     c.commit()
     c.close()
-    # email notification on non-internal reply
+    # email notification on a public message
     if not internal:
-        threading.Thread(target=_notify_reply_web, args=(conn_(), tid, u["id"]), daemon=True).start()
-    return ok(ok=True)
+        threading.Thread(target=_notify_reply_web, args=(conn_(), tid, u["id"], is_internal),
+                         daemon=True).start()
+    return ok(ok=True, status=new_status)
 
 
-def _notify_reply_web(c, tid, uid):
-    t = c.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
-    msgs = c.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (tid,)).fetchall()
-    parts = [r["email"] for r in c.execute("SELECT email FROM ticket_participants WHERE ticket_id=?", (tid,))]
-    # customer contact email too
+def _ticket_mail_audience(c, t, author_email, from_staff):
+    """Who should receive the "a reply was added" mail.
+
+    * internal ticket  -> the desk only
+    * staff answer     -> the customer side (that is the "通知客户" part)
+    * customer answer  -> the desk
+    """
+    author = (author_email or "").lower()
+    staff = {e.lower() for e in mailer._support_emails(c)}
+    parts = [r["email"] for r in c.execute(
+        "SELECT email FROM ticket_participants WHERE ticket_id=?", (t["id"],))]
     if t["customer_id"]:
-        cust = c.execute("SELECT contact_email,domains FROM customers WHERE id=?", (t["customer_id"],)).fetchone()
+        cust = c.execute("SELECT contact_email FROM customers WHERE id=?", (t["customer_id"],)).fetchone()
         if cust and cust["contact_email"]:
             parts.append(cust["contact_email"])
-    parts = sorted(set(e for e in parts if e and e != ""))
-    # internal ticket: notify only staff/admin
+    parts = {e.lower() for e in parts if e and "@" in e}
+    parts.discard(author)
     if t["internal"]:
-        parts = [e for e in parts if e in mailer._support_emails(c)]
+        return sorted(parts & staff)
+    if from_staff:
+        return sorted(parts - staff)
+    return sorted(parts | staff)
+
+
+def _notify_reply_web(c, tid, uid, from_staff=False):
+    t = c.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+    if not t:
+        return
+    arow = c.execute("SELECT email FROM users WHERE id=?", (uid,)).fetchone()
+    author = (arow["email"] if arow else "") or t["creator_email"] or ""
+    parts = _ticket_mail_audience(c, t, author, from_staff)
+    if not parts:
+        return
+    msgs = c.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (tid,)).fetchall()
     htmlb = mailer._render_email(c, t, msgs, get_setting(c, "base_url", ""))
-    mailer.send_email(c, parts, "Re:[#%s] %s" % (t["code"], t["title"]),
-                      "A reply was added to ticket %s." % t["code"], htmlb)
+    text = ("Support replied on ticket %s." % t["code"]) if from_staff \
+        else ("A reply was added to ticket %s." % t["code"])
+    mailer.send_email(c, parts, "Re:[#%s] %s" % (t["code"], t["title"]), text, htmlb)
 
 
 # =============================== KNOWLEDGE BASE ===============================
