@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lite-support 技术架构与流程图</title>
+<style>
+  :root{--bg:#f7f7f5;--card:#fff;--line:#e3e2dd;--ink:#2c2c2a;--muted:#6b6a65;--accent:#534AB7;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       font-size:14px;line-height:1.65;}
+  .wrap{max-width:860px;margin:0 auto;padding:40px 24px 64px;}
+  h1{font-size:24px;font-weight:600;margin:0 0 6px;}
+  .sub{color:var(--muted);margin:0 0 32px;}
+  h2{font-size:17px;font-weight:600;margin:40px 0 6px;padding-top:20px;border-top:1px solid var(--line);}
+  h2:first-of-type{border-top:0;padding-top:0;}
+  h3{font-size:14px;font-weight:600;margin:24px 0 8px;}
+  .note{color:var(--muted);margin:0 0 16px;}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);
+        border-radius:10px;overflow:hidden;margin:8px 0 4px;}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{background:#f1efea;font-weight:600;font-size:13px;}
+  tr:last-child td{border-bottom:0;}
+  td.k{width:132px;color:var(--muted);white-space:nowrap;}
+  code{background:#f1efea;padding:1px 5px;border-radius:4px;font-size:12.5px;
+       font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}
+  .fig{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 16px 12px;margin:12px 0 28px;}
+  .cap{color:var(--muted);font-size:12.5px;text-align:center;padding-top:6px;}
+  .fix{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--accent);
+       border-radius:8px;padding:14px 16px;margin:12px 0;}
+  .fix b{font-weight:600;}
+  .ok{color:#0F6E56;font-weight:600;}
+  ul{padding-left:20px;margin:8px 0;}
+  li{margin:3px 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Lite-support 技术架构与流程图</h1>
+<p class="sub">工单 + 知识库系统 · http://192.168.254.10:12345 · 2026-09-18（至第 27 轮）</p>
+
+<h2>1. 技术栈清单</h2>
+<p class="note">一句话概括：<b>后端 FastAPI + SQLite，前端零框架零打包的原生 ES Module SPA</b>。</p>
+
+<table>
+  <tr><th>层</th><th>技术 / 文件</th><th>说明</th></tr>
+  <tr><td class="k">前端框架</td><td><b>无框架</b>（原生 ES Module）</td>
+      <td>不用 React/Vue，也没有 webpack/vite。手写 <code>h()</code> hyperscript 生成 DOM，hash 路由（<code>#/tickets/12</code>）。</td></tr>
+  <tr><td class="k">前端</td><td><code>frontend/js/app.js</code></td>
+      <td>单文件视图层，约 160 KB。所有页面（工单台/知识库/后台）都在这里。</td></tr>
+  <tr><td class="k">前端</td><td><code>css/app.css</code> · <code>js/i18n.js</code></td>
+      <td>手写 CSS（含亮/暗主题）；i18n 支持中 / 英 / 繁三语。</td></tr>
+  <tr><td class="k">Web 框架</td><td><b>FastAPI 0.141.1</b> + Starlette 1.6</td>
+      <td>ASGI，路由与依赖注入；<code>backend/app.py</code> 是路由总入口。</td></tr>
+  <tr><td class="k">数据校验</td><td>Pydantic 2</td><td>请求体校验与序列化。</td></tr>
+  <tr><td class="k">应用服务器</td><td>Uvicorn 0.53</td><td>单进程，监听 12345。</td></tr>
+  <tr><td class="k">业务模块</td><td><code>rbac.py</code></td>
+      <td>角色 / 权限 / 用户组。权限由「角色」和「组」两路派生后取并集。</td></tr>
+  <tr><td class="k">业务模块</td><td><code>tickets.py</code></td>
+      <td>工单全生命周期、邮件模板、入站自动建号。</td></tr>
+  <tr><td class="k">业务模块</td><td><code>mailer.py</code></td>
+      <td>163 邮箱 IMAP 收信 / SMTP 发信，正文解码（第 24 轮修复点）。</td></tr>
+  <tr><td class="k">业务模块</td><td><code>md.py</code> <code>convert.py</code> <code>desens.py</code> <code>backup.py</code> <code>captcha.py</code></td>
+      <td>Markdown 渲染、文档转换（PDF/Word/Excel）、脱敏、备份、滑块验证码。</td></tr>
+  <tr><td class="k">数据库</td><td><b>SQLite</b>（WAL 模式）</td>
+      <td><code>/opt/Lite-support/data/app.db</code>，单文件，无独立数据库服务。</td></tr>
+  <tr><td class="k">关键依赖</td><td>qrcode + pillow · pypdf · fpdf2 · markdown · python-docx · openpyxl</td>
+      <td>第 25 轮才发现 <code>qrcode</code> 一直躺在 requirements 里却从没被 import。</td></tr>
+  <tr><td class="k">运行</td><td>systemd 服务 <code>Lite-support</code></td>
+      <td>用户 <code>Lite</code>，装于 <code>/opt/Lite-support</code>，venv <code>.venv</code>（Python 3.13）。</td></tr>
+  <tr><td class="k">外部</td><td>163 邮箱（IMAP + SMTP）</td>
+      <td>客户发信即建工单；建单 / 回复 / 建号都走邮件回执。</td></tr>
+</table>
+
+<h2>2. 架构分层</h2>
+<div class="fig">
+<svg width="100%" viewBox="0 0 680 456" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Lite-support 架构分层</title>
+<desc>四层：前端原生 ES Module SPA、ASGI 服务端、业务模块、数据与外部依赖。</desc>
+<g>
+<rect x="40" y="20" width="600" height="92" rx="12" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="60" y="44" font-size="14" font-weight="600" fill="#3C3489">前端 · 原生 ES Module SPA（无框架 / 无打包器）</text>
+<rect x="60" y="62" width="180" height="34" rx="6" fill="#fff" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="150" y="79" text-anchor="middle" font-size="12.5" fill="#3C3489">原生 ES Module</text>
+<rect x="250" y="62" width="180" height="34" rx="6" fill="#fff" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="340" y="79" text-anchor="middle" font-size="12.5" fill="#3C3489">hash 路由 · 手写 h()</text>
+<rect x="440" y="62" width="180" height="34" rx="6" fill="#fff" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="530" y="79" text-anchor="middle" font-size="12.5" fill="#3C3489">i18n 中 / 英 / 繁</text>
+</g>
+<g>
+<rect x="40" y="128" width="600" height="92" rx="12" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="60" y="152" font-size="14" font-weight="600" fill="#0C447C">服务端 · ASGI（Uvicorn 单进程）</text>
+<rect x="60" y="170" width="180" height="34" rx="6" fill="#fff" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="150" y="187" text-anchor="middle" font-size="12.5" fill="#0C447C">FastAPI + Starlette</text>
+<rect x="250" y="170" width="180" height="34" rx="6" fill="#fff" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="340" y="187" text-anchor="middle" font-size="12.5" fill="#0C447C">Pydantic 2 校验</text>
+<rect x="440" y="170" width="180" height="34" rx="6" fill="#fff" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="530" y="187" text-anchor="middle" font-size="12.5" fill="#0C447C">Uvicorn :12345</text>
+</g>
+<g>
+<rect x="40" y="236" width="600" height="92" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="60" y="260" font-size="14" font-weight="600" fill="#085041">业务模块 · backend/</text>
+<rect x="60" y="278" width="180" height="34" rx="6" fill="#fff" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="150" y="295" text-anchor="middle" font-size="12.5" fill="#085041">rbac 权限 · 组派生</text>
+<rect x="250" y="278" width="180" height="34" rx="6" fill="#fff" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="340" y="295" text-anchor="middle" font-size="12.5" fill="#085041">tickets 工单 + 模板</text>
+<rect x="440" y="278" width="180" height="34" rx="6" fill="#fff" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="530" y="295" text-anchor="middle" font-size="12.5" fill="#085041">mailer 收发 + 解码</text>
+</g>
+<g>
+<rect x="40" y="344" width="600" height="92" rx="12" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="60" y="368" font-size="14" font-weight="600" fill="#2C2C2A">数据与外部依赖</text>
+<rect x="60" y="386" width="180" height="34" rx="6" fill="#fff" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="150" y="403" text-anchor="middle" font-size="12.5" fill="#2C2C2A">SQLite WAL · app.db</text>
+<rect x="250" y="386" width="180" height="34" rx="6" fill="#fff" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="340" y="403" text-anchor="middle" font-size="12.5" fill="#2C2C2A">163 邮箱 IMAP/SMTP</text>
+<rect x="440" y="386" width="180" height="34" rx="6" fill="#fff" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="530" y="403" text-anchor="middle" font-size="12.5" fill="#2C2C2A">systemd · /opt</text>
+</g>
+</svg>
+<div class="cap">自上而下：浏览器 → ASGI 服务 → 业务模块 → 数据与外部系统</div>
+</div>
+
+<h2>3. 工单入站链路</h2>
+<p class="note">客户发一封邮件，经过这六步落到一张工单上。<b>第 2 步是第 24 轮修掉的中文乱码，第 5 步是第 27 轮修掉的"回复被新开单"</b>。</p>
+<div class="fig">
+<svg width="100%" viewBox="0 0 680 700" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>工单入站链路</title>
+<desc>邮件到达、解码正文、过滤机器邮件、识别身份、建单并回执。</desc>
+<defs>
+<marker id="ar1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<g>
+<rect x="170" y="20" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="340" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">邮件到达收件箱</text>
+<text x="340" y="56" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">IMAP 轮询未读（UNSEEN）</text>
+</g>
+<path d="M340 76 L340 136" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
+<g>
+<rect x="170" y="136" width="340" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text x="340" y="154" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">解码正文　◀ 第 24 轮修复</text>
+<text x="340" y="172" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">严格 UTF-8 优先，兜底 latin-1 无损</text>
+</g>
+<path d="M340 192 L340 252" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
+<g>
+<rect x="170" y="252" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="340" y="270" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">过滤机器邮件</text>
+<text x="340" y="288" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">退信 / 自动回复 / 系统通知 → 丢弃</text>
+</g>
+<path d="M340 308 L340 368" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
+<g>
+<rect x="170" y="368" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="386" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#3C3489">识别来信人身份</text>
+<text x="340" y="404" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#534AB7">按域名归组，未见过的自动建号</text>
+</g>
+<path d="M340 424 L340 484" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
+<g>
+<rect x="170" y="484" width="340" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text x="340" y="502" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">匹配已有工单　◀ 第 27 轮修复</text>
+<text x="340" y="520" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">工单号优先，无号则比标题（未关闭 / 45 天内）</text>
+</g>
+<path d="M340 540 L340 600" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
+<g>
+<rect x="170" y="600" width="340" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="340" y="618" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">命中 → 追加到该工单</text>
+<text x="340" y="636" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">匹配不到才新开单 + 发回执（回执带工单号）</text>
+</g>
+</svg>
+<div class="cap">邮件路径：唯一会经过「解码」的一段，也是中文乱码唯一起因；第 5 步决定这封信是"回答某张单"还是"开一张新单"</div>
+</div>
+
+<h2>4. 共享到知识库 → 关闭工单</h2>
+<p class="note">工单沉淀为知识库文章；若工单尚未关闭，会先弹确认框（明说"会一并关闭"）。</p>
+<div class="fig">
+<svg width="100%" viewBox="0 0 680 384" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>共享到知识库并关闭工单</title>
+<desc>发起共享、未关闭时确认、archive_to_kb 落库并按用户组限定可见、工单置为关闭。</desc>
+<defs>
+<marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<g>
+<rect x="170" y="20" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#3C3489">点「共享到知识库」</text>
+<text x="340" y="56" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#534AB7">工单详情页 · 需内部用户权限</text>
+</g>
+<path d="M340 76 L340 116" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+<g>
+<rect x="170" y="116" width="340" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text x="340" y="134" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">工单是否已关闭？</text>
+<text x="340" y="152" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">未关闭 → 弹确认框「会一并关单」</text>
+</g>
+<path d="M340 172 L340 212" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+<g>
+<rect x="170" y="212" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="340" y="230" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#3C3489">archive_to_kb()</text>
+<text x="340" y="248" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#534AB7">按工单幂等；改档位时重写组绑定</text>
+</g>
+<path d="M340 268 L340 288 L210 288 L210 308" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+<path d="M340 268 L340 288 L470 288 L470 308" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+<g>
+<rect x="100" y="308" width="220" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="210" y="326" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">KB 新增文章</text>
+<text x="210" y="344" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">按 group_ids 限定可见</text>
+</g>
+<g>
+<rect x="360" y="308" width="220" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="470" y="326" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">工单置为已关闭</text>
+<text x="470" y="344" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">记录关闭时间与操作人</text>
+</g>
+</svg>
+<div class="cap">可见性四档：公开 / 已注册 / 内部 / 指定用户组</div>
+</div>
+
+<h2>5. 代理商 ↔ 客户绑定</h2>
+<p class="note">管理员把客户挂到代理商名下，代理商的可见范围由此收敛；开单时二选一。</p>
+<div class="fig">
+<svg width="100%" viewBox="0 0 680 444" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>代理商与客户绑定及可见范围</title>
+<desc>管理员绑定客户、代理商登录、可见范围收敛为被绑定客户加自营、开单二选一。</desc>
+<defs>
+<marker id="ar3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<g>
+<rect x="170" y="20" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="340" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">管理员绑定客户</text>
+<text x="340" y="56" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">customers.partner_id = 代理商</text>
+</g>
+<path d="M340 76 L340 136" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
+<g>
+<rect x="170" y="136" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="340" y="154" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">代理商登录</text>
+<text x="340" y="172" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">组 Partner-名称 · 角色自动对齐</text>
+</g>
+<path d="M340 192 L340 252" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
+<g>
+<rect x="170" y="252" width="340" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="340" y="270" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">可见范围收敛</text>
+<text x="340" y="288" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">仅被绑定客户 + 自营工单</text>
+</g>
+<path d="M340 308 L340 328 L210 328 L210 368" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
+<path d="M340 308 L340 328 L470 328 L470 368" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
+<g>
+<rect x="100" y="368" width="220" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text x="210" y="386" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">开单：给某客户</text>
+<text x="210" y="404" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">后端校验确属其名下</text>
+</g>
+<g>
+<rect x="360" y="368" width="220" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text x="470" y="386" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">开单：给自营</text>
+<text x="470" y="404" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">以代理商自身为客户</text>
+</g>
+</svg>
+<div class="cap">"能开单"不等于"能编客户"：客户名由后端钉死</div>
+</div>
+
+<h2>6. 修复记录</h2>
+
+<h3>第 27 轮（2026-09-18）：同一人回复自己的工单，却被新开了一张</h3>
+
+<div class="fix">
+<b>线程匹配只认了工单号，身份校验又只认客户名</b>　<span class="ok">已修复</span><br>
+hotmail 用户从网页开了 <code>LITE-SUPPORT-202609003</code>，随后用邮件回复系统发出的通知，
+结果被新开成 <code>LITE-SUPPORT-202609004</code>。<br>
+<b>取证第一步是看真实 Subject</b>：收件箱里那封是 <code>Re: Re:[#LITE-SUPPORT-202609003] 救救我</code> ——
+<b>工单号就在标题里</b>，所以问题不在正则，而在匹配到之后的<b>身份校验</b>。<br>
+<b>根因</b>：校验只比 <code>customer_id</code> / <code>customer_name</code>，而 <code>customer_name</code>
+<b>只有"由邮件开的"工单才有</b>（建单时代理商分支才写入）。网页开的工单该字段为空，
+于是同一个人用自己的地址回复自己的工单被判成陌生人，一路掉到"新开一张"。<br>
+<b>修法</b>（两处，缺一仍有洞）：<br>
+① <code>_owns_ticket()</code> —— 身份改为「<b>creator_email / creator_id / ticket_participants 命中任一</b>，
+或客户/代理商域名匹配，内部同事放行」；域名规则降为最后一条兜底，不再是唯一判据。<br>
+② <code>_match_by_subject()</code> —— 工单号找不到时<b>按标题兜底</b>：标题归一化（去工单号、去堆叠
+<code>Re:/Fwd:</code>、去括号空白）后与<b>同一 owner 的工单</b>比对，取最新一张。
+<b>刻意加围栏</b>：只认未关闭 + 只认近 45 天，否则「无法登录」这种通用标题会被吸到一年前的旧单；
+别人家的同名标题不许认领。返回结果带 <code>matched_by=code|subject</code>，兜底的猜测不静默。<br>
+<b>顺带</b>：通知标题统一走 <code>thread_subject()</code> —— 邮件开的工单标题本身就是 <code>[CODE] 原题</code>，
+旧写法会拼成 <code>Re:[#CODE] [CODE] 原题</code> 并且每轮回复再叠一层 <code>Re:</code>。<br>
+<b>数据修复</b>：重复单的消息移回原单、参与者与告警改指、空壳工单删除，状态回到「客户已答复」；
+动手前留热备 <code>app.db.prethreadfix-20260918-090445</code>。
+</div>
+
+<h3>第 27 轮 · 验证证据</h3>
+<ul>
+  <li><b>真实邮件回放</b>：拿线上数据库的 WAL 安全热副本，桩掉发信，直接调生产函数跑 11 个用例 —— <b>11/11 通过</b>：事故原信（归到 …003、零新单）、客户端丢掉工单号（按标题命中）、裸标题、旧 <code>TK-</code> 号、多个同名取最新、陌生域名被拒、别人家的标题不认领、新标题开新单、<b>已关闭的单不会被标题猜活</b>、后台同事回复（状态转「售后已答复」）</li>
+  <li><b>线上 HTTP</b>：<code>/api/tickets/134</code> 返回 4 条消息且状态为「客户已答复」；<code>/api/tickets</code> 列表里已无 <code>…004</code>；合并后三类残留（消息 / 参与者 / 告警）均为 0</li>
+  <li>三个文件线上 / 本地 md5 一致；服务 <code>active</code>、<code>/health</code> 200；提交 <code>c64015a3</code> 已推送（blob 逐位核对通过）</li>
+</ul>
+
+<h3>第 26 轮（2026-09-18）：新建工单只剩工具栏，没有正文输入框</h3>
+
+<div class="fix">
+<b>markdown 编辑器从未挂载它的输入框</b>　<span class="ok">已修复</span><br>
+<code>mdEditor(ta)</code> 负责把「格式工具栏 + 正文框」打包成一块：它取了 <code>ta</code>、建了 wrapper、挂了工具栏和提示行，
+<b>却没有 append <code>ta</code> 本身</b>。5 个调用点都只把 <code>ta</code> 传进去、默认它会被挂载（提交时照样读 <code>ta.value</code>），
+所以坏的不是某一个页面，而是<b>所有用到这个编辑器的界面</b>：新建工单描述、工单回复框、知识库文章编辑、欢迎页、回复模板。<br>
+<b>判据</b>：样式表里 <code>.md-editor textarea{border-radius:0 0 6px 6px}</code> 只圆下角（工具栏只圆上角、无下边框）——
+说明设计上输入框就该在工具栏正下方，漏掉的是代码而不是设计。<br>
+<b>是回归吗</b>：翻 GitHub 上 17 个版本的 <code>app.js</code>，这个编辑器只出现在最近两个提交里，且<b>从第一版起就缺这一行</b>；
+再往前一版，描述字段是直接放在 label 里的裸 <code>textarea</code> —— 这就解释了"以前有输入框、现在没有"。<br>
+<b>修法</b>：<code>wrap.append(bar, ta)</code>，顺序固定为<b>工具栏 → 输入框 → 提示行</b>。<br>
+<b>顺带</b>：<code>index.html</code> 的资源版本号升到 <code>?v=20260918e</code> —— 服务端不发 <code>Cache-Control</code>，
+不换版本号时浏览器可能按启发式缓存继续用旧脚本。
+</div>
+
+<h3>第 26 轮 · 验证证据</h3>
+<ul>
+  <li>把 <code>h()</code> 桩化后<b>真跑</b> <code>mdEditor()</code>：8/8 通过 —— wrapper 恰好是「工具栏 + <b>同一个 textarea 对象</b> + 提示行」，工具栏 8 个按钮，点 <b>B</b> 能把 <code>**bold**</code> 写进那个已挂载的输入框</li>
+  <li>线上 / 磁盘 / 本地 <code>app.js</code> 三处 md5 一致（<code>ccfa91e5…</code>），且浏览器真正下载的那份字节里含修复标记</li>
+  <li><code>node --check</code> 全绿；服务 <code>active</code>、<code>/health</code> 200；提交 <code>9e6790a2</code> 已推送（blob 逐位核对通过）</li>
+</ul>
+
+<h3>第 25 轮（2026-09-18）：代理商角色错配 + 两步验证二维码</h3>
+
+<div class="fix">
+<b>① 代理商被错标成「客户」</b>　<span class="ok">已修复</span><br>
+<code>netfuns@hotmail.com</code> 在用户列表里角色显示为「客户」。查库发现<b>组是对的</b>（<code>Partner-hotmail</code>）、<b>角色是错的</b>。<br>
+<b>根因</b>：两条建号路径各写各的 —— 入站邮件自动建号 <code>tickets.find_or_create_user()</code> <b>硬编码</b>了「客户」角色，随后调用的
+<code>align_internal_role()</code> 只处理本站自有域名，代理商域直接漏过；而网页注册那条路反而有正确的三分支。
+这个账号正是客户发信触发的自动建号产物。<br>
+<b>修法</b>：新增 <code>rbac.domain_role_name()</code>（<b>从已挂的组反推角色</b>，而不是重新匹配域名 —— 组才是单一事实来源，也避免循环依赖）
++ <code>align_domain_role()</code>（写入，沿用"人工选的角色一律不碰"的保守契约）。两条建号路径都改调它。存量数据全量审计后定点修正 1 例。
+</div>
+
+<div class="fix">
+<b>② 两步验证的二维码扫不出来</b>　<span class="ok">已修复</span><br>
+注册页面挂的是 <code>api.qrserver.com/v1/code-16x16.php</code> —— 这个端点<b>本身就是错的</b>（正确是 <code>/v1/create-qr-code/</code>），
+而且<b>需要公网</b>，本站是内网部署，所以用户只看到一个破图。<br>
+<b>关键发现</b>：<code>qrcode 8.2</code> + <code>pillow</code> <b>本来就在 requirements.txt 和 venv 里</b>，代码却从未 import 过。<br>
+<b>修法</b>：<code>auth.qr_svg()</code> 在服务端生成<b>内联 SVG</b>（不外呼、密钥不进 URL / referrer），三处响应都带上，前端内联显示并保留明文密钥兜底。
+</div>
+
+<h3>第 25 轮 · 验证证据</h3>
+<ul>
+  <li>探针账号走真实函数建号 → 角色 <code>代理商</code>、组 <code>Partner-hotmail</code>（修复前此处为「客户」）</li>
+  <li>HTTP 登录返回 <code>need_enroll_totp</code> + 19 KB 合法 SVG 二维码</li>
+  <li>用返回的密钥算出验证码完成注册 → 登录成功，<code>/api/me</code> 角色为「代理商」</li>
+  <li>探针账号已删除，零残留；本地语法检查全绿；5 个文件线上 / 本地 md5 一致</li>
+  <li>服务 <code>active</code>、<code>/health</code> 200；提交 <code>6d8f242e</code> 已推送至 <code>netfuns/Lite-Support-with-KB</code></li>
+</ul>
+
+</div>
+</body>
+</html>

@@ -56,7 +56,7 @@ tar -czf /tmp/example_support.tar.gz -C . .
 sudo bash deploy/run.sh /tmp/example_support.tar.gz
 ```
 
-Defaults: app directory `/opt/rankez-support`, service `rankez-support`, user `rankez`,
+Defaults: app directory `/opt/Lite-support`, service `Lite-support`, user `Lite`,
 backups under `<app>/backups`. Override them at the top of the script.
 
 ## Email integration (Admin → Mail settings)

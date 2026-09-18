@@ -2871,13 +2871,13 @@ async def admin_backup_delete(request: Request):
 def _exit_for_restart():
     """Leave with a non-zero code so the unit's Restart=on-failure reloads us.
 
-    The portal runs as `rankez` and cannot call systemctl. A *clean* exit would
+    The portal runs as `Lite` and cannot call systemctl. A *clean* exit would
     not be restarted (RestartSec only applies to a failure), and the process
     cannot simply carry on either: it still holds connections to the database
     file that was just replaced under it.
     """
     try:
-        sys.stderr.write("rankez-support: exiting for restart after restore\n")
+        sys.stderr.write("Lite-support: exiting for restart after restore\n")
         sys.stderr.flush()
     except Exception:  # noqa: BLE001
         pass
@@ -3076,7 +3076,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return ok(ok=True, service="rankez-support")
+    return ok(ok=True, service="Lite-support")
 
 
 # SPA fallback

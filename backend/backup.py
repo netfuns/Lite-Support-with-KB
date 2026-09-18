@@ -13,7 +13,7 @@ branding all live in app.db. Restoring the archive onto a freshly deployed
 instance therefore brings the whole platform back -- which is why the restore
 path replaces the database file rather than re-importing rows.
 
-The service runs as ``rankez`` and cannot call systemctl, so an in-app restore
+The service runs as ``Lite`` and cannot call systemctl, so an in-app restore
 swaps the files and then exits with a non-zero code; the unit's
 ``Restart=on-failure`` / ``RestartSec=5`` brings the portal back on the restored
 data. An archive never contains another copy of the software.
@@ -36,9 +36,9 @@ from db import DB_PATH, UPLOAD_DIR, get_setting, set_setting
 FREQS = ("daily", "weekly", "monthly")
 #: daily / weekly (every Monday) / monthly (the 1st), at the configured time
 FREQ_HINT = {"daily": "every day", "weekly": "every Monday", "monthly": "the 1st of the month"}
-DEFAULT_DIR = "/opt/rankez-support/backups"
+DEFAULT_DIR = "/opt/Lite-support/backups"
 PREFIX = "backup_"
-LEGACY_GLOB = "rankez-backup-*.tar.gz"
+LEGACY_GLOB = "Lite-backup-*.tar.gz"
 MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024      # a 4GB "backup" is not our backup
 CORE_TABLES = ("users", "tickets", "messages", "kb_articles", "settings")
 
@@ -157,7 +157,7 @@ def run_backup(conn, reason="manual"):
         os.makedirs(stage, exist_ok=True)
         _snapshot_db(os.path.join(stage, "app.db"))
         manifest = {
-            "app": "rankez-support",
+            "app": "Lite-support",
             "format": 1,
             "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "created_ts": stamp,
@@ -438,10 +438,10 @@ def disk_free(path):
 
 
 def legacy_timer_present():
-    """True when the system-level rankez-backup.timer is still installed.
+    """True when the system-level Lite-backup.timer is still installed.
 
     The app cannot stop it (that needs root) and leaving it on means two
     backups a night, so the page says so and prints the command.
     """
-    return os.path.exists("/etc/systemd/system/rankez-backup.timer") or os.path.exists(
-        "/etc/systemd/system/multi-user.target.wants/rankez-backup.timer")
+    return os.path.exists("/etc/systemd/system/Lite-backup.timer") or os.path.exists(
+        "/etc/systemd/system/multi-user.target.wants/Lite-backup.timer")

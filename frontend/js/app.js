@@ -2,7 +2,7 @@
 // browser is free to reuse this module from its heuristic cache. index.html
 // bumps app.js and app.css; this import has to carry the bump too, or a
 // returning visitor keeps the old translations while running the new code.
-import { t, setLang, LANGS } from "./i18n.js?v=20260918f";
+import { t, setLang, LANGS } from "./i18n.js?v=20260918g";
 
 // ----------------------------------------------------------------- state
 const state = {
@@ -3266,7 +3266,7 @@ async function adminBackup() {
         + (s.free ? " · " + t("backup_free") + " " + fmtSize(s.free) : "")),
       s.legacy_timer
         ? h("p", { class: "muted" }, "⚠ " + t("backup_legacy_timer") + " ",
-            h("code", {}, "sudo systemctl disable --now rankez-backup.timer"))
+            h("code", {}, "sudo systemctl disable --now Lite-backup.timer"))
         : null,
       h("div", { style: "display:flex;gap:8px;margin-top:12px" },
         h("button", { class: "btn btn-blue", onclick: save }, t("save")),

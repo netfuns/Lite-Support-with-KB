@@ -1,14 +1,14 @@
 # run.sh — idempotent installer (runs as root via `sudo -i`).
-# Deploys /opt/rankez-support as a dedicated `rankez` system user + systemd service.
+# Deploys /opt/Lite-support as a dedicated `Lite` system user + systemd service.
 # Port auto-select starting at 12345; if occupied, increments until free.
 set -euo pipefail
 
-APP_DIR=/opt/rankez-support
-DATA_DIR=/opt/rankez-support/data
-TARBALL="${1:-/tmp/rankez_support.tar.gz}"
+APP_DIR=/opt/Lite-support
+DATA_DIR=/opt/Lite-support/data
+TARBALL="${1:-/tmp/Lite_support.tar.gz}"
 PORT_START=12345
-SERVICE=rankez-support
-APP_USER=rankez
+SERVICE=Lite-support
+APP_USER=Lite
 
 # 1. dedicated user
 id "$APP_USER" >/dev/null 2>&1 || useradd -r -s /bin/bash -d "$APP_DIR" "$APP_USER"
