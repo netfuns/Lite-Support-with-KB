@@ -1,6 +1,6 @@
-# Example Support
+# Support + KB all in one
 
-Integrated after-sales ticket platform + knowledge base. Self-hosted, single
+Integrated post-sales ticket platform + knowledge base. Self-hosted, single
 process, no external services required.
 
 ## Stack
