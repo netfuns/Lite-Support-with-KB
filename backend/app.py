@@ -1720,7 +1720,7 @@ def _notify_reply_web(c, tid, uid, from_staff=False):
     htmlb = mailer._render_email(c, t, msgs, get_setting(c, "base_url", ""))
     text = ("Support replied on ticket %s." % t["code"]) if from_staff \
         else ("A reply was added to ticket %s." % t["code"])
-    mailer.send_email(c, parts, "Re:[#%s] %s" % (t["code"], t["title"]), text, htmlb)
+    mailer.send_email(c, parts, mailer.thread_subject(t), text, htmlb)
 
 
 # =============================== KNOWLEDGE BASE ===============================

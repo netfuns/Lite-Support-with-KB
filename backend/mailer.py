@@ -677,9 +677,138 @@ def _handle_msg(conn, mbox, num, cfg):
 # the change would silently open a new one.
 REF_RE = re.compile(r"\b(?:RANKEZ-SUPPORT-\d{9}|TK-\d{5})\b", re.I)
 
+#: a subject-only match is a guess, so it is fenced: the thread has to be still
+#: open and recent. Without the window a mail called "无法登录" would thread onto
+#: last year's ticket that happens to share the words.
+SUBJECT_MATCH_DAYS = 45
+
+#: reply/forward prefixes -- repeated, because clients stack them ("Re: Re:")
+_PREFIX_RE = re.compile(
+    r"(?i)^(?:\s*(?:re|fw|fwd|答复|回复|回覆|转发|轉發)\s*\d*\s*[:：]\s*)+")
+
+
+def clean_subject(s):
+    """A subject stripped down to what the thread is actually about.
+
+    Clients rewrite subjects on the way out ("Re: Re:[#CODE] 救救我"), so the
+    ticket code, the reply prefixes and the punctuation they leave behind all
+    have to go before two subjects can be compared -- or used as a title.
+    """
+    s = REF_RE.sub(" ", s or "")
+    s = re.sub(r"[\[\]()（）【】#]", " ", s)
+    s = _PREFIX_RE.sub(" ", s)
+    s = re.sub(r"[\s*_·]+", " ", s)
+    return s.strip(" -·")
+
+
+def thread_key(s):
+    """The comparison key for subject threading; see :func:`clean_subject`."""
+    return clean_subject(s).lower()
+
+
+def thread_subject(t):
+    """The subject a notification goes out with: one code, no Re: pile-up.
+
+    A mail-opened ticket is *named* "[CODE] subject", so using its title as-is
+    produced "Re:[#CODE] [CODE] subject" -- and every answer then nested one
+    more Re: onto the front of an ever-growing line.
+    """
+    return "Re:[#%s] %s" % (t["code"], clean_subject(t["title"]) or "(no subject)")
+
+
+def _owns_ticket(conn, t, *, frm, cust, part, staff_sender, sender_id=None):
+    """May this sender answer this ticket?
+
+    The domain rule used to decide it alone, and it was wrong in both
+    directions. A ticket opened from the *web* by a partner-domain user carries
+    no customer_name -- only mail-opened tickets get one -- so the partner's own
+    answer failed the "same partner" test and opened a duplicate. Identity is
+    now what it should have been: anybody demonstrably *on* the ticket (its
+    creator, a participant, the account that filed it) as well as the domain
+    rule. The desk sees every ticket anyway.
+    """
+    frm = (frm or "").lower()
+    if staff_sender:
+        return True
+    if frm and (t["creator_email"] or "").lower() == frm:
+        return True
+    if sender_id and t["creator_id"] and t["creator_id"] == sender_id:
+        return True
+    if frm and conn.execute(
+            "SELECT 1 FROM ticket_participants WHERE ticket_id=? AND lower(email)=?",
+            (t["id"], frm)).fetchone():
+        return True
+    if cust:
+        return t["customer_id"] == cust["id"]
+    if part:
+        # a partner's ticket carries no customer id, his name is the link
+        return (not t["customer_id"]) and (t["customer_name"] or "") == part["name"]
+    return False
+
+
+def _match_by_subject(conn, subject, *, frm, cust, part, staff_sender, sender_id=None):
+    """The newest open ticket this mail answers, judged by its subject.
+
+    The fallback for a client that dropped the code from the subject: rather
+    than file a second ticket for a thread that already exists, find it. Newest
+    first, so a re-opened subject lands on the latest round, not the oldest.
+    """
+    key = thread_key(subject)
+    if len(key) < 2:                    # "" or "re" threads with everything
+        return None
+    rows = conn.execute(
+        "SELECT * FROM tickets WHERE status<>'closed' "
+        "AND COALESCE(updated_at, created_at) >= datetime('now', ?) "
+        "ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 100",
+        ("-%d days" % SUBJECT_MATCH_DAYS,)).fetchall()
+    for t in rows:
+        if thread_key(t["title"]) != key:
+            continue
+        if _owns_ticket(conn, t, frm=frm, cust=cust, part=part,
+                        staff_sender=staff_sender, sender_id=sender_id):
+            return t
+    return None
+
+
+def _append_reply(conn, t, *, frm, frm_name, body, atts, staff_sender, sender_info,
+                  matched_by="code"):
+    """Put an inbound mail on an existing ticket and let it drive the status.
+
+    `matched_by` says how the thread was found -- "code" from the subject's
+    reference, "subject" when the client dropped it. The second one is a guess,
+    so it is reported back instead of hidden.
+    """
+    import tickets as T
+    uid = sender_info.get("id")
+    if not uid and not staff_sender:
+        # a sender with no row yet (first mail from a known domain) is
+        # auto-provisioned so the reply is attributed to somebody
+        uid = T.find_or_create_user(conn, frm, frm_name)["id"]
+    T.add_message(conn, t["id"], body=body, user_id=uid, author_email=frm,
+                  author_name=frm_name, source="email", attachments=atts)
+    # the reply drives the status: a desk answer -> 售后已答复 (and the customer
+    # is told), a customer answer -> 客户已答复 (and the desk is told).
+    conn.execute("UPDATE tickets SET status=? WHERE id=?",
+                 ("support_replied" if staff_sender else "customer_replied", t["id"]))
+    conn.commit()
+    if staff_sender:
+        _notify_customer_reply(conn, t, frm)
+    else:
+        # a customer (or his partner) answered -- the desk has to hear about it
+        # in the app, not only in their mailbox
+        T.alert_customer_reply(conn, t)
+        _notify_reply(conn, t, frm)
+    return {"status": "replied", "ticket": t["code"], "matched_by": matched_by,
+            "created_user": bool(sender_info.get("created"))}
+
 
 def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=None, cfg=None):
-    """Core: match customer by domain, create or reply ticket, or reject + reply."""
+    """Core: thread onto an existing ticket, or open one, or reject + reply.
+
+    Threading resolves in two steps: the reference code in the subject first
+    (that is the contract), then the subject itself for clients that rewrite or
+    drop it. Only when neither finds a ticket does this open a new one.
+    """
     import tickets as T
     if not frm:
         return {"status": "ignored"}
@@ -704,65 +833,38 @@ def process_incoming_email(conn, *, subject, frm, frm_name, to_list, body, atts=
     sender_info = {"id": None, "created": False, "mailed": False}
     if (cust or part) and frm and not staff_sender:
         sender_info = T.find_or_create_user(conn, frm, frm_name, send_credentials=True)
-    if not cust and staff_sender:
-        t = conn.execute("SELECT * FROM tickets WHERE code=?", (m.group(0).upper(),)).fetchone() if m else None
-        if not t:
-            # Desk staff writing in with no reference is *opening* a ticket, not
-            # answering one. Bouncing it (the old behaviour) lost the mail: the
-            # sender got nothing and never knew why. File it instead -- it just
-            # has no customer behind it, so it lands as an internal ticket.
-            return _open_ticket(conn, subject=subject, body=body, frm=frm, frm_name=frm_name,
-                                to_list=to_list, atts=atts, cfg=cfg, cust=None,
-                                sender_info=sender_info, internal=1)
-        T.add_message(conn, t["id"], body=body, author_email=frm, author_name=frm_name,
-                      source="email", attachments=atts)
-        conn.execute("UPDATE tickets SET status='support_replied' WHERE id=?", (t["id"],))
-        conn.commit()
-        _notify_customer_reply(conn, t, frm)
-        return {"status": "replied", "ticket": t["code"], "created_user": bool(sender_info["created"])}
-    # Only a registered domain may open a ticket: a customer's, a partner's or
-    # the desk's own. Anything else is a stranger and gets told so (once).
-    if not cust and not part:
+    # ---- which ticket is this mail answering? -------------------------------
+    # By code first, by subject after. The code alone was not enough: a client
+    # that drops it, and a ticket opened from the web (whose notification the
+    # same person then answers), both used to spawn a duplicate ticket.
+    t = None
+    matched_by = "code"
+    if m:
+        cand = conn.execute("SELECT * FROM tickets WHERE code=?",
+                            (m.group(0).upper(),)).fetchone()
+        if cand and _owns_ticket(conn, cand, frm=frm, cust=cust, part=part,
+                                 staff_sender=staff_sender, sender_id=sender_info["id"]):
+            t = cand
+    if t is None:
+        t = _match_by_subject(conn, subject, frm=frm, cust=cust, part=part,
+                              staff_sender=staff_sender, sender_id=sender_info["id"])
+        matched_by = "subject"
+    if t is not None:
+        return _append_reply(conn, t, frm=frm, frm_name=frm_name, body=body, atts=atts,
+                             staff_sender=staff_sender, sender_info=sender_info,
+                             matched_by=matched_by)
+    # Nothing to attach it to. Only a registered domain -- a customer's, a
+    # partner's or the desk's own -- may *open* a ticket; anything else is a
+    # stranger and gets told so (once). The desk's own mail is filed as an
+    # internal ticket rather than bounced: bouncing it lost the mail.
+    if not cust and not part and not staff_sender:
         cfg = cfg or mail_cfg(conn)
         reject_reply(cfg, frm, "unauthorized")
         return {"status": "rejected", "reason": "unauthorized domain"}
-    if m:
-        code = m.group(0).upper()
-        t = conn.execute("SELECT * FROM tickets WHERE code=?", (code,)).fetchone()
-        if t:
-            if cust:
-                same_customer = (cust["id"] == t["customer_id"])
-            else:
-                # a partner's ticket carries no customer id, his name is the link
-                same_customer = (not t["customer_id"]) and \
-                    (t["customer_name"] or "") == (part["name"] if part else "")
-            if same_customer:
-                # make sure the replying sender has a user row (auto-provisioned
-                # above when they were new) so the reply is attributed correctly
-                if sender_info["id"]:
-                    uid = sender_info["id"]
-                else:
-                    uid = T.find_or_create_user(conn, frm, frm_name)["id"]
-                T.add_message(conn, t["id"], body=body, user_id=uid, author_email=frm,
-                              author_name=frm_name, source="email", attachments=atts)
-                # the reply drives the status: a desk answer -> 售后已答复 (and the
-                # customer is told), a customer answer -> 客户已答复 (and the desk
-                # is told).
-                conn.execute("UPDATE tickets SET status=? WHERE id=?",
-                             ("support_replied" if staff_sender else "customer_replied", t["id"]))
-                conn.commit()
-                if staff_sender:
-                    _notify_customer_reply(conn, t, frm)
-                else:
-                    # a customer (or his partner) answered -- the desk has to hear
-                    # about it in the app, not only in their mailbox
-                    T.alert_customer_reply(conn, t)
-                    _notify_reply(conn, t, frm)
-                return {"status": "replied", "ticket": code, "created_user": bool(sender_info["created"])}
-    # new ticket
     return _open_ticket(conn, subject=subject, body=body, frm=frm, frm_name=frm_name,
                         to_list=to_list, atts=atts, cfg=cfg, cust=cust, part=part,
-                        sender_info=sender_info, internal=0)
+                        sender_info=sender_info,
+                        internal=1 if (not cust and not part) else 0)
 
 
 def _open_ticket(conn, *, subject, body, frm, frm_name, to_list, atts, cfg,
@@ -863,7 +965,7 @@ def _notify_customer_reply(conn, t, frm):
         return
     htmlb = _render_email(conn, t, conn.execute(
         "SELECT * FROM messages WHERE ticket_id=? ORDER BY id", (t["id"],)).fetchall())
-    send_email(conn, parts, "Re:[#%s] %s" % (t["code"], t["title"]),
+    send_email(conn, parts, thread_subject(t),
                "Support replied on ticket %s." % t["code"], htmlb)
 
 
