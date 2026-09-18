@@ -1,4 +1,8 @@
-import { t, setLang, LANGS } from "./i18n.js";
+// The version query is not decoration: the server sends no Cache-Control, so a
+// browser is free to reuse this module from its heuristic cache. index.html
+// bumps app.js and app.css; this import has to carry the bump too, or a
+// returning visitor keeps the old translations while running the new code.
+import { t, setLang, LANGS } from "./i18n.js?v=20260918f";
 
 // ----------------------------------------------------------------- state
 const state = {
@@ -746,6 +750,12 @@ function current() {
 }
 
 async function render() {
+  // A dialog is opened from, and closed with, the screen it belongs to. It is
+  // appended to <body> rather than into #root, so re-drawing the page does not
+  // remove it -- navigating away used to leave the panel floating over the next
+  // screen (and it swallowed clicks aimed at it). closeModal() here makes the
+  // two lifetimes one.
+  closeModal();
   const c = current();
   const route = c.route;   // "/ticket/12" -> "ticket"
   const arg = c.parts[1];  // "/ticket/12" -> "12"
@@ -1206,6 +1216,58 @@ function openShareDialog(T, onConfirm) {
   showModal(t("share_to_kb"), body);
 }
 
+/**
+ * Answering a thread, in a dialog rather than underneath it.
+ *
+ * The editor used to sit permanently at the bottom of the page. On a thread
+ * with twenty messages that parks a 400px form below all of them: a reader who
+ * came for the latest answer scrolls past it, and the customer who just wants
+ * to read gets a box he cannot use. So the message carries a "Reply" button in
+ * its top-right corner and the editor only exists while the dialog is open --
+ * built here, removed by closeModal().
+ *
+ * Cancel closes without touching the ticket; the confirm button sits next to it
+ * and refuses to send an empty body (an empty reply would still drive the
+ * status to customer_replied and mail the whole thread).
+ */
+function openReplyDialog(opts) {
+  const o = opts || {};
+  const ta = h("textarea", { rows: 8, placeholder: t("reply") + "…" });
+  const intChk = h("input", { type: "checkbox" });
+  const fileInp = h("input", { type: "file", multiple: true });
+  const sendBtn = h("button", { class: "btn btn-blue" }, t("confirm_reply"));
+
+  sendBtn.onclick = async () => {
+    if (!ta.value.trim()) { toast(t("reply_empty"), false); return; }
+    sendBtn.disabled = true;
+    try {
+      const fd = new FormData();
+      fd.set("body", ta.value);
+      if (intChk.checked) fd.set("internal", "1");
+      for (const f of fileInp.files) fd.append("files", f);
+      await apiForm("/api/tickets/" + o.id + "/reply", fd);
+      ta.value = "";
+      closeModal();
+      toast("OK");
+      setTimeout(() => render(), 400);
+    } catch (e) {
+      sendBtn.disabled = false;   // keep the text so it can be retried
+      toast(e.message, false);
+    }
+  };
+
+  const body = h("div", {},
+    h("div", {}, mdEditor(ta), fileInp),
+    // the internal note is a property of the reply being written, so it lives
+    // with the editor instead of in the page header
+    o.internal
+      ? h("label", { class: "muted", style: "display:inline-flex;align-items:center;gap:6px;margin-top:10px" },
+          intChk, t("internal"))
+      : null);
+  showModal(t("reply"), body,
+    [h("button", { class: "btn btn-ghost", onclick: closeModal }, t("cancel")), sendBtn]);
+}
+
 async function ticketDetail(id) {
   if (!state.user) return loginView();
   if (!id) { window.location.hash = "#/tickets"; return { title: "", body: h("div", {}) }; }
@@ -1318,30 +1380,27 @@ async function ticketDetail(id) {
         t("shared_to_kb") + " ↗")
     : null;
 
-  // reply box -- Markdown, with a format bar and image paste
-  const msgInp = h("textarea", { rows: 3, placeholder: t("reply") + "…" });
-  const intChk = h("input", { type: "checkbox" });
-  const fileInp = h("input", { type: "file", multiple: true });
-  const replyBtn = h("button", { class: "btn btn-blue", onclick: async () => {
-    const fd = new FormData();
-    fd.set("body", msgInp.value);
-    if (intChk.checked) fd.set("internal", "1");
-    for (const f of fileInp.files) fd.append("files", f);
-    await apiForm("/api/tickets/" + id + "/reply", fd);
-    msgInp.value = ""; toast("OK"); setTimeout(() => render(), 400);
-  } }, t("reply"));
+  // There is deliberately no editor on this page: every message owns a "Reply"
+  // button that opens one (see openReplyDialog).
 
   const claimBtn = T.owner_id ? null : h("button", { class: "btn btn-ghost", onclick: async () => {
     await api("/api/tickets/" + id + "/claim", { method: "POST" }); toast("OK"); setTimeout(() => render(), 400);
   } }, t("claim"));
 
-  const msgs2 = h("div", {}, (data.messages || []).map(m => {
+  // Newest on top: a thread is read from the last answer backwards, so the
+  // reader lands on what was said most recently instead of scrolling past the
+  // whole history to find it. The API keeps handing the list over oldest-first
+  // (the outbound mail renderer walks it top-down), so the reversal is
+  // display-only -- `.slice()` first, because reverse() mutates in place and
+  // the count in the header is read from the same array.
+  const msgs2 = h("div", {}, (data.messages || []).slice().reverse().map(m => {
     return h("div", { class: "card mb-2" }, h("div", { class: "card-body" },
       h("div", { class: "flex-between" },
         h("div", {}, h("b", {}, m.author_name || m.author_email || "—"),
           h("span", { class: "muted" }, "  " + m.created_at),
           m.internal ? h("span", { class: "tag medium", style: "margin-left:8px" }, "internal") : null),
-        null),
+        can.reply ? h("button", { class: "btn btn-ghost btn-sm msg-reply",
+          onclick: () => openReplyDialog({ id: id, internal: internal }) }, t("reply")) : null),
       h("div", { class: "markdown", style: "margin-top:8px", innerHTML: mdToHtml(m.body || "") }),
       attachmentList(m.attachments)));
   }));
@@ -1366,14 +1425,10 @@ async function ticketDetail(id) {
         can.export ? h("a", { class: "btn btn-ghost", href: "/api/kb/export/" + (T.kb_article_id || id), target: "_blank" }, t("export_pdf")) : null,
       ),
       h("div", { class: "card-body", style: "background:var(--bg)" },
-        h("div", { class: "flex-between mb-2" }, h("h3", {}, t("messages") + " (" + (data.messages || []).length + ")"),
-          (can.reply && internal) ? h("label", { class: "muted" }, intChk, t("internal")) : null),
-        msgs2,
-        can.reply ? h("div", { class: "card-body", style: "background:var(--card)" },
-          h("div", {}, mdEditor(msgInp), fileInp),
-          h("div", { class: "flex-between", style: "margin-top:8px" },
-            h("span", { class: "muted" }, internal ? (t("reply") + " · " + t("internal")) : t("reply")),
-            replyBtn)) : null))));
+        h("div", { class: "flex-between mb-2" },
+          h("h3", {}, t("messages") + " (" + (data.messages || []).length + ")"),
+          can.reply ? h("span", { class: "muted", style: "font-size:13px" }, t("reply_hint")) : null),
+        msgs2))));
   return { title: "", body };
 }
 
@@ -1659,12 +1714,20 @@ async function kbEditorPage(id) {
   return { title: "", body };
 }
 
-function showModal(head, bodyEl) {
+/**
+ * A dialog. ``buttons`` is optional: dialogs whose own footer carries the
+ * choices (Cancel next to the action) pass theirs in, and the rest get the
+ * plain ✕ close button.
+ */
+function showModal(head, bodyEl, buttons) {
+  const foot = (buttons && buttons.length)
+    ? buttons
+    : [h("button", { class: "btn btn-ghost", onclick: closeModal }, "✕")];
   const p = h("div", { class: "modal" },
     h("div", { class: "panel" },
       h("div", { class: "head" }, head),
       h("div", { class: "body" }, bodyEl),
-      h("div", { class: "foot" }, h("button", { class: "btn btn-ghost", onclick: closeModal }, "✕"))));
+      h("div", { class: "foot" }, foot)));
   document.body.append(p);
 }
 function closeModal() { document.querySelectorAll(".modal").forEach(m => m.remove()); }

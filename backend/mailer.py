@@ -188,8 +188,90 @@ def _part_text(part):
 
 
 
+# ---------- trimming the quoted thread ----------
+#
+# A reply always arrives with the conversation underneath it: the client appends
+# the message it answers so the reader keeps the context. A ticket body is not a
+# conversation log -- it is that one message -- so the quoted part is cut before
+# anything is stored. Otherwise the third reply of a thread files the two
+# earlier ones a second time, and every round makes the next one longer.
+#
+# The cut is deliberately conservative: truncating a customer's own text is
+# worse than keeping a quoted trailer, because the trailer is at least readable.
+# So a marker only ends the message when it is unambiguous.
+
+#: ">" is the universal quoting character, and it is exactly what
+#: :func:`md.html_to_md` emits for every ``<blockquote>`` -- so a Gmail, Apple
+#: Mail or 163 quote is recognised in the converted Markdown without having to
+#: guess at the client's HTML wrappers.
+_QUOTE_LINE = re.compile(r"^\s*>")
+
+#: Markers that can only ever introduce a quote, so the message ends at them.
+#: ``On ... wrote:`` (Gmail/Apple), ``在 ... 写道：`` (Chinese clients),
+#: Outlook's ``_____`` and its ``----- 原始邮件 -----`` divider.
+_QUOTE_CUT = (
+    re.compile(r"^\s*_{6,}\s*$"),
+    re.compile(r"^\s*-{2,}\s*(?:原始邮件|原始郵件|转发邮件|转发郵件|"
+               r"original message|forwarded message)\s*-{2,}\s*$", re.I),
+    re.compile(r"^\s*(?:在|On)\s+\S.{2,120}?(?:写道|寫道|wrote)\s*[:：]?\s*$", re.I),
+    re.compile(r"^\s*.{1,80}?(?:写道|寫道)\s*[:：]\s*$"),
+)
+
+#: A single ``From:`` line is *not* a quote marker: customers paste log files
+#: and mail headers into tickets all the time. The Outlook header dump is a
+#: *block* of these fields, so two or more of them close together is what
+#: actually marks the start of the quote.
+_QUOTE_FIELD = re.compile(
+    r"^\s*(?:发件人|寄件者|差出人|发信人|发送时间|发送日期|时间|收件人|抄送|主题|"
+    r"from|sent|to|cc|subject|date)\s*[:：]\s*\S", re.I)
+_QUOTE_FIELD_MIN = 2
+_QUOTE_FIELD_WINDOW = 8
+
+
+def _quote_cut_index(lines):
+    """Index of the first line that starts the quoted thread, or ``None``."""
+    for i, line in enumerate(lines):
+        if any(rx.match(line) for rx in _QUOTE_CUT):
+            return i
+        if _QUOTE_FIELD.match(line):
+            window = lines[i:i + _QUOTE_FIELD_WINDOW]
+            if sum(1 for w in window if _QUOTE_FIELD.match(w)) >= _QUOTE_FIELD_MIN:
+                return i
+    return None
+
+
+def _tidy(text):
+    return re.sub(r"\n{3,}", "\n\n", text.strip())
+
+
+def strip_quoted(text):
+    """Keep only what the sender wrote this time, dropping the quoted thread.
+
+    Two passes, in this order:
+
+    1. cut at the first unambiguous marker (attribution, divider, header block);
+       if that leaves nothing, the mail is a bare forward and the quote *is* the
+       content, so nothing is cut -- better a long ticket than an empty one;
+    2. remove any remaining quoted lines (``> ...``), which also covers an
+       inline reply that sits *below* the quote, where a plain cut would have
+       thrown the sender's own words away with it.
+
+    An empty result falls back to the original text for the same reason.
+    """
+    if not text or not text.strip():
+        return text or ""
+    lines = text.split("\n")
+    cut = _quote_cut_index(lines)
+    if cut is not None:
+        head = _tidy("\n".join(lines[:cut]))
+        if head:
+            return head
+    body = _tidy("\n".join(l for l in lines if not _QUOTE_LINE.match(l)))
+    return body or _tidy(text)
+
+
 def extract_body(msg, images=None):
-    """The mail body as Markdown.
+    """The mail body as Markdown, with the quoted thread removed.
 
     A customer writes his problem in a webmail or in Outlook, so the part that
     carries the formatting is text/html -- and the part that loses it is
@@ -198,6 +280,9 @@ def extract_body(msg, images=None):
     into one paragraph. The HTML part is converted instead; ``images`` maps the
     Content-IDs of the inline pictures to their saved /files/ URL so they are
     rendered in the ticket rather than dropped.
+
+    The result goes through :func:`strip_quoted`: what is stored is the message
+    itself, not the message plus every mail it answers.
     """
     text = ""
     htmlb = ""
@@ -223,8 +308,8 @@ def extract_body(msg, images=None):
         # (an image-only mail with unmapped pictures), the plain part still
         # tells the reader more than an empty ticket.
         if converted:
-            return converted
-    return text or ""
+            return strip_quoted(converted)
+    return strip_quoted(text or "")
 
 
 def save_inline_images(msg):
@@ -271,7 +356,7 @@ def save_inline_images(msg):
         if disp == "attachment":
             # the sender also listed it as a file: keep it on the attachment bar
             saved.append({"filename": _dec(part.get_filename() or "image" + ext),
-                          "data": data, "content_type": ct})
+                          "data": data, "content_type": ct, "stored": stored})
     return mapping, saved
 
 
@@ -619,6 +704,21 @@ def _handle_msg(conn, mbox, num, cfg):
     # point at them and the ticket shows the image instead of an empty gap
     cid_map, inline_atts = save_inline_images(msg)
     body = extract_body(msg, cid_map)
+    # A picture that lived only inside the quoted thread is not part of this
+    # message any more, so the file save_inline_images() wrote for it has no
+    # owner left: nothing references it in the body, so bind_body_files() will
+    # not register it either. Delete it rather than let uploads/ fill up with
+    # pictures no ticket will ever show.
+    keep = set(re.findall(r"/files/([^)\s\"'>]+)", body))
+    keep |= {a.get("stored") for a in inline_atts if a.get("stored")}
+    for url in set(cid_map.values()):
+        stored = url.rsplit("/", 1)[-1]
+        if stored in keep:
+            continue
+        try:
+            os.remove(os.path.join(UPLOAD_DIR, stored))
+        except OSError:
+            pass
 
     # attachments: store up to 5MB each
     atts = list(inline_atts)

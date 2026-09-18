@@ -68,6 +68,8 @@ backups under `<app>/backups`. Override them at the top of the script.
 - A reply is threaded onto its ticket by the ticket code in the subject
   (`[SUPPORT-…]` / legacy `[TK-…]`), falling back to a normalised
   subject match against the same owner's recent open tickets.
+- The quoted thread a mail client appends under a reply is trimmed before the text is stored, so a
+  ticket holds the message itself rather than the conversation it answers.
 
 ## v1 coverage
 
@@ -78,6 +80,8 @@ backups under `<app>/backups`. Override them at the top of the script.
 - ✅ Tickets: web creation (customer autocomplete / auto-create customer, version, product module,
   priority), claim, change owner, filter by time / status / owner / customer / version / priority /
   module, status flow (new / customer replied / support replied / closed), internal notes, attachments.
+  The thread reads newest-first, and replying opens an editor in a dialog from a button on the
+  message being answered — the page itself stays a reading surface.
 - ✅ Inbound e-mail → ticket (domain match) / reply threading / unauthorized rejection.
 - ✅ KB visibility scopes (public / registered / internal / user-group), auto-archive on close,
   **desensitization** (customer domains → `xxxxx.com`, names → `xxxxxx`; images/attachments stripped),
@@ -90,11 +94,12 @@ backups under `<app>/backups`. Override them at the top of the script.
 
 - CJK PDF export uses fpdf2 with font auto-detection on the server; falls back to ASCII if no CJK
   font is installed.
-- There is no WYSIWYG editor for Markdown — KB articles use a Markdown textarea with a format bar.
+- There is no WYSIWYG editor for Markdown — KB articles use a Markdown textarea with a format bar
+  (on a ticket, the reply editor lives in a dialog rather than at the foot of the thread).
 - Inbound mail is decoded as UTF-8 first, then by declared charset, then by a short candidate list,
   with a lossless `latin-1` last resort: a body is never decoded with `errors="replace"`, because
   `U+FFFD` in the database is unrecoverable.
 
 ## License
 
-Not yet chosen — add a `LICENSE` file before publishing.
+LGPL-3.0 — see `LICENSE`.
