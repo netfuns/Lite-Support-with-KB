@@ -191,9 +191,43 @@ def _setting_raw(key, default=""):
     return raw if raw not in (None, "") else default
 
 
+def modules_with_builtin(raw=None):
+    """The modules on offer: the built-ins, always, plus whatever was added.
+
+    A module the operator added can be deleted; the four built-ins cannot. They
+    are what the shipped ticket form, knowledge base and every filter are written
+    against, and a site offering none of them would leave nothing to file a
+    ticket under. The order is the built-ins in their seeded order, then the
+    added ones -- which is also the order the settings page draws them in.
+    """
+    out = list(DEFAULT_MODULES)
+    for x in (raw or []):
+        v = str(x).strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
 def site_modules():
-    m = _setting_json("modules", [])
-    return [x for x in m if x] or DEFAULT_MODULES
+    """The configured module list, deletions included.
+
+    An empty list is a real answer -- the operator removed every module he had
+    added -- so it must not be swapped for a fallback: that is exactly what made
+    a deleted module come back in the ticket form and the knowledge base. Only a
+    value that was never written falls back to the seed.
+    """
+    c = conn_()
+    raw = get_setting(c, "modules", None)
+    c.close()
+    if raw in (None, ""):
+        return list(DEFAULT_MODULES)
+    try:
+        m = json.loads(raw)
+    except Exception:
+        return list(DEFAULT_MODULES)
+    if not isinstance(m, list):
+        return list(DEFAULT_MODULES)
+    return modules_with_builtin(m)
 
 
 def site_internal_domains():
@@ -805,7 +839,8 @@ def meta(request: Request):
     return ok(permissions=perms, products=products,
               statuses=T.STATUSES, priorities=["critical", "high", "medium", "low"],
               my_permissions=sorted(myperms),
-              modules=site_modules(), deploy_types=DEPLOY_TYPES,
+              modules=site_modules(), builtin_modules=DEFAULT_MODULES,
+              deploy_types=DEPLOY_TYPES,
               session_timeout=site_session_timeout(),
               session_max_lifetime=site_session_max_lifetime(),
               theme=site_theme(), can_edit_kb=can_edit_kb)
@@ -2624,7 +2659,8 @@ def admin_site(request: Request):
     c = conn_()
     known = rbac.known_domains(c)
     c.close()
-    return ok(modules=site_modules(), internal_domains=site_internal_domains(),
+    return ok(modules=site_modules(), builtin_modules=DEFAULT_MODULES,
+              internal_domains=site_internal_domains(),
               session_timeout=site_session_timeout(),
               session_max_lifetime=site_session_max_lifetime(),
               theme=site_theme(), deploy_types=DEPLOY_TYPES,
@@ -2644,8 +2680,12 @@ async def admin_site_save(request: Request):
     b = await request.json()
     c = conn_()
     if "modules" in b:
+        # The built-ins are put back rather than the save being refused: a client
+        # that drops one (a cached page, a hand-written request) would otherwise
+        # fail the whole save, theme and session timeout included.
         mods = [str(x).strip() for x in (b.get("modules") or []) if str(x).strip()]
-        set_setting(c, "modules", json.dumps(mods, ensure_ascii=False))
+        set_setting(c, "modules",
+                    json.dumps(modules_with_builtin(mods), ensure_ascii=False))
     if "internal_domains" in b:
         doms = [str(x).strip().lower() for x in (b.get("internal_domains") or []) if str(x).strip()]
         set_setting(c, "internal_domains", json.dumps(doms, ensure_ascii=False))

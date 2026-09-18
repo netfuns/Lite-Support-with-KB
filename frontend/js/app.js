@@ -2,7 +2,7 @@
 // browser is free to reuse this module from its heuristic cache. index.html
 // bumps app.js and app.css; this import has to carry the bump too, or a
 // returning visitor keeps the old translations while running the new code.
-import { t, setLang, LANGS } from "./i18n.js?v=20260918g";
+import { t, setLang, LANGS } from "./i18n.js?v=20260918h";
 
 // ----------------------------------------------------------------- state
 const state = {
@@ -1042,7 +1042,10 @@ async function ticketsView() {
     ["new", "customer_replied", "support_replied", "closed"].map(s => h("option", { value: s }, t("st_" + s)))]);
   const prioSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("priority")),
     ["critical", "high", "medium", "low"].map(p => h("option", { value: p }, t("pr_" + p)))]);
-  const modules = (state.modules && state.modules.length) ? state.modules : (state.products || []);
+  // The configured list, full stop. This used to fall back to the legacy product
+  // list, which still carries the built-in module names -- so a module the
+  // operator had deleted reappeared as soon as his own list came back empty.
+  const modules = state.modules || [];
   const prodSel = h("select", {}, [h("option", { value: "" }, t("all") + " · " + t("module")),
     modules.map(p => h("option", { value: p }, p))]);
   const ownerInp = h("input", { placeholder: t("filter_by_owner") });
@@ -1491,7 +1494,7 @@ async function newTicketView() {
         h("div", { class: "muted", style: "font-size:12px" }, t("customer_locked_hint")));
   }
 
-  const modules = (state.modules && state.modules.length) ? state.modules : (state.products || []);
+  const modules = state.modules || [];
   const prodSel = h("select", { style: "width:100%" },
     h("option", { value: "" }, t("select_product")),
     modules.map(p => h("option", { value: p }, p)));
@@ -2676,20 +2679,28 @@ async function adminSite() {
   let s;
   try { s = await api("/api/admin/site"); } catch (e) { return { title: "", body: h("div", {}, t("no_results")) }; }
   const modules = (s.modules || []).slice();
+  const builtinModules = s.builtin_modules || [];
   // Internal domains moved to their own settings page (#/admin/internal_domains).
 
   // --- modules CRUD ---
+  // The built-in modules are fixed: no delete control here, and the server puts
+  // one back even if a client submits it as removed. They are what the shipped
+  // ticket form and knowledge base are written against, so a site cannot be left
+  // without them. A module added here can be removed again -- and once it is, it
+  // is gone from the ticket list, the new-ticket form and the knowledge base.
   const modList = h("div", {});
   const modInput = h("input", { placeholder: "PAC" });
   function renderMods() {
     modList.innerHTML = "";
     if (!modules.length) modList.append(h("div", { class: "muted" }, t("no_results")));
     modules.forEach((m, i) => {
+      const fixed = builtinModules.includes(m);
       modList.append(h("div", { class: "flex-between", style: "padding:6px 0;border-bottom:1px solid var(--border)" },
-        h("span", {}, m),
-        h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: () => {
-          modules.splice(i, 1); renderMods();
-        } }, t("delete"))));
+        h("span", {}, m, fixed ? h("span", { class: "tag", style: "margin-left:8px" }, t("builtin")) : null),
+        fixed ? null
+          : h("button", { class: "btn btn-ghost btn-sm", style: "color:#dc2626", onclick: () => {
+              modules.splice(i, 1); renderMods();
+            } }, t("delete"))));
     });
   }
   renderMods();
