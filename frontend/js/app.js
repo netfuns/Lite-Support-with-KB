@@ -398,7 +398,13 @@ function mdEditor(ta, opts = {}) {
     (async () => { for (const f of files) await insertImage(f); })();
   });
 
-  wrap.append(bar);
+  // The box itself is the point of an editor. The bar goes on top (rounded top,
+  // no bottom border) and the textarea sits under it, which is what
+  // `.md-editor textarea` styles for -- it only rounds the *bottom* corners. The
+  // textarea is appended here because callers hand it in and never mount it
+  // themselves; leaving it out renders a bare toolbar over empty space, which is
+  // exactly what happened on every screen that uses this editor.
+  wrap.append(bar, ta);
   if (opts.hint !== false) {
     wrap.append(h("div", { class: "md-hint" }, opts.hintText || t("md_hint")));
   }
