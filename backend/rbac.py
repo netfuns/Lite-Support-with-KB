@@ -665,8 +665,7 @@ def align_domain_role(conn, uid, email):
     """Give an account the role its e-mail domain implies.
 
     Replaces the 客户 default that the inbound-mail path used to apply blind:
-    an agent writing in from a partner domain (netfuns@hotmail.com, whose
-    partner record owns hotmail.com) ended up in the right "Partner-<name>"
+    an agent writing in from a partner domain (an address on a partner's domain) ended up in the right "Partner-<name>"
     group but labelled 客户 in the users list. Same conservatism as
     align_internal_role -- only the default 客户 role is ever swapped, a role an
     administrator picked on purpose (管理员, L1/L2, 代理商) is left alone.

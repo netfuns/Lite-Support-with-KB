@@ -16,12 +16,12 @@ import os
 STATUSES = ["new", "customer_replied", "support_replied", "closed"]
 
 
-CODE_PREFIX = "RANKEZ-SUPPORT"
+CODE_PREFIX = "SUPPORT"
 CODE_RE = re.compile(r"^%s-(\d{6})(\d{3})$" % CODE_PREFIX, re.I)
 
 
 def _code(conn):
-    """RANKEZ-SUPPORT-YYYYMMxxx -- the counter restarts every month.
+    """SUPPORT-YYYYMMxxx -- the counter restarts every month.
 
     The old TK-00001 counted the whole table, so the number said nothing but
     "how busy we have ever been". Year+month makes a code sortable and lets a
@@ -116,7 +116,7 @@ def send_tpl_email(conn, key, to_list, fallback, values):
 def display_title(ticket):
     """The ticket title without the ``[CODE] `` that mail-opened tickets carry.
 
-    An e-mail ticket is named "[RANKEZ-SUPPORT-20260918001] 打印机故障" so the
+    An e-mail ticket is named "[SUPPORT-20260918001] 打印机故障" so the
     name itself shows the code. Everywhere the code is printed anyway -- the
     receipt subject, the desk notification -- repeating it just reads as a bug.
     """
@@ -129,12 +129,12 @@ def display_title(ticket):
 
 def _credentials_email(conn, to_addr, password, base_url="", display_name=""):
     """Send the temporary password + TOTP-nag to a brand-new account holder."""
-    subject = "[RankEZ] Your account was created"
+    subject = "[Example] Your account was created"
     # bilingual: the auto-created address is on a customer domain that we do not
     # know the locale of, so ship both English and 简体 Chinese in one mail.
     login = (base_url or site_root(conn)) + "/#/login"
     text = (
-        "Your account on the RankEZ support portal was created automatically "
+        "Your account on the Example support portal was created automatically "
         "because you sent a message to a support ticket.\n\n"
         "Login URL: %s\n"
         "Email (your username): %s\n"
@@ -142,18 +142,18 @@ def _credentials_email(conn, to_addr, password, base_url="", display_name=""):
         "On first sign-in you will be asked to set up two-factor authentication "
         "(TOTP) in your authenticator app.\n"
         "---\n"
-        "您的 RankEZ 售后平台账号已自动创建（您刚刚发邮件到售后时触发）。\n\n"
+        "您的示例售后平台账号已自动创建（您刚刚发邮件到售后时触发）。\n\n"
         "登录地址：%s\n"
         "邮箱（即用户名）：%s\n"
         "临时密码：%s\n\n"
         "首次登录时需设置两步验证（TOTP）。\n"
     ) % (login, to_addr, password, login, to_addr, password)
-    htmlb = ("<p>Your account on the RankEZ support portal was created automatically.</p>"
+    htmlb = ("<p>Your account on the Example support portal was created automatically.</p>"
              "<p><b>Login URL:</b> <a href='%s'>%s</a><br>"
              "<b>Email (username):</b> %s<br>"
              "<b>Temporary password:</b> %s</p>"
              "<p>On first sign-in you will be asked to set up two-factor authentication (TOTP).</p>"
-             "<hr><p>您的 RankEZ 售后平台账号已自动创建。</p>"
+             "<hr><p>您的示例售后平台账号已自动创建。</p>"
              "<p><b>登录地址：</b><a href='%s'>%s</a><br>"
              "<b>邮箱（即用户名）：</b>%s<br>"
              "<b>临时密码：</b>%s</b></p>"
@@ -191,7 +191,7 @@ def find_or_create_user(conn, email, display_name="", send_credentials=False):
     rbac.sync_email_groups(conn, uid, email, remove_stale=False)
     # The role follows the group the domain just earned. Hard-coding 客户 here
     # used to mislabel every agent whose first contact was an inbound e-mail
-    # (netfuns@hotmail.com): right group, wrong role in the users list.
+    # (an address on a partner's domain): right group, wrong role.
     rbac.align_domain_role(conn, uid, email)
     conn.commit()
     mailed = False
@@ -216,7 +216,7 @@ def site_root(conn):
 def _company(conn):
     """Brand name used in the mail templates ({{company}})."""
     from db import get_setting
-    return (get_setting(conn, "company_name", "") or "").strip() or "RankEZ"
+    return (get_setting(conn, "company_name", "") or "").strip() or "Example"
 
 
 def registration_nag_email(conn, to_addr, ticket=None):
@@ -233,9 +233,9 @@ def registration_nag_email(conn, to_addr, ticket=None):
         return False
     url = site_root(conn) + "/#/register"
     who = ("ticket %s" % ticket["code"]) if ticket else "a support ticket"
-    subject = "[RankEZ Support] You have no account yet / 您还没有注册售后平台"
+    subject = "[Example Support] You have no account yet / 您还没有注册售后平台"
     text = (
-        "You were copied on %s, but this address has no account on the RankEZ "
+        "You were copied on %s, but this address has no account on the Example "
         "support portal yet.\n\n"
         "Please register with this exact address to follow the ticket:\n%s\n\n"
         "---\n"
@@ -245,7 +245,7 @@ def registration_nag_email(conn, to_addr, ticket=None):
     htmlb = (
         "<div style='font-family:Segoe UI,Arial;font-size:14px;line-height:1.6'>"
         "<p>You were copied on <b>%s</b>, but this address has no account on the "
-        "RankEZ support portal yet.</p>"
+        "Example support portal yet.</p>"
         "<p><a href='%s'>%s</a></p>"
         "<hr><p>您被抄送了工单 <b>%s</b>，但此邮箱还没有注册售后平台账号。<br>"
         "请使用此邮箱访问下面地址自行注册，即可追踪工单处理进度：<br>"

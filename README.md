@@ -1,60 +1,100 @@
-# RankEZ Support
+# Example Support
 
-Integrated after-sales ticket platform + knowledge base (V1 MVP).
+Integrated after-sales ticket platform + knowledge base. Self-hosted, single
+process, no external services required.
 
 ## Stack
-- Backend: Python FastAPI + SQLite (single process, no external services required)
-- Frontend: modern, minimal (in the style of rankez.com). Vanilla ES modules, **zero build step**.
-- i18n: English (default), Simplified Chinese, Traditional Chinese.
-- Deploy: systemd + uvicorn, listens on port **12345** (auto-frees on conflict).
 
-## Local run
+- **Backend**: Python `FastAPI` + `Starlette` on `uvicorn` (single ASGI process), `Pydantic` for
+  validation. Python standard library only for mail (`imaplib` / `smtplib` / `email`).
+- **Database**: one SQLite file in WAL mode.
+- **Frontend**: vanilla ES modules, **zero build step** — no framework, no bundler.
+  A hand-written `h()` hyperscript helper plus hash routing.
+- **i18n**: English (default), Simplified Chinese, Traditional Chinese.
+- **Deploy**: systemd + uvicorn, listens on port **12345** (auto-frees on conflict).
+
+## Quick start (local)
+
 ```bash
 cd backend
-python -m venv .venv && .venv/bin/pip install -r ../requirements.txt
-.venv/bin/uvicorn app:app --reload --host 0.0.0.0 --port 8000
-# then: http://127.0.0.1:8000   (admin@rankez.local / Admin@12345)
+python3 -m venv .venv && .venv/bin/pip install -r ../requirements.txt
+.venv/bin/uvicorn app:app --reload --host 127.0.0.1 --port 8000
+# open http://127.0.0.1:8000
 ```
-
-## Deploy to 192.168.254.10
-From `deploy/run.sh` (runs as root via `sudo -i`):
-```bash
-tar -czf /tmp/rankez_support.tar.gz -C rankez-support .
-scp rankez-support/deploy/run.sh deploy/run.sh    # then:
-sudo bash deploy/run.sh root
-```
-Service: `rankez-support` → `http://192.168.254.10:12345`.
 
 ## Accounts (seed)
-- Administrator: `admin@rankez.local / Admin@12345` (TOTP optional, 2FA optional).
-- A demo customer `Acme Inc` (email domain `abc.com`) is seeded so the domain-gated
+
+- Administrator: **`admin@example.com` / `Admin@12345`** — change this password on first login.
+- A demo customer `Acme Inc` (e-mail domain `abc.com`) is seeded so the domain-gated
   self-registration flow works out of the box.
 
-## Email integration (admin → Mail settings)
-- **Receive** via IMAP (incl. O365 `outlook.office365.com` with optional OAuth2 client-credentials),
-  polled every 60s by a background thread.
-- **Send** via SMTP / O365 SMTP OAuth2.
-- Unauthorized sender domains are rejected with an automatic reply.
-- Replies with subject `[TK-…]` are threaded onto the matching ticket.
+Disable the demo fixture with `RZ_SEED_DEMO=0` if you want a completely empty database.
+
+## Configuration
+
+Configuration lives in the database (`settings` table) and is edited from the admin UI;
+only three values come from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `12345` | Listen port |
+| `RZ_DATA` | `backend/data` | Directory holding `app.db` and `uploads/` |
+| `RZ_SEED_DEMO` | `1` | Seed the `Acme Inc` demo customer + a demo KB article |
+
+Everything else — SMTP/IMAP mailbox, O365 OAuth2 credentials, company name, logo, bound
+hosts, product modules, internal domains, welcome page, notification templates, session
+timeouts — is stored in the database and configured from **Admin → Settings**. A fresh
+install ships with an empty mailbox: the inbound poller stays idle until you configure one.
+
+## Deploy
+
+`deploy/run.sh` is an idempotent installer; it runs as root and creates a dedicated
+system user, a virtualenv, and a systemd unit:
+
+```bash
+tar -czf /tmp/example_support.tar.gz -C . .
+sudo bash deploy/run.sh /tmp/example_support.tar.gz
+```
+
+Defaults: app directory `/opt/rankez-support`, service `rankez-support`, user `rankez`,
+backups under `<app>/backups`. Override them at the top of the script.
+
+## Email integration (Admin → Mail settings)
+
+- **Receive** via IMAP (including `outlook.office365.com` with optional OAuth2
+  client-credentials), polled every 60s by a background thread.
+- **Send** via SMTP, or O365 SMTP with OAuth2.
+- Senders from unregistered domains are rejected with an automatic reply.
+- A reply is threaded onto its ticket by the ticket code in the subject
+  (`[SUPPORT-…]` / legacy `[TK-…]`), falling back to a normalised
+  subject match against the same owner's recent open tickets.
 
 ## v1 coverage
+
 - ✅ Unified login portal + RBAC (roles with a granular permission checkbox list per role) + user groups.
-- ✅ Domain-gated self-registration; user group per customer (auto-add by email domain).
-- ✅ Customers: CSV template + bulk import + manual CRUD.
-- ✅ Tickets: web creation (customer autocomplete / auto-create customer, version, product module, priority),
-  claim, change owner, filter by time / status / owner / customer / version / priority / module,
-  status flow (new / customer replied / support replied / closed), internal ticket toggle, attachments.
-- ✅ Email → ticket (domain match) / reply threading / unauthorized rejection; SMTP notification replies.
+- ✅ Domain-gated self-registration; one user group per customer (auto-add by e-mail domain).
+- ✅ Customers: CSV template + bulk import + manual CRUD. Partners (resellers) with their own
+  visible-ticket scope and two-way ticket creation (on behalf of a bound customer, or internal).
+- ✅ Tickets: web creation (customer autocomplete / auto-create customer, version, product module,
+  priority), claim, change owner, filter by time / status / owner / customer / version / priority /
+  module, status flow (new / customer replied / support replied / closed), internal notes, attachments.
+- ✅ Inbound e-mail → ticket (domain match) / reply threading / unauthorized rejection.
 - ✅ KB visibility scopes (public / registered / internal / user-group), auto-archive on close,
   **desensitization** (customer domains → `xxxxx.com`, names → `xxxxxx`; images/attachments stripped),
-  import (MD / Word / Excel / PDF → MD), export to PDF, email share link.
+  import (MD / Word / Excel / PDF → MD), export to PDF, e-mail share link.
 - ✅ Global fuzzy search over accessible tickets + KB articles.
-- ✅ TOTP (self-enable + admin reset); self-service display name / password.
+- ✅ TOTP (self-enable + admin reset, server-rendered QR code); self-service display name / password.
+- ✅ Scheduled SQLite backups with in-app restore.
 
 ### Scope notes / known ceilings (first version)
-- CJK PDF export uses fpdf2 with font auto-detection on the server; falls back to ASCII if no CJK font is installed.
-- We did **not** add a WYSIWYG editor for Markdown; KB articles use a Markdown textarea.
-- Email receive/send requires a configured mailbox in **Admin → Mail settings**; without it the inbound loop is idle.
 
-## Code → GitHub sync
-Pushed to `https://github.com/netfuns/rankez-support` (branch `main`) using the provided fine-grained token.
+- CJK PDF export uses fpdf2 with font auto-detection on the server; falls back to ASCII if no CJK
+  font is installed.
+- There is no WYSIWYG editor for Markdown — KB articles use a Markdown textarea with a format bar.
+- Inbound mail is decoded as UTF-8 first, then by declared charset, then by a short candidate list,
+  with a lossless `latin-1` last resort: a body is never decoded with `errors="replace"`, because
+  `U+FFFD` in the database is unrecoverable.
+
+## License
+
+Not yet chosen — add a `LICENSE` file before publishing.

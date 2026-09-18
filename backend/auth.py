@@ -57,7 +57,7 @@ def totp_verify(secret_b32: str, code: str, window=1, step=30) -> bool:
     return False
 
 
-def totp_uri(email: str, secret_b32: str, issuer="RankEZ Support") -> str:
+def totp_uri(email: str, secret_b32: str, issuer="Example Support") -> str:
     from urllib.parse import quote
     return "otpauth://totp/%s:%s?secret=%s&issuer=%s" % (quote(issuer), quote(email), secret_b32, quote(issuer))
 

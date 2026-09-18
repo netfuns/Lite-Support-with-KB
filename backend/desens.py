@@ -6,7 +6,7 @@ e-mail address, IP literal, host name and domain -- all become ``xxxxxx``:
     Acme Inc          -> xxxxxx
     alice@abc.com     -> xxxxxx
     abc.com           -> xxxxxx
-    192.168.254.10    -> xxxxxx
+    203.0.113.10      -> xxxxxx
 
 When desensitization is on the caller also drops every attachment and image
 (see tickets.archive_to_kb): only the dialogue text is published.

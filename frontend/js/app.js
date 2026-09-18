@@ -415,7 +415,7 @@ function mdEditor(ta, opts = {}) {
 /** Company logo + name, taken from settings > company info. */
 function brandMark(size) {
   const b = state.brand || {};
-  const name = b.company_name || "RankEZ";
+  const name = b.company_name || "Example";
   const logo = b.company_logo
     ? h("img", { src: b.company_logo, class: "brand-logo", alt: name,
                  style: size ? "height:" + size + "px" : null })
@@ -426,7 +426,7 @@ function brandMark(size) {
 function layout(title, content) {
   const root = document.getElementById("root");
   root.innerHTML = "";
-  document.title = ((state.brand && state.brand.company_name) || "RankEZ") + " \u00b7 " + t("app");
+  document.title = ((state.brand && state.brand.company_name) || "Example") + " \u00b7 " + t("app");
   root.append(h("div", {},
     h("header", { class: "app-bar" },
       h("a", { class: "logo", href: state.user ? "#/dashboard" : "#/home" }, brandMark(26)),
@@ -794,7 +794,7 @@ window.addEventListener("hashchange", () => render());
 async function homeView() {
   if (!state.brand) await loadBrand();
   const b = state.brand || {};
-  const name = b.company_name || "RankEZ";
+  const name = b.company_name || "Example";
   const searchInp = h("input", { class: "filter-grow", placeholder: t("home_search_placeholder") });
   const results = h("div", { class: "home-search-results" });
   async function runSearch() {
@@ -2807,7 +2807,7 @@ async function adminInternalDomains() {
   const domains = (s.domains || []).slice();
 
   const list = h("div", {});
-  const inp = h("input", { placeholder: "rankez.local", style: "flex:1" });
+  const inp = h("input", { placeholder: "example.com", style: "flex:1" });
   let paintSite = () => {};
   const paint = () => {
     paintSite();

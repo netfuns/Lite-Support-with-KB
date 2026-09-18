@@ -311,7 +311,7 @@ def send_email(conn, to_list, subject, text_body, html_body=None):
         return False
     to_list = sorted({t.lower() for t in to_list if t and "@" in t})
     msg = MIMEMultipart("alternative")
-    msg["From"] = formataddr(("RankEZ Support", cfg["smtp_from"] or cfg["smtp_user"]))
+    msg["From"] = formataddr(("Example Support", cfg["smtp_from"] or cfg["smtp_user"]))
     msg["To"] = ", ".join(to_list)
     msg["Subject"] = subject
     # Marks the mail as ours. Every notification is addressed to the ticket's
@@ -319,7 +319,7 @@ def send_email(conn, to_list, subject, text_body, html_body=None):
     # app reads its own answer back in and answers that too, one ticket turning
     # into an endless chain of reply notifications.
     msg["Auto-Submitted"] = "auto-generated"
-    msg["X-Rankez-Auto"] = "1"
+    msg["X-Example-Auto"] = "1"
     msg.attach(MIMEText(text_body or _html_to_text(html_body or ""), "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -364,7 +364,7 @@ def reject_reply(cfg, from_addr, reason):
     base = ("The email address %s is not associated with any authorized customer domain, "
             "so this message was not converted into a support ticket.\n"
             "Reason: unauthorized sender domain.\n" % from_addr)
-    send_email_only(cfg, [from_addr], "[RankEZ Support] Email not authorized",
+    send_email_only(cfg, [from_addr], "[Example Support] Email not authorized",
                     base, "<p>%s</p>" % escape(base))
 
 
@@ -373,7 +373,7 @@ def send_email_only(cfg, to_list, subject, text_body, html_body=None):
     if not cfg["smtp_host"] or not to_list:
         return False
     msg = MIMEMultipart("alternative")
-    msg["From"] = formataddr(("RankEZ Support", cfg["smtp_from"] or cfg["smtp_user"]))
+    msg["From"] = formataddr(("Example Support", cfg["smtp_from"] or cfg["smtp_user"]))
     msg["To"] = ", ".join(to_list)
     msg["Subject"] = subject
     # Marks the mail as ours. Every notification is addressed to the ticket's
@@ -381,7 +381,7 @@ def send_email_only(cfg, to_list, subject, text_body, html_body=None):
     # app reads its own answer back in and answers that too, one ticket turning
     # into an endless chain of reply notifications.
     msg["Auto-Submitted"] = "auto-generated"
-    msg["X-Rankez-Auto"] = "1"
+    msg["X-Example-Auto"] = "1"
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -452,7 +452,7 @@ def _imap_identify(mbox, user):
     try:
         if "ID" not in imaplib.Commands:
             imaplib.Commands["ID"] = ("AUTH", "SELECTED")
-        arg = '("name" "rankez-support" "version" "1.0" "vendor" "rankez" "contact" "%s")' \
+        arg = '("name" "example-support" "version" "1.0" "vendor" "example" "contact" "%s")' \
               % (user or "").replace('"', "").replace("\\", "")
         typ, _dat = mbox._simple_command("ID", arg)
         try:
@@ -523,7 +523,7 @@ def _is_own_mail(cfg, header):
     this version, the header does not.
     """
     try:
-        if (header.get("X-Rankez-Auto") or "").strip():
+        if (header.get("X-Example-Auto") or "").strip():
             return True
         if (header.get("Auto-Submitted") or "").strip().lower().startswith("auto-"):
             return True
@@ -672,10 +672,10 @@ def _handle_msg(conn, mbox, num, cfg):
 
 # ---------- incoming logic (also used by tests / webhook) ----------
 
-# RANKEZ-SUPPORT-YYYYMMxxx is the format since the monthly-counter change; the
+# SUPPORT-YYYYMMxxx is the format since the monthly-counter change; the
 # older TK-##### must still thread, or every answer to a ticket opened before
 # the change would silently open a new one.
-REF_RE = re.compile(r"\b(?:RANKEZ-SUPPORT-\d{9}|TK-\d{5})\b", re.I)
+REF_RE = re.compile(r"\b(?:SUPPORT-\d{9}|TK-\d{5})\b", re.I)
 
 #: a subject-only match is a guess, so it is fenced: the thread has to be still
 #: open and recent. Without the window a mail called "无法登录" would thread onto

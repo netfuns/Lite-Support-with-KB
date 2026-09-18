@@ -1,4 +1,4 @@
-"""RankEZ Support platform — FastAPI app (API + static SPA)."""
+"""Example Support platform — FastAPI app (API + static SPA)."""
 import base64
 import csv
 import io
@@ -32,7 +32,7 @@ from starlette.responses import RedirectResponse
 # ------------------------------------------------------------------ bootstrap
 FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
 init_db()
-app = FastAPI(title="RankEZ Support", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Example Support", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
 
 @app.exception_handler(Exception)
@@ -58,13 +58,13 @@ async def _host_guard(request: Request, call_next):
     return await call_next(request)
 
 
-DEFAULT_MODULES = ["PAC", "PSM", "CPM", "VAULT", "CP", "REMOTEAPP", "CLM", "RAG"]
+DEFAULT_MODULES = ["通用", "账号管理", "密码管理", "会话审计报告"]
 DEPLOY_TYPES = ["ON-PREM", "SaaS"]
 LOGO_HINT = "建议上传 200 × 48 px 的 PNG / SVG（透明背景，横向），不超过 1 MB"
 
-DEFAULT_WELCOME = """# RankEZ 支持中心
+DEFAULT_WELCOME = """# 示例支持中心
 
-欢迎来到 **RankEZ 售后与知识库平台**。
+欢迎来到 **示例售后与知识库平台**。
 
 - 提交工单并跟踪处理进度
 - 检索产品文档与最佳实践
@@ -98,7 +98,7 @@ def _seed():
     _seed_setting(conn, "session_timeout", "480")
     _seed_setting(conn, "session_max_lifetime", "1440")
     _seed_setting(conn, "theme", "light")
-    _seed_setting(conn, "company_name", "RankEZ")
+    _seed_setting(conn, "company_name", "Example")
     _seed_setting(conn, "company_logo", "")
     _seed_setting(conn, "welcome_md", DEFAULT_WELCOME)
     _seed_setting(conn, "allowed_hosts", "[]")
@@ -114,11 +114,11 @@ def _seed():
     for p in ("通用", "账号管理", "密码管理", "会话审计报告"):
         conn.execute("INSERT OR IGNORE INTO products(name) VALUES(?)", (p,))
     # admin user
-    admin = conn.execute("SELECT id FROM users WHERE email=?", ("admin@rankez.local",)).fetchone()
+    admin = conn.execute("SELECT id FROM users WHERE email=?", ("admin@example.com",)).fetchone()
     if not admin:
         cur = conn.execute(
             "INSERT INTO users(email,display_name,password_hash) VALUES(?,?,?)",
-            ("admin@rankez.local", "Administrator", auth.hash_password("Admin@12345")))
+            ("admin@example.com", "Administrator", auth.hash_password("Admin@12345")))
         aid = cur.lastrowid
         role = conn.execute("SELECT id FROM roles WHERE name='管理员'").fetchone()
         conn.execute("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)", (aid, role["id"]))
@@ -126,9 +126,9 @@ def _seed():
             g = conn.execute("SELECT id FROM user_groups WHERE name=?", (gname,)).fetchone()
             if g:
                 conn.execute("INSERT OR IGNORE INTO user_groups_rel(user_id,group_id) VALUES(?,?)", (aid, g["id"]))
-        print("[seed] admin@rankez.local / Admin@12345")
+        print("[seed] admin@example.com / Admin@12345")
     # make sure the existing admin also belongs to the internal group (KB edit rights)
-    arow = conn.execute("SELECT id FROM users WHERE email=?", ("admin@rankez.local",)).fetchone()
+    arow = conn.execute("SELECT id FROM users WHERE email=?", ("admin@example.com",)).fetchone()
     if arow:
         gi = rbac.internal_group_id(conn)
         if gi:
@@ -150,11 +150,11 @@ def _seed_demo_if_needed():
         if not c.execute("SELECT id FROM customers WHERE domains LIKE '%abc.com%'").fetchone():
             cid = c.execute("INSERT INTO customers(name,domains) VALUES('Acme Inc','abc.com')").lastrowid
             rbac.ensure_customer_group(c, cid, "Acme Inc")
-        if not c.execute("SELECT id FROM kb_articles WHERE title='欢迎使用 RankEZ 知识库'").fetchone():
+        if not c.execute("SELECT id FROM kb_articles WHERE title='欢迎使用示例知识库'").fetchone():
             c.execute("INSERT INTO kb_articles(title,body,source,visibility,collection_id,author_id) "
                       "VALUES(?,?,?,?,?,?)",
-                    ("欢迎使用 RankEZ 知识库",
-                     "# RankEZ Support\n\nA knowledge base article auto-desensitized from a ticket shows how customer data is masked "
+                    ("欢迎使用示例知识库",
+                     "# Example Support\n\nA knowledge base article auto-desensitized from a ticket shows how customer data is masked "
                      "(e.g. `abc.com` is shown as `xxxxx.com`).\n\n## 常见问题\n- Q: 如何开工单？\n- A: 登录后点击「工单→新建工单」，选择客户并填写详情。\n\n## Demo article / 示例知识",
                      "manual", "registered",
                      (c.execute("SELECT id FROM kb_collections WHERE name='注册用户'").fetchone() or {"id": None})["id"], 1))
@@ -206,7 +206,7 @@ def site_allowed_hosts():
 
 
 def site_company_name():
-    return _setting_raw("company_name", "RankEZ") or "RankEZ"
+    return _setting_raw("company_name", "Example") or "Example"
 
 
 def site_company_logo():
@@ -700,22 +700,22 @@ def _forgot_credentials_email(conn, to_addr, password, base_url=""):
     import mailer
     login = (base_url or "") + "/#/login"
     text = (
-        "Your RankEZ support portal password has been reset.\n\n"
+        "Your Example support portal password has been reset.\n\n"
         "Login URL: %s\nEmail: %s\nNew password: %s\n\n"
         "On next sign-in you will be asked to set up two-factor authentication "
-        "(TOTP) again.\n---\n您的 RankEZ 售后平台密码已重置。\n\n登录地址：%s\n邮箱：%s\n"
+        "(TOTP) again.\n---\n您的示例售后平台密码已重置。\n\n登录地址：%s\n邮箱：%s\n"
         "新密码：%s\n\n下次登录时需重新设置两步验证（TOTP）。\n"
     ) % (login, to_addr, password, login, to_addr, password)
-    htmlb = ("<p>Your RankEZ password has been reset.</p>"
+    htmlb = ("<p>Your Example password has been reset.</p>"
              "<p><b>Login URL:</b> <a href='%s'>%s</a><br><b>Email:</b> %s<br>"
              "<b>New password:</b> %s</p>"
              "<p>On next sign-in you will be asked to set up TOTP again.</p>"
-             "<hr><p>您的 RankEZ 售后平台密码已重置。</p>"
+             "<hr><p>您的示例售后平台密码已重置。</p>"
              "<p><b>登录地址：</b><a href='%s'>%s</a><br><b>邮箱：</b>%s<br>"
              "<b>新密码：</b>%s</p>"
              "<p>下次登录时需重新设置两步验证（TOTP）。</p>"
              % (login, login, to_addr, password, login, login, to_addr, password))
-    return mailer.send_email(conn, [to_addr], "[RankEZ] Your password has been reset",
+    return mailer.send_email(conn, [to_addr], "[Example] Your password has been reset",
                              text, htmlb)
 
 
@@ -2009,7 +2009,7 @@ async def kb_share(request: Request):
     msg = "A knowledge base article is shared with you: %s\nLink: %s\n" % (a["title"], link)
     if a["visibility"] != "public":
         msg += "\nThis article requires login to access."
-    okmail = mailer.send_email(c, [to], "[RankEZ KB] %s" % a["title"], msg)
+    okmail = mailer.send_email(c, [to], "[Example KB] %s" % a["title"], msg)
     c.close()
     return ok(sent=bool(okmail), link=link)
 
@@ -2162,8 +2162,8 @@ USER_CSV_HEADER = ["email", "display_name", "password", "roles", "status"]
 def admin_users_template(request: Request):
     require_perm(request, "user.manage")
     csv_data = ",".join(USER_CSV_HEADER) + "\n" + \
-        "l1@rankez.local,L1 Agent,Change@123,L1售后人员,active\n" + \
-        "l2@rankez.local,L2 Engineer,Change@123,L2售后人员,active\n"
+        "l1@example.com,L1 Agent,Change@123,L1售后人员,active\n" + \
+        "l2@example.com,L2 Engineer,Change@123,L2售后人员,active\n"
     return Response(content=csv_data.encode("utf-8-sig"), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=users_template.csv"})
 
@@ -2662,7 +2662,7 @@ async def admin_site_save(request: Request):
     if "theme" in b:
         set_setting(c, "theme", str(b.get("theme") or "light"))
     if "company_name" in b:
-        set_setting(c, "company_name", str(b.get("company_name") or "").strip() or "RankEZ")
+        set_setting(c, "company_name", str(b.get("company_name") or "").strip() or "Example")
     if "welcome_md" in b:
         set_setting(c, "welcome_md", str(b.get("welcome_md") or ""))
     # Portal address: the link inside notification mails. "Settings > Mail >
@@ -2785,7 +2785,7 @@ async def mail_test(request: Request):
     b = await request.json()
     to = b.get("to") or ""
     c = conn_()
-    res = mailer.send_email(c, [to] if to else [], "RankEZ test", "Mail engine test OK.")
+    res = mailer.send_email(c, [to] if to else [], "Example test", "Mail engine test OK.")
     c.close()
     return ok(sent=bool(res))
 

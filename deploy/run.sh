@@ -42,7 +42,7 @@ chmod 600 "$APP_DIR/.env"
 # 5. systemd unit
 cat > /etc/systemd/system/${SERVICE}.service <<EOF
 [Unit]
-Description=RankEZ Support (helpdesk + knowledge base)
+Description=Example Support (helpdesk + knowledge base)
 After=network.target
 
 [Service]
