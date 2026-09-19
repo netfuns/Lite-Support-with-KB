@@ -1,350 +1,118 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lite-support — Architecture &amp; Flow Diagrams</title>
-<style>
-  :root{--bg:#f7f7f5;--card:#fff;--line:#e3e2dd;--ink:#2c2c2a;--muted:#6b6a65;--accent:#534AB7;}
-  *{box-sizing:border-box;}
-  body{margin:0;background:var(--bg);color:var(--ink);
-       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-       font-size:14px;line-height:1.65;}
-  .wrap{max-width:860px;margin:0 auto;padding:40px 24px 64px;}
-  h1{font-size:24px;font-weight:600;margin:0 0 6px;}
-  .sub{color:var(--muted);margin:0 0 32px;}
-  h2{font-size:17px;font-weight:600;margin:40px 0 6px;padding-top:20px;border-top:1px solid var(--line);}
-  h2:first-of-type{border-top:0;padding-top:0;}
-  h3{font-size:14px;font-weight:600;margin:24px 0 8px;}
-  .note{color:var(--muted);margin:0 0 16px;}
-  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);
-        border-radius:10px;overflow:hidden;margin:8px 0 4px;}
-  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
-  th{background:#f1efea;font-weight:600;font-size:13px;}
-  tr:last-child td{border-bottom:0;}
-  td.k{width:132px;color:var(--muted);white-space:nowrap;}
-  code{background:#f1efea;padding:1px 5px;border-radius:4px;font-size:12.5px;
-       font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}
-  .fig{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 16px 12px;margin:12px 0 28px;}
-  .cap{color:var(--muted);font-size:12.5px;text-align:center;padding-top:6px;}
-  .fix{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--accent);
-       border-radius:8px;padding:14px 16px;margin:12px 0;}
-  .fix b{font-weight:600;}
-  .ok{color:#0F6E56;font-weight:600;}
-  ul{padding-left:20px;margin:8px 0;}
-  li{margin:3px 0;}
-</style>
-</head>
-<body>
-<div class="wrap">
+  Lite-support — Architecture & Flow Diagrams :root{--bg:#f7f7f5;--card:#fff;--line:#e3e2dd;--ink:#2c2c2a;--muted:#6b6a65;--accent:#534AB7;} \*{box-sizing:border-box;} body{margin:0;background:var(--bg);color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; font-size:14px;line-height:1.65;} .wrap{max-width:860px;margin:0 auto;padding:40px 24px 64px;} h1{font-size:24px;font-weight:600;margin:0 0 6px;} .sub{color:var(--muted);margin:0 0 32px;} h2{font-size:17px;font-weight:600;margin:40px 0 6px;padding-top:20px;border-top:1px solid var(--line);} h2:first-of-type{border-top:0;padding-top:0;} h3{font-size:14px;font-weight:600;margin:24px 0 8px;} .note{color:var(--muted);margin:0 0 16px;} table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line); border-radius:10px;overflow:hidden;margin:8px 0 4px;} th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;} th{background:#f1efea;font-weight:600;font-size:13px;} tr:last-child td{border-bottom:0;} td.k{width:132px;color:var(--muted);white-space:nowrap;} code{background:#f1efea;padding:1px 5px;border-radius:4px;font-size:12.5px; font-family:ui-monospace,SFMono-Regular,Consolas,monospace;} .fig{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 16px 12px;margin:12px 0 28px;} .cap{color:var(--muted);font-size:12.5px;text-align:center;padding-top:6px;} .fix{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--accent); border-radius:8px;padding:14px 16px;margin:12px 0;} .fix b{font-weight:600;} .ok{color:#0F6E56;font-weight:600;} ul{padding-left:20px;margin:8px 0;} li{margin:3px 0;}
 
-<h1>Lite-support — Architecture &amp; Flow Diagrams</h1>
-<p class="sub">Helpdesk + knowledge base · http://192.168.254.10:12345 · 2026-09-18 (through round 27)</p>
+Lite-support — Architecture & Flow Diagrams
+===========================================
 
-<h2>1. Technology stack</h2>
-<p class="note">In one line: <b>FastAPI + SQLite on the back end, and a hand-written native ES-module SPA on the front end — no framework, no bundler</b>.</p>
+Helpdesk + knowledge base · http://192.168.254.10:12345 · 2026-09-18 (through round 27)
 
-<table>
-  <tr><th>Layer</th><th>Tech / file</th><th>Notes</th></tr>
-  <tr><td class="k">Front-end framework</td><td><b>None</b> (native ES modules)</td>
-      <td>No React/Vue, no webpack/vite. DOM is built by a hand-written <code>h()</code> hyperscript helper; routing is hash-based (<code>#/tickets/12</code>).</td></tr>
-  <tr><td class="k">Front end</td><td><code>frontend/js/app.js</code></td>
-      <td>Single-file view layer, roughly 160 KB. Every page (helpdesk, knowledge base, admin) lives here.</td></tr>
-  <tr><td class="k">Front end</td><td><code>css/app.css</code> · <code>js/i18n.js</code></td>
-      <td>Hand-written CSS (light and dark themes); i18n covers English / Simplified Chinese / Traditional Chinese.</td></tr>
-  <tr><td class="k">Web framework</td><td><b>FastAPI 0.141.1</b> + Starlette 1.6</td>
-      <td>ASGI, routing and dependency injection; <code>backend/app.py</code> is the router entry point.</td></tr>
-  <tr><td class="k">Validation</td><td>Pydantic 2</td><td>Request-body validation and serialisation.</td></tr>
-  <tr><td class="k">App server</td><td>Uvicorn 0.53</td><td>Single process, listening on 12345.</td></tr>
-  <tr><td class="k">Business module</td><td><code>rbac.py</code></td>
-      <td>Roles / permissions / user groups. Effective permissions are the union of what the role and the group each derive.</td></tr>
-  <tr><td class="k">Business module</td><td><code>tickets.py</code></td>
-      <td>Full ticket lifecycle, e-mail templates, auto-provisioning of accounts on inbound mail.</td></tr>
-  <tr><td class="k">Business module</td><td><code>mailer.py</code></td>
-      <td>IMAP receive / SMTP send through a 163 mailbox, plus body decoding (the round-24 fix).</td></tr>
-  <tr><td class="k">Business module</td><td><code>md.py</code> <code>convert.py</code> <code>desens.py</code> <code>backup.py</code> <code>captcha.py</code></td>
-      <td>Markdown rendering, document conversion (PDF/Word/Excel), desensitisation, backups, slider CAPTCHA.</td></tr>
-  <tr><td class="k">Database</td><td><b>SQLite</b> (WAL mode)</td>
-      <td><code>/opt/Lite-support/data/app.db</code> — a single file, no separate database service.</td></tr>
-  <tr><td class="k">Key dependencies</td><td>qrcode + pillow · pypdf · fpdf2 · markdown · python-docx · openpyxl</td>
-      <td>Round 25 was where we noticed <code>qrcode</code> had been sitting in requirements all along without ever being imported.</td></tr>
-  <tr><td class="k">Runtime</td><td>systemd service <code>Lite-support</code></td>
-      <td>User <code>Lite</code>, installed under <code>/opt/Lite-support</code>, venv <code>.venv</code> (Python 3.13).</td></tr>
-  <tr><td class="k">External</td><td>163 mailbox (IMAP + SMTP)</td>
-      <td>A customer e-mail opens a ticket; ticket creation, replies and account creation all send receipts by mail.</td></tr>
-</table>
+1\. Technology stack
+--------------------
 
-<h2>2. Architecture layers</h2>
-<div class="fig">
-<svg width="100%" viewBox="0 0 680 456" role="img" xmlns="http://www.w3.org/2000/svg">
-<title>Lite-support architecture layers</title>
-<desc>Four layers: native ES-module SPA, ASGI server, business modules, data and external dependencies.</desc>
-<g>
-<rect x="40" y="20" width="600" height="92" rx="12" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
-<text x="60" y="44" font-size="14" font-weight="600" fill="#3C3489">Front end · native ES-module SPA (no framework / no bundler)</text>
-<rect x="60" y="62" width="180" height="34" rx="6" fill="#fff" stroke="#AFA9EC" stroke-width="0.5"/>
-<text x="150" y="79" text-anchor="middle" font-size="12.5" fill="#3C3489">native ES modules</text>
-<rect x="250" y="62" width="180" height="34" rx="6" fill="#fff" stroke="#AFA9EC" stroke-width="0.5"/>
-<text x="340" y="79" text-anchor="middle" font-size="12.5" fill="#3C3489">hash router · hand-rolled h()</text>
-<rect x="440" y="62" width="180" height="34" rx="6" fill="#fff" stroke="#AFA9EC" stroke-width="0.5"/>
-<text x="530" y="79" text-anchor="middle" font-size="12.5" fill="#3C3489">i18n en / zh / zh-Hant</text>
-</g>
-<g>
-<rect x="40" y="128" width="600" height="92" rx="12" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
-<text x="60" y="152" font-size="14" font-weight="600" fill="#0C447C">Server · ASGI (single-process Uvicorn)</text>
-<rect x="60" y="170" width="180" height="34" rx="6" fill="#fff" stroke="#85B7EB" stroke-width="0.5"/>
-<text x="150" y="187" text-anchor="middle" font-size="12.5" fill="#0C447C">FastAPI + Starlette</text>
-<rect x="250" y="170" width="180" height="34" rx="6" fill="#fff" stroke="#85B7EB" stroke-width="0.5"/>
-<text x="340" y="187" text-anchor="middle" font-size="12.5" fill="#0C447C">Pydantic 2 validation</text>
-<rect x="440" y="170" width="180" height="34" rx="6" fill="#fff" stroke="#85B7EB" stroke-width="0.5"/>
-<text x="530" y="187" text-anchor="middle" font-size="12.5" fill="#0C447C">Uvicorn :12345</text>
-</g>
-<g>
-<rect x="40" y="236" width="600" height="92" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
-<text x="60" y="260" font-size="14" font-weight="600" fill="#085041">Business modules · backend/</text>
-<rect x="60" y="278" width="180" height="34" rx="6" fill="#fff" stroke="#5DCAA5" stroke-width="0.5"/>
-<text x="150" y="295" text-anchor="middle" font-size="12.5" fill="#085041">rbac · group-derived perms</text>
-<rect x="250" y="278" width="180" height="34" rx="6" fill="#fff" stroke="#5DCAA5" stroke-width="0.5"/>
-<text x="340" y="295" text-anchor="middle" font-size="12.5" fill="#085041">tickets + mail templates</text>
-<rect x="440" y="278" width="180" height="34" rx="6" fill="#fff" stroke="#5DCAA5" stroke-width="0.5"/>
-<text x="530" y="295" text-anchor="middle" font-size="12.5" fill="#085041">mailer · send / receive / decode</text>
-</g>
-<g>
-<rect x="40" y="344" width="600" height="92" rx="12" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
-<text x="60" y="368" font-size="14" font-weight="600" fill="#2C2C2A">Data &amp; external dependencies</text>
-<rect x="60" y="386" width="180" height="34" rx="6" fill="#fff" stroke="#B4B2A9" stroke-width="0.5"/>
-<text x="150" y="403" text-anchor="middle" font-size="12.5" fill="#2C2C2A">SQLite WAL · app.db</text>
-<rect x="250" y="386" width="180" height="34" rx="6" fill="#fff" stroke="#B4B2A9" stroke-width="0.5"/>
-<text x="340" y="403" text-anchor="middle" font-size="12.5" fill="#2C2C2A">163 mailbox IMAP/SMTP</text>
-<rect x="440" y="386" width="180" height="34" rx="6" fill="#fff" stroke="#B4B2A9" stroke-width="0.5"/>
-<text x="530" y="403" text-anchor="middle" font-size="12.5" fill="#2C2C2A">systemd · /opt</text>
-</g>
-</svg>
-<div class="cap">Top to bottom: browser → ASGI server → business modules → data and external systems</div>
-</div>
+In one line: **FastAPI + SQLite on the back end, and a hand-written native ES-module SPA on the front end — no framework, no bundler**.
 
-<h2>3. Inbound ticket pipeline</h2>
-<p class="note">A customer sends one e-mail; six steps later it is a ticket. <b>Step 2 is the mojibake fixed in round 24; step 5 is the "reply opened a new ticket" bug fixed in round 27.</b></p>
-<div class="fig">
-<svg width="100%" viewBox="0 0 680 700" role="img" xmlns="http://www.w3.org/2000/svg">
-<title>Inbound ticket pipeline</title>
-<desc>Mail arrives, the body is decoded, machine mail is filtered, the sender is identified, a ticket is created and acknowledged.</desc>
-<defs>
-<marker id="ar1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-</marker>
-</defs>
-<g>
-<rect x="170" y="20" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
-<text x="340" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">Mail lands in the inbox</text>
-<text x="340" y="56" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">IMAP polls UNSEEN</text>
-</g>
-<path d="M340 76 L340 136" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
-<g>
-<rect x="170" y="136" width="340" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
-<text x="340" y="154" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">Decode the body　◀ fixed in round 24</text>
-<text x="340" y="172" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">strict UTF-8 first, lossless latin-1 fallback</text>
-</g>
-<path d="M340 192 L340 252" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
-<g>
-<rect x="170" y="252" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
-<text x="340" y="270" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">Filter machine mail</text>
-<text x="340" y="288" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">bounces / auto-replies / system notices → dropped</text>
-</g>
-<path d="M340 308 L340 368" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
-<g>
-<rect x="170" y="368" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
-<text x="340" y="386" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#3C3489">Identify the sender</text>
-<text x="340" y="404" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#534AB7">group by domain; unseen senders get an account</text>
-</g>
-<path d="M340 424 L340 484" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
-<g>
-<rect x="170" y="484" width="340" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
-<text x="340" y="502" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">Match an existing ticket　◀ fixed in round 27</text>
-<text x="340" y="520" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">ticket code first, subject as fallback (open, within 45 days)</text>
-</g>
-<path d="M340 540 L340 600" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar1)"/>
-<g>
-<rect x="170" y="600" width="340" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
-<text x="340" y="618" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">Hit → append to that ticket</text>
-<text x="340" y="636" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">only a miss opens a ticket + sends a receipt (carrying the code)</text>
-</g>
-</svg>
-<div class="cap">The mail path is the only one that decodes bytes, and the only source of mojibake; step 5 decides whether a message answers a ticket or opens a new one</div>
-</div>
+| Layer | Tech / file | Notes |
+| --- | --- | --- |
+| Front-end framework | **None** (native ES modules) | No React/Vue, no webpack/vite. DOM is built by a hand-written `h()` hyperscript helper; routing is hash-based (`#/tickets/12`). |
+| Front end | `frontend/js/app.js` | Single-file view layer, roughly 160 KB. Every page (helpdesk, knowledge base, admin) lives here. |
+| Front end | `css/app.css` · `js/i18n.js` | Hand-written CSS (light and dark themes); i18n covers English / Simplified Chinese / Traditional Chinese. |
+| Web framework | **FastAPI 0.141.1** + Starlette 1.6 | ASGI, routing and dependency injection; `backend/app.py` is the router entry point. |
+| Validation | Pydantic 2 | Request-body validation and serialisation. |
+| App server | Uvicorn 0.53 | Single process, listening on 12345. |
+| Business module | `rbac.py` | Roles / permissions / user groups. Effective permissions are the union of what the role and the group each derive. |
+| Business module | `tickets.py` | Full ticket lifecycle, e-mail templates, auto-provisioning of accounts on inbound mail. |
+| Business module | `mailer.py` | IMAP receive / SMTP send through a 163 mailbox, plus body decoding (the round-24 fix). |
+| Business module | `md.py` `convert.py` `desens.py` `backup.py` `captcha.py` | Markdown rendering, document conversion (PDF/Word/Excel), desensitisation, backups, slider CAPTCHA. |
+| Database | **SQLite** (WAL mode) | `/opt/Lite-support/data/app.db` — a single file, no separate database service. |
+| Key dependencies | qrcode + pillow · pypdf · fpdf2 · markdown · python-docx · openpyxl | Round 25 was where we noticed `qrcode` had been sitting in requirements all along without ever being imported. |
+| Runtime | systemd service `Lite-support` | User `Lite`, installed under `/opt/Lite-support`, venv `.venv` (Python 3.13). |
+| External | 163 mailbox (IMAP + SMTP) | A customer e-mail opens a ticket; ticket creation, replies and account creation all send receipts by mail. |
 
-<h2>4. Share to the knowledge base → close the ticket</h2>
-<p class="note">A ticket is distilled into a knowledge-base article; if the ticket is still open, a confirmation box says plainly that it will be closed as well.</p>
-<div class="fig">
-<svg width="100%" viewBox="0 0 680 384" role="img" xmlns="http://www.w3.org/2000/svg">
-<title>Share to the knowledge base and close the ticket</title>
-<desc>Sharing starts, an open ticket is confirmed, archive_to_kb persists and scopes visibility by user group, the ticket is closed.</desc>
-<defs>
-<marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-</marker>
-</defs>
-<g>
-<rect x="170" y="20" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
-<text x="340" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#3C3489">Click "Share to knowledge base"</text>
-<text x="340" y="56" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#534AB7">ticket detail page · internal users only</text>
-</g>
-<path d="M340 76 L340 116" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
-<g>
-<rect x="170" y="116" width="340" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
-<text x="340" y="134" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">Is the ticket already closed?</text>
-<text x="340" y="152" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">still open → confirm "this closes it too"</text>
-</g>
-<path d="M340 172 L340 212" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
-<g>
-<rect x="170" y="212" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
-<text x="340" y="230" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#3C3489">archive_to_kb()</text>
-<text x="340" y="248" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#534AB7">idempotent per ticket; rewrites group bindings on change</text>
-</g>
-<path d="M340 268 L340 288 L210 288 L210 308" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
-<path d="M340 268 L340 288 L470 288 L470 308" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
-<g>
-<rect x="100" y="308" width="220" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
-<text x="210" y="326" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">KB article created</text>
-<text x="210" y="344" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">visibility limited by group_ids</text>
-</g>
-<g>
-<rect x="360" y="308" width="220" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
-<text x="470" y="326" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">Ticket set to closed</text>
-<text x="470" y="344" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">records close time and actor</text>
-</g>
-</svg>
-<div class="cap">Four visibility tiers: public / registered / internal / selected user groups</div>
-</div>
+2\. Architecture layers
+-----------------------
 
-<h2>5. Partner ↔ customer binding</h2>
-<p class="note">An admin puts a customer under a partner; that binding is what narrows the partner's visibility. When opening a ticket there are two options.</p>
-<div class="fig">
-<svg width="100%" viewBox="0 0 680 444" role="img" xmlns="http://www.w3.org/2000/svg">
-<title>Partner–customer binding and visibility scope</title>
-<desc>Admin binds a customer, the partner signs in, visibility narrows to bound customers plus its own, and ticket creation offers two options.</desc>
-<defs>
-<marker id="ar3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-</marker>
-</defs>
-<g>
-<rect x="170" y="20" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
-<text x="340" y="38" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">Admin binds a customer</text>
-<text x="340" y="56" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">customers.partner_id = partner</text>
-</g>
-<path d="M340 76 L340 136" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
-<g>
-<rect x="170" y="136" width="340" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
-<text x="340" y="154" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0C447C">Partner signs in</text>
-<text x="340" y="172" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#185FA5">group Partner-&lt;name&gt; · role auto-aligned</text>
-</g>
-<path d="M340 192 L340 252" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
-<g>
-<rect x="170" y="252" width="340" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
-<text x="340" y="270" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">Visibility narrows</text>
-<text x="340" y="288" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#0F6E56">bound customers + its own tickets only</text>
-</g>
-<path d="M340 308 L340 328 L210 328 L210 368" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
-<path d="M340 308 L340 328 L470 328 L470 368" fill="none" stroke="#888780" stroke-width="1.5" marker-end="url(#ar3)"/>
-<g>
-<rect x="100" y="368" width="220" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
-<text x="210" y="386" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">New ticket: for a customer</text>
-<text x="210" y="404" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">the server verifies it is really theirs</text>
-</g>
-<g>
-<rect x="360" y="368" width="220" height="56" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
-<text x="470" y="386" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#633806">New ticket: for itself</text>
-<text x="470" y="404" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#854F0B">the partner is its own customer</text>
-</g>
-</svg>
-<div class="cap">"Can open tickets" is not "can edit customers": the customer name is pinned server-side</div>
-</div>
+Lite-support architecture layers Four layers: native ES-module SPA, ASGI server, business modules, data and external dependencies. Front end · native ES-module SPA (no framework / no bundler) native ES modules hash router · hand-rolled h() i18n en / zh / zh-Hant Server · ASGI (single-process Uvicorn) FastAPI + Starlette Pydantic 2 validation Uvicorn :12345 Business modules · backend/ rbac · group-derived perms tickets + mail templates mailer · send / receive / decode Data & external dependencies SQLite WAL · app.db 163 mailbox IMAP/SMTP systemd · /opt
 
-<h2>6. Fix log</h2>
+Top to bottom: browser → ASGI server → business modules → data and external systems
 
-<h3>Round 27 (2026-09-18): one person replied to their own ticket and got a new one instead</h3>
+3\. Inbound ticket pipeline
+---------------------------
 
-<div class="fix">
-<b>Thread matching only looked at the ticket code, and the identity check only looked at the customer name</b>　<span class="ok">fixed</span><br>
-A hotmail user opened <code>LITE-SUPPORT-202609003</code> from the web, then replied to the notification the system had sent — and that reply was opened as <code>LITE-SUPPORT-202609004</code>.<br>
-<b>Step one of the investigation was reading the real Subject</b>: the message in the inbox was <code>Re: Re:[#LITE-SUPPORT-202609003] 救救我</code> —
-<b>the code was right there in the subject</b>, so the bug was not in the regex but in the <b>identity check</b> that runs after a match.<br>
-<b>Root cause</b>: the check compared only <code>customer_id</code> / <code>customer_name</code>, and <code>customer_name</code>
-<b>is only ever set on tickets that were opened by e-mail</b> (only the partner branch of ticket creation writes it). A web-created ticket leaves that column empty,
-so the same person replying from their own address to their own ticket was judged a stranger and fell all the way through to "open a new one".<br>
-<b>The fix</b> (two places — either one alone still leaves a hole):<br>
-① <code>_owns_ticket()</code> — identity becomes "any of <b>creator_email / creator_id / ticket_participants</b> matches,
-or the customer/partner domain matches, or the sender is an internal colleague"; the domain rule is demoted to a last-resort fallback instead of the only test.<br>
-② <code>_match_by_subject()</code> — when the ticket code finds nothing, <b>fall back to the subject</b>: normalise it (strip the code, strip stacked
-<code>Re:/Fwd:</code>, strip bracket whitespace) and compare it against <b>tickets owned by the same person</b>, taking the newest.
-<b>Deliberately fenced</b>: only tickets that are not closed, and only within the last 45 days — otherwise a generic subject like "cannot sign in" would be sucked onto a year-old ticket;
-and a same-named subject belonging to someone else must not be claimed. The result carries <code>matched_by=code|subject</code>, so a fallback guess is never silent.<br>
-<b>Along the way</b>: notification subjects now go through <code>thread_subject()</code> — a mail-opened ticket's title is already <code>[CODE] original subject</code>,
-and the old construction produced <code>Re:[#CODE] [CODE] original subject</code> and stacked another <code>Re:</code> on every round trip.<br>
-<b>Data repair</b>: the duplicate ticket's messages were moved back onto the original, participants and alerts re-pointed, the empty shell deleted, status returned to "customer replied";
-a hot copy <code>app.db.prethreadfix-20260918-090445</code> was taken before touching anything.
-</div>
+A customer sends one e-mail; six steps later it is a ticket. **Step 2 is the mojibake fixed in round 24; step 5 is the "reply opened a new ticket" bug fixed in round 27.**
 
-<h3>Round 27 · verification evidence</h3>
-<ul>
-  <li><b>Replaying real mail</b>: a WAL-safe hot copy of the live database, outbound mail stubbed out, production functions called directly over 11 cases — <b>11/11 passed</b>: the original incident message (filed onto …003, zero new tickets), a client that dropped the ticket code (matched by subject), a bare subject, an old <code>TK-</code> code, several same-named tickets taking the newest, an unknown domain rejected, someone else's subject not claimed, a new subject opening a new ticket, <b>a closed ticket not resurrected by a subject guess</b>, and a colleague replying from the back office (status becomes "support replied")</li>
-  <li><b>Live HTTP</b>: <code>/api/tickets/134</code> returns 4 messages with status "customer replied"; <code>…004</code> is gone from <code>/api/tickets</code>; all three categories of residue after the merge (messages / participants / alerts) are 0</li>
-  <li>All three files match between live and local by md5; service <code>active</code>, <code>/health</code> 200; commit <code>c64015a3</code> pushed (blob-by-blob verification passed)</li>
-</ul>
+Inbound ticket pipeline Mail arrives, the body is decoded, machine mail is filtered, the sender is identified, a ticket is created and acknowledged. Mail lands in the inbox IMAP polls UNSEEN Decode the body　◀ fixed in round 24 strict UTF-8 first, lossless latin-1 fallback Filter machine mail bounces / auto-replies / system notices → dropped Identify the sender group by domain; unseen senders get an account Match an existing ticket　◀ fixed in round 27 ticket code first, subject as fallback (open, within 45 days) Hit → append to that ticket only a miss opens a ticket + sends a receipt (carrying the code)
 
-<h3>Round 26 (2026-09-18): the new-ticket page had a toolbar but no body input</h3>
+The mail path is the only one that decodes bytes, and the only source of mojibake; step 5 decides whether a message answers a ticket or opens a new one
 
-<div class="fix">
-<b>The markdown editor never mounted its own textarea</b>　<span class="ok">fixed</span><br>
-<code>mdEditor(ta)</code> is supposed to package "format toolbar + body box" into one block: it took <code>ta</code>, built the wrapper, attached the toolbar and the hint line —
-<b>but never appended <code>ta</code> itself</b>. All five call sites passed <code>ta</code> in and assumed it would be mounted (submission still read <code>ta.value</code>, so the data flow looked fine),
-which means what broke was not one page but <b>every screen that uses this editor</b>: the new-ticket description, the ticket reply box, knowledge-base article editing, the welcome page and reply templates.<br>
-<b>The tell</b>: the stylesheet has <code>.md-editor textarea{border-radius:0 0 6px 6px}</code> — only the bottom corners rounded (the toolbar rounds only its top corners and has no bottom border) —
-so by design the box belongs directly under the toolbar. What was missing was code, not design.<br>
-<b>A regression?</b> Walking 17 versions of <code>app.js</code> on GitHub, this editor only appears in the last two commits and <b>has been missing that line since its first version</b>;
-one version earlier the description field was a bare <code>textarea</code> inside the label — which explains "there used to be an input box and now there isn't".<br>
-<b>The fix</b>: <code>wrap.append(bar, ta)</code>, with the order fixed as <b>toolbar → input → hint</b>.<br>
-<b>Along the way</b>: the asset version in <code>index.html</code> moved to <code>?v=20260918e</code> — the server sends no <code>Cache-Control</code>,
-so without a version bump a browser may keep using the old bundle on heuristic freshness.
-</div>
+4\. Share to the knowledge base → close the ticket
+--------------------------------------------------
 
-<h3>Round 26 · verification evidence</h3>
-<ul>
-  <li>With <code>h()</code> stubbed out, <code>mdEditor()</code> was <b>actually executed</b>: 8/8 passed — the wrapper is exactly "toolbar + <b>the same textarea object</b> + hint line", the toolbar has 8 buttons, and clicking <b>B</b> writes <code>**bold**</code> into that mounted box</li>
-  <li><code>app.js</code> matches across live / on-disk / local by md5 (<code>ccfa91e5…</code>), and the very bytes the browser downloads contain the fix marker</li>
-  <li><code>node --check</code> green; service <code>active</code>, <code>/health</code> 200; commit <code>9e6790a2</code> pushed (blob-by-blob verification passed)</li>
-</ul>
+A ticket is distilled into a knowledge-base article; if the ticket is still open, a confirmation box says plainly that it will be closed as well.
 
-<h3>Round 25 (2026-09-18): partner role mismatch + two-factor QR code</h3>
+Share to the knowledge base and close the ticket Sharing starts, an open ticket is confirmed, archive\_to\_kb persists and scopes visibility by user group, the ticket is closed. Click "Share to knowledge base" ticket detail page · internal users only Is the ticket already closed? still open → confirm "this closes it too" archive\_to\_kb() idempotent per ticket; rewrites group bindings on change KB article created visibility limited by group\_ids Ticket set to closed records close time and actor
 
-<div class="fix">
-<b>① A partner was labelled "customer"</b>　<span class="ok">fixed</span><br>
-<code>netfuns@hotmail.com</code> showed up as "customer" in the user list. Querying the database showed <b>the group was right</b> (<code>Partner-hotmail</code>) and <b>the role was wrong</b>.<br>
-<b>Root cause</b>: the two account-creation paths each wrote their own thing — inbound-mail provisioning, <code>tickets.find_or_create_user()</code>, <b>hard-coded</b> the "customer" role, and the
-<code>align_internal_role()</code> it then called only handled the site's own domains, so partner domains slipped straight through; the web registration path, by contrast, had the correct three-way branch.
-This account was exactly the product of customer mail triggering auto-provisioning.<br>
-<b>The fix</b>: a new <code>rbac.domain_role_name()</code> (<b>derives the role from the groups already attached</b> rather than re-matching the domain — the group is the single source of truth, and it avoids a circular import)
-plus <code>align_domain_role()</code> to write it, keeping the conservative contract that a role a human chose is never touched. Both provisioning paths now call it. A full audit of existing data produced exactly 1 correction.
-</div>
+Four visibility tiers: public / registered / internal / selected user groups
 
-<div class="fix">
-<b>② The two-factor QR code would not scan</b>　<span class="ok">fixed</span><br>
-The registration page pointed at <code>api.qrserver.com/v1/code-16x16.php</code> — <b>that endpoint is simply wrong</b> (the correct one is <code>/v1/create-qr-code/</code>),
-and it <b>requires the public internet</b> while this site is an intranet deployment, so users saw a broken image.<br>
-<b>The key finding</b>: <code>qrcode 8.2</code> + <code>pillow</code> <b>were already in requirements.txt and in the venv</b> — the code had just never imported them.<br>
-<b>The fix</b>: <code>auth.qr_svg()</code> renders an <b>inline SVG</b> server-side (no outbound call, and the secret never enters a URL or a referrer), all three responses carry it, and the front end inlines it while still showing the plaintext secret as a fallback.
-</div>
+5\. Partner ↔ customer binding
+------------------------------
 
-<h3>Round 25 · verification evidence</h3>
-<ul>
-  <li>A probe account created through the real function came out with role <code>代理商</code> and group <code>Partner-hotmail</code> (this was "customer" before the fix)</li>
-  <li>An HTTP login returned <code>need_enroll_totp</code> plus a valid 19 KB SVG QR code</li>
-  <li>Computing the code from the returned secret completed enrolment → login succeeded and <code>/api/me</code> reported the "代理商" role</li>
-  <li>The probe account was deleted, zero residue; local syntax checks green; 5 files match between live and local by md5</li>
-  <li>Service <code>active</code>, <code>/health</code> 200; commit <code>6d8f242e</code> pushed to <code>netfuns/Lite-Support-with-KB</code></li>
-</ul>
+An admin puts a customer under a partner; that binding is what narrows the partner's visibility. When opening a ticket there are two options.
 
-</div>
-</body>
-</html>
+Partner–customer binding and visibility scope Admin binds a customer, the partner signs in, visibility narrows to bound customers plus its own, and ticket creation offers two options. Admin binds a customer customers.partner\_id = partner Partner signs in group Partner-<name> · role auto-aligned Visibility narrows bound customers + its own tickets only New ticket: for a customer the server verifies it is really theirs New ticket: for itself the partner is its own customer
+
+"Can open tickets" is not "can edit customers": the customer name is pinned server-side
+
+6\. Fix log
+-----------
+
+### Round 27 (2026-09-18): one person replied to their own ticket and got a new one instead
+
+**Thread matching only looked at the ticket code, and the identity check only looked at the customer name**　fixed  
+A hotmail user opened `LITE-SUPPORT-202609003` from the web, then replied to the notification the system had sent — and that reply was opened as `LITE-SUPPORT-202609004`.  
+**Step one of the investigation was reading the real Subject**: the message in the inbox was `Re: Re:[#LITE-SUPPORT-202609003] 救救我` — **the code was right there in the subject**, so the bug was not in the regex but in the **identity check** that runs after a match.  
+**Root cause**: the check compared only `customer_id` / `customer_name`, and `customer_name` **is only ever set on tickets that were opened by e-mail** (only the partner branch of ticket creation writes it). A web-created ticket leaves that column empty, so the same person replying from their own address to their own ticket was judged a stranger and fell all the way through to "open a new one".  
+**The fix** (two places — either one alone still leaves a hole):  
+① `_owns_ticket()` — identity becomes "any of **creator\_email / creator\_id / ticket\_participants** matches, or the customer/partner domain matches, or the sender is an internal colleague"; the domain rule is demoted to a last-resort fallback instead of the only test.  
+② `_match_by_subject()` — when the ticket code finds nothing, **fall back to the subject**: normalise it (strip the code, strip stacked `Re:/Fwd:`, strip bracket whitespace) and compare it against **tickets owned by the same person**, taking the newest. **Deliberately fenced**: only tickets that are not closed, and only within the last 45 days — otherwise a generic subject like "cannot sign in" would be sucked onto a year-old ticket; and a same-named subject belonging to someone else must not be claimed. The result carries `matched_by=code|subject`, so a fallback guess is never silent.  
+**Along the way**: notification subjects now go through `thread_subject()` — a mail-opened ticket's title is already `[CODE] original subject`, and the old construction produced `Re:[#CODE] [CODE] original subject` and stacked another `Re:` on every round trip.  
+**Data repair**: the duplicate ticket's messages were moved back onto the original, participants and alerts re-pointed, the empty shell deleted, status returned to "customer replied"; a hot copy `app.db.prethreadfix-20260918-090445` was taken before touching anything.
+
+### Round 27 · verification evidence
+
+*   **Replaying real mail**: a WAL-safe hot copy of the live database, outbound mail stubbed out, production functions called directly over 11 cases — **11/11 passed**: the original incident message (filed onto …003, zero new tickets), a client that dropped the ticket code (matched by subject), a bare subject, an old `TK-` code, several same-named tickets taking the newest, an unknown domain rejected, someone else's subject not claimed, a new subject opening a new ticket, **a closed ticket not resurrected by a subject guess**, and a colleague replying from the back office (status becomes "support replied")
+*   **Live HTTP**: `/api/tickets/134` returns 4 messages with status "customer replied"; `…004` is gone from `/api/tickets`; all three categories of residue after the merge (messages / participants / alerts) are 0
+*   All three files match between live and local by md5; service `active`, `/health` 200; commit `c64015a3` pushed (blob-by-blob verification passed)
+
+### Round 26 (2026-09-18): the new-ticket page had a toolbar but no body input
+
+**The markdown editor never mounted its own textarea**　fixed  
+`mdEditor(ta)` is supposed to package "format toolbar + body box" into one block: it took `ta`, built the wrapper, attached the toolbar and the hint line — **but never appended `ta` itself**. All five call sites passed `ta` in and assumed it would be mounted (submission still read `ta.value`, so the data flow looked fine), which means what broke was not one page but **every screen that uses this editor**: the new-ticket description, the ticket reply box, knowledge-base article editing, the welcome page and reply templates.  
+**The tell**: the stylesheet has `.md-editor textarea{border-radius:0 0 6px 6px}` — only the bottom corners rounded (the toolbar rounds only its top corners and has no bottom border) — so by design the box belongs directly under the toolbar. What was missing was code, not design.  
+**A regression?** Walking 17 versions of `app.js` on GitHub, this editor only appears in the last two commits and **has been missing that line since its first version**; one version earlier the description field was a bare `textarea` inside the label — which explains "there used to be an input box and now there isn't".  
+**The fix**: `wrap.append(bar, ta)`, with the order fixed as **toolbar → input → hint**.  
+**Along the way**: the asset version in `index.html` moved to `?v=20260918e` — the server sends no `Cache-Control`, so without a version bump a browser may keep using the old bundle on heuristic freshness.
+
+### Round 26 · verification evidence
+
+*   With `h()` stubbed out, `mdEditor()` was **actually executed**: 8/8 passed — the wrapper is exactly "toolbar + **the same textarea object** + hint line", the toolbar has 8 buttons, and clicking **B** writes `**bold**` into that mounted box
+*   `app.js` matches across live / on-disk / local by md5 (`ccfa91e5…`), and the very bytes the browser downloads contain the fix marker
+*   `node --check` green; service `active`, `/health` 200; commit `9e6790a2` pushed (blob-by-blob verification passed)
+
+### Round 25 (2026-09-18): partner role mismatch + two-factor QR code
+
+**① A partner was labelled "customer"**　fixed  
+`netfuns@hotmail.com` showed up as "customer" in the user list. Querying the database showed **the group was right** (`Partner-hotmail`) and **the role was wrong**.  
+**Root cause**: the two account-creation paths each wrote their own thing — inbound-mail provisioning, `tickets.find_or_create_user()`, **hard-coded** the "customer" role, and the `align_internal_role()` it then called only handled the site's own domains, so partner domains slipped straight through; the web registration path, by contrast, had the correct three-way branch. This account was exactly the product of customer mail triggering auto-provisioning.  
+**The fix**: a new `rbac.domain_role_name()` (**derives the role from the groups already attached** rather than re-matching the domain — the group is the single source of truth, and it avoids a circular import) plus `align_domain_role()` to write it, keeping the conservative contract that a role a human chose is never touched. Both provisioning paths now call it. A full audit of existing data produced exactly 1 correction.
+
+**② The two-factor QR code would not scan**　fixed  
+The registration page pointed at `api.qrserver.com/v1/code-16x16.php` — **that endpoint is simply wrong** (the correct one is `/v1/create-qr-code/`), and it **requires the public internet** while this site is an intranet deployment, so users saw a broken image.  
+**The key finding**: `qrcode 8.2` + `pillow` **were already in requirements.txt and in the venv** — the code had just never imported them.  
+**The fix**: `auth.qr_svg()` renders an **inline SVG** server-side (no outbound call, and the secret never enters a URL or a referrer), all three responses carry it, and the front end inlines it while still showing the plaintext secret as a fallback.
+
+### Round 25 · verification evidence
+
+*   A probe account created through the real function came out with role `代理商` and group `Partner-hotmail` (this was "customer" before the fix)
+*   An HTTP login returned `need_enroll_totp` plus a valid 19 KB SVG QR code
+*   Computing the code from the returned secret completed enrolment → login succeeded and `/api/me` reported the "代理商" role
+*   The probe account was deleted, zero residue; local syntax checks green; 5 files match between live and local by md5
+*   Service `active`, `/health` 200; commit `6d8f242e` pushed to `netfuns/Lite-Support-with-KB`
