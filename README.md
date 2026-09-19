@@ -1,7 +1,6 @@
 # Support + KB all in one
 
-Integrated post-sales ticket platform + knowledge base. Self-hosted, single
-process, no external services required.
+Integrated post-sales ticket platform + knowledge base. Self-hosted, no external services required.
 
 ## Stack
 
